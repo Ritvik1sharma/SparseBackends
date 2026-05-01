@@ -1,0 +1,18 @@
+name = "SparseBackends"
+uuid = "60b00394-95c5-4a10-8e1c-b93543744110"
+version = "0.1.0"
+
+[deps]
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+ITensors = "9136182c-28ba-11e9-034c-db9fb085ebd5"
+
+[compat]
+julia = "1.11"
+ITensors      = "0.9"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]

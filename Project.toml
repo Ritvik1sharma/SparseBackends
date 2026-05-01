@@ -1,0 +1,6 @@
+[deps]
+CompositionsBase = "a33af91c-f02d-484b-be07-31d278c5ca2b"
+ITensorMPS = "0d1a4710-d33b-49a5-8f18-73bdf49b47e2"
+ITensors = "9136182c-28ba-11e9-034c-db9fb085ebd5"
+KrylovKit = "0b1a1467-8014-51b9-945f-bf0ae24f4b77"
+SparseBackends = "60b00394-95c5-4a10-8e1c-b93543744110"
