@@ -783,7 +783,7 @@ function to_dense_itensors(T::ITensors.ITensor)::ITensors.ITensor
   end
 end
 
-import Base: ndims, size, eltype
+import Base: ndims, size, eltype, *, +, -, copy
 import LinearAlgebra: norm
 
 Base.ndims(es::ITensors.ExternalStorage) = length(ITensors.inds(es))
@@ -794,6 +794,63 @@ LinearAlgebra.norm(w::WrappedBlockSparse) = norm(w.blocksparse.data)
 LinearAlgebra.norm(w::WrappedCOOTensor)   = norm(w.coo.vals)
 LinearAlgebra.norm(w::WrappedTensor)      = norm(w.data)
 LinearAlgebra.norm(es::ITensors.ExternalStorage{<:WrappedTensorTypes}) = norm(es.data)
+
+Base.eltype(::WrappedBlockSparse{T}) where T = T
+
+# ── Scalar multiply for BS tensors (needed by KrylovKit/VectorInterface) ─────
+function Base.:*(α::Number, wbs::WrappedBlockSparse{T,N,N2,P}) where {T,N,N2,P}
+    bs = wbs.blocksparse
+    new_bs = NewBlockSparseSorted{T,N,N2,P}(
+        bs.dims, bs.blksize, copy(bs.keys), copy(bs.ids), T(α) .* bs.data
+    )
+    WrappedBlockSparse(new_bs, wbs.inds)
+end
+
+# Returns an ITensor so that `itensor(α * tensor(T))` = `itensor(ITensor)` = identity
+Base.:*(α::Number, es::ITensors.ExternalStorage{<:WrappedBlockSparse}) =
+    ITensors._itensor_from_external_storage(α * es.data)
+
+Base.:-(wbs::WrappedBlockSparse) = (-1) * wbs
+Base.:/(wbs::WrappedBlockSparse, α::Number) = (one(eltype(wbs))/α) * wbs
+
+# ── Deep copy ─────────────────────────────────────────────────────────────────
+function Base.copy(wbs::WrappedBlockSparse{T,N,N2,P}) where {T,N,N2,P}
+    bs = wbs.blocksparse
+    new_bs = NewBlockSparseSorted{T,N,N2,P}(
+        bs.dims, bs.blksize, copy(bs.keys), copy(bs.ids), copy(bs.data)
+    )
+    WrappedBlockSparse(new_bs, wbs.inds)
+end
+
+# ── Block-wise addition (union of block keys) ─────────────────────────────────
+function Base.:+(wA::WrappedBlockSparse{T,N,N2,P}, wB::WrappedBlockSparse{T,N,N2,P}) where {T,N,N2,P}
+    C = copy(wA)
+    bs_C = C.blocksparse
+    bs_B = wB.blocksparse
+    for (key, id_b) in blocks_sorted(bs_B)
+        id_c = _ensure_block!(bs_C, key)
+        bv_c = _block_view(bs_C, id_c)
+        bv_b = _block_view(bs_B, id_b)
+        @inbounds for i in eachindex(bv_c)
+            bv_c[i] += bv_b[i]
+        end
+    end
+    C
+end
+
+# Hook for ITensors addition: a + b calls _add(tensor(a), tensor(b))
+function ITensors._add(
+    es_A::ITensors.ExternalStorage{<:WrappedBlockSparse},
+    es_B::ITensors.ExternalStorage{<:WrappedBlockSparse},
+)
+    ITensors._itensor_from_external_storage(es_A.data + es_B.data)
+end
+
+# Hook for fill!(T, x) with external storage (needed by zerovector!/broadcast scalar fill)
+function ITensors._external_fill!(T::ITensors.ITensor, storage::WrappedBlockSparse, x::Number)
+    fill!(storage.blocksparse.data, x)
+    return T
+end
 
 # Element-wise map! for ExternalStorage ITensors (used by scale!, axpy!, normalize!)
 function _apply_elementwise!(f, R::WrappedBlockSparse, A::WrappedBlockSparse)
@@ -816,17 +873,15 @@ function _apply_elementwise!(f, R::WrappedTensor, A::WrappedTensor)
     R.data .= f.(R.data, A.data)
 end
 
+# ITensors hook: `_external_map_storage!(f, storage, R, A)` where storage = get_external_storage(R)
 function ITensors._external_map_storage!(
     f::Function,
-    sR::ITensors.ExternalStorage,
+    storage::WrappedTensorTypes,
     R::ITensors.ITensor,
     A::ITensors.ITensor,
 )
-    sA = A.tensor
-    sA isa ITensors.ExternalStorage ||
-        error("Expected external storage for A, got $(typeof(sA))")
-
-    _apply_elementwise!(f, sR.data, sA.data)
+    sA = ITensors.get_external_storage(A)
+    _apply_elementwise!(f, storage, sA)
     return R
 end
 
@@ -947,38 +1002,4 @@ function itensor_blocksparse_svd(
         WrappedBlockSparse(SV_bs, (new_bond_ind, r_ind, s2_ind))
     )
     return L_it, R_it, spec
-end
-
-# _external_factorize hook: dispatches to sparse block-diagonal SVD.
-function ITensors._external_factorize(A::ITensors.ITensor, Linds...; kwargs...)
-    storage = ITensors.get_external_storage(A)
-    if storage isa WrappedBlockSparse
-        ortho  = String(get(kwargs, :ortho,  "left"))
-        maxdim = Int(something(get(kwargs, :maxdim,  nothing), typemax(Int)))
-        mindim = Int(something(get(kwargs, :mindim,  nothing), 1))
-        cutoff = Float64(something(get(kwargs, :cutoff, nothing), 0.0))
-        tags   = get(kwargs, :tags, ITensors.ts"Link,fact")
-        return itensor_blocksparse_svd(A, Linds; ortho, maxdim, mindim, cutoff, tags)
-    end
-    error("factorize not implemented for external storage type $(typeof(storage))")
-end
-
-# permute override for external-storage ITensors.
-# Identity permutations are no-ops; non-identity permutations just relabel inds
-# (data layout is unchanged — callers in DMRG that use block-sparse psi must avoid
-# non-identity permutations, e.g. by skipping reorder_split_tensors for sparse L/R).
-function ITensors.permute(T::ITensors.ITensor, new_inds::ITensors.Index...; kwargs...)
-    if !ITensors.has_external_storage(T)
-        return invoke(ITensors.permute,
-                      Tuple{ITensors.ITensor, Vararg{ITensors.Index}},
-                      T, new_inds...; kwargs...)
-    end
-    w = ITensors.get_external_storage(T)
-    N = length(w.inds)
-    length(new_inds) == N || error("permute: expected $N indices, got $(length(new_inds))")
-    perm = [findfirst(==(new_inds[i]), w.inds) for i in 1:N]
-    any(isnothing, perm) && error("permute: index not found in $(w.inds)")
-    perm == collect(1:N) && return T   # identity: no-op
-    permute_inds!(w, perm)             # relabel only (data layout unchanged)
-    return T
 end
