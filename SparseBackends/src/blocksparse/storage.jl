@@ -1,11 +1,11 @@
 using Base: OneTo
 
 mutable struct NewBlockSparseSorted{T,N,N2,P,K<:Integer} <: SparseTensor{T,N}  # AbstractArray{T,N}
-  dims::NTuple{N,Int}
+  dims::NTuple{N,Int} # N total dimensions
   blksize::Int
   keys::Vector{NTuple{P,K}}   # P = N - N2, key type K
   ids::Vector{Int}
-  data::Vector{T}
+  data::Vector{T} # N2 dimensions 
 end
 
 # Backwards-compatible outer constructor (K=Int default)
@@ -139,6 +139,10 @@ end
   off = (id - 1) * A.blksize
   return @view(A.data[off+1 : off + A.blksize])
 end
+
+_N( ::NewBlockSparseSorted{T,N})         where {T,N}       = N
+_N2(::NewBlockSparseSorted{T,N,N2})      where {T,N,N2}    = N2
+_P( ::NewBlockSparseSorted{T,N,N2,P})    where {T,N,N2,P}  = P
 
 # function Base.permutedims(A::NewBlockSparseSorted{T,N,N2,P}, perm::AbstractVector{Int}) where {T,N,N2,P}
 #   _check_no_cross_perm(perm, N, P, N2)

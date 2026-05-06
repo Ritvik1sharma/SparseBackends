@@ -31,6 +31,10 @@ _backend(::WrappedTensor) = :dense
 _backend(::WrappedCOOTensor) = :coo
 _backend(::WrappedBlockSparse) = :blocksparse
 
+dim(w::WrappedTensorTypes) = _dims(w)
+dim(w::WrappedCOOTensor) = _dims(w)
+dim(w::WrappedBlockSparse) = _dims(w)
+
 
 
 
@@ -388,40 +392,22 @@ end
 
 function contract(A::ITensors.ITensor, B::WrappedTensorTypes{TB,NB}; kwargs...) where {TB,NB}
   Aw = wrap_itensor(A; backend=:dense)
-  time = @elapsed begin
-    Cw = contract(Aw, B; kwargs...)
-  end
-  if Cw isa WrappedBlockSparse
-    if is_dense(Cw.blocksparse)
-      time = @elapsed begin
-        data = to_dense(Cw.blocksparse)
-        inds = Cw.inds
-        result = ITensors.ITensor(data, inds...)    
-      end
-      # println("Time to convert to dense ITensor 1 : $time")
-      return result
-    end
+  Cw = contract(Aw, B; kwargs...)
+  Cw isa ITensors.ITensor && return Cw
+  if Cw isa WrappedBlockSparse && is_dense(Cw.blocksparse)
+    data = to_dense(Cw.blocksparse)
+    return ITensors.ITensor(data, Cw.inds...)
   end
   return ITensors._itensor_from_external_storage(Cw)
 end
 
 function contract(A::WrappedTensorTypes{TA,NA}, B::ITensors.ITensor; kwargs...) where {TA,NA}
   Bw = wrap_itensor(B; backend=:dense)
-  time = @elapsed begin
-    Cw = contract(A, Bw; kwargs...)
-  end
-
-  if Cw isa WrappedBlockSparse
-    if is_dense(Cw.blocksparse)
-      time = @elapsed begin
-        data = to_dense(Cw.blocksparse)
-        inds = Cw.inds
-        # println(" @@@@@@@@@@@ TRIGGER CONVERSION @@@@@@@@@@@@")
-        result = ITensors.ITensor(data, inds...)
-      end
-      # println("Time to convert to dense ITensor 2 : $time")
-      return result
-    end
+  Cw = contract(A, Bw; kwargs...)
+  Cw isa ITensors.ITensor && return Cw
+  if Cw isa WrappedBlockSparse && is_dense(Cw.blocksparse)
+    data = to_dense(Cw.blocksparse)
+    return ITensors.ITensor(data, Cw.inds...)
   end
   return ITensors._itensor_from_external_storage(Cw)
 end
@@ -646,8 +632,20 @@ function wrapped_contract(A::WrappedTensorTypes{TA,NA},
         if denseLinksC == length(indsC)
             # P_C = 0: all output indices are dense → return plain ITensor
             C_data = zeros(TC, dimsC...)
-            SparseBackends.contract_bs_bs_to_dense!(
-                C_data, labelsC_vec, Arep, labelsA_vec, Brep, labelsB_vec)
+            if Arep isa NewBlockSparseSorted && Brep isa NewBlockSparseSorted
+                SparseBackends.contract_bs_bs_to_dense!(
+                    C_data, labelsC_vec, Arep, labelsA_vec, Brep, labelsB_vec)
+            elseif Arep isa NewBlockSparseSorted && Brep isa AbstractArray
+                SparseBackends.contract_bs_dense_to_dense!(
+                    C_data, labelsC_vec, Arep, labelsA_vec, Brep, labelsB_vec)
+            elseif Arep isa AbstractArray && Brep isa NewBlockSparseSorted
+                SparseBackends.contract_bs_dense_to_dense!(
+                    C_data, labelsC_vec, Brep, labelsB_vec, Arep, labelsA_vec)
+            else
+                # Both dense: direct tensor contraction via einsum
+                C_bs = NewBlockSparseSorted{TC, length(dimsC), length(dimsC)}(dimsC)
+                contract!(C_bs, labelsC_vec, NewBlockSparseSorted(Arep), labelsA_vec, Brep, labelsB_vec)
+            end
             return length(indsC) == 0 ? ITensors.ITensor(C_data[]) : ITensors.ITensor(C_data, indsC...)
         end
         # time = @elapsed begin
@@ -969,37 +967,204 @@ function left_factorize(w::WrappedBlockSparse{T,3,1,2},
     return Q, R
 end
 
-# Sparse-psi binding: block-diagonal SVD for WrappedBlockSparse phi.
-# Returns (L_it, R_it, spec) — same contract as stable_factorize's return.
-# w.inds layout must be (l_link, r_link, site1, site2): prefix first, dense last.
+# # Sparse-psi binding: block-diagonal SVD for WrappedBlockSparse phi.
+# # Returns (L_it, R_it, spec) — same contract as stable_factorize's return.
+# # w.inds layout must be (l_link, r_link, site1, site2): prefix first, dense last.
+# function itensor_blocksparse_svd(
+#     phi::ITensors.ITensor,
+#     indsMb;
+#     ortho::String="left",
+#     maxdim::Int=typemax(Int),
+#     mindim::Int=1,
+#     cutoff::Float64=0.0,
+#     tags=ITensors.ts"Link,l",
+# )
+#     w  = ITensors.get_external_storage(phi)::WrappedBlockSparse
+#     println("Performing block-diagonal SVD on WrappedBlockSparse with dims ", w.inds, " and block dims ", w.blocksparse.dims)
+
+#     bs = w.blocksparse   # NewBlockSparseSorted{T,4,2,2}
+#     # w.inds = (l_link, r_link, site1, site2) = (prefix1, prefix2, dense1, dense2)
+#     l_ind, r_ind, s1_ind, s2_ind = w.inds
+
+#     U_bs, SV_bs, svs_kept, spec = blocksparse_svd(
+#         bs; ortho, maxdim, mindim, cutoff
+#     )
+
+#     new_bond_dim = length(svs_kept)
+#     new_bond_ind = ITensors.Index(new_bond_dim; tags)
+
+#     # U: prefix=(l, new_bond), dense=(s1)
+#     L_it = ITensors._itensor_from_external_storage(
+#         WrappedBlockSparse(U_bs, (l_ind, new_bond_ind, s1_ind))
+#     )
+#     # SV: prefix=(new_bond, r), dense=(s2)
+#     R_it = ITensors._itensor_from_external_storage(
+#         WrappedBlockSparse(SV_bs, (new_bond_ind, r_ind, s2_ind))
+#     )
+#     return L_it, R_it, spec
+# end
+
+function permute(
+    phi::WrappedBlockSparse,
+    desired::Vararg{ITensors.Index};
+    allow_alias::Bool = true,
+)
+  N = length(phi.inds)
+  # 1. Validate inputs
+  length(desired) == N || error("Wrong number of indices in permute")
+  inds_old = phi.inds
+  inds_new = Tuple(desired)
+  # Build permutation: where each new index came from
+  perm = ntuple(i -> begin
+      idx = findfirst(==(inds_new[i]), inds_old)
+      idx === nothing && error("Index $(inds_new[i]) not found in tensor")
+      idx
+  end, N)
+  # Check it's a valid permutation
+  if sort(collect(perm)) != collect(1:N)
+      error("Invalid permutation")
+  end
+  # 2. Fast path: identity perm
+  if perm == ntuple(identity, N)
+      return allow_alias ? phi : WrappedBlockSparse(
+          copy(phi.blocksparse),
+          inds_new
+      )
+  end
+  # 3. Apply permutation to storage
+  # We assume this returns a new object
+  bs_new = permutedims(phi.blocksparse, perm)
+  # 4. Construct result
+  return WrappedBlockSparse(bs_new, inds_new)
+end
+
+function permute(phi::ITensors.ITensor, desired::Vararg{ITensors.Index}; allow_alias::Bool = true)
+  w = ITensors.get_external_storage(phi)::WrappedBlockSparse
+  return ITensors._itensor_from_external_storage(permute(w, desired...; allow_alias))
+end
+
+
+function reorder_invariant(legs, dense_set)
+  sp_link    = ITensors.Index[]
+  sp_nonlink = ITensors.Index[]
+  dense_tail = ITensors.Index[]
+  for I in legs
+    if I in dense_set
+      push!(dense_tail, I)
+    elseif is_link(I)
+      push!(sp_link, I)
+    else
+      push!(sp_nonlink, I)
+    end
+  end
+  sort_link_inds_cached!(sp_link)
+  return sp_link, sp_nonlink, dense_tail
+end
+
+
 function itensor_blocksparse_svd(
     phi::ITensors.ITensor,
     indsMb;
-    ortho::String="left",
-    maxdim::Int=typemax(Int),
-    mindim::Int=1,
-    cutoff::Float64=0.0,
-    tags=ITensors.ts"Link,l",
+    ortho::String   = "left",
+    maxdim::Int     = typemax(Int),
+    mindim::Int     = 1,
+    cutoff::Float64 = 0.0,
+    tags            = ITensors.ts"Link,l",   # caller MUST encode the level, see §3
 )
-    w  = ITensors.get_external_storage(phi)::WrappedBlockSparse
-    bs = w.blocksparse   # NewBlockSparseSorted{T,4,2,2}
-    # w.inds = (l_link, r_link, site1, site2) = (prefix1, prefix2, dense1, dense2)
-    l_ind, r_ind, s1_ind, s2_ind = w.inds
+  w        = ITensors.get_external_storage(phi)::WrappedBlockSparse
+  phi_inds = collect(w.inds)
 
-    U_bs, SV_bs, svs_kept, spec = blocksparse_svd(
-        bs; ortho, maxdim, mindim, cutoff
-    )
+  # Authoritative dense set — replaces `_P(bs)` + positional slicing of w.inds,
+  # which was the original source of the partition error.
+  dense_set = Set(dense_inds(w))
 
-    new_bond_dim = length(svs_kept)
-    new_bond_ind = ITensors.Index(new_bond_dim; tags)
+  # ----- bipartition by membership in indsMb -----
+  in_U   = Set(filter(i -> i ∈ phi_inds, indsMb))
+  U_legs = filter(i ->  i ∈ in_U, phi_inds)
+  V_legs = filter(i -> !(i ∈ in_U), phi_inds)
 
-    # U: prefix=(l, new_bond), dense=(s1)
-    L_it = ITensors._itensor_from_external_storage(
-        WrappedBlockSparse(U_bs, (l_ind, new_bond_ind, s1_ind))
-    )
-    # SV: prefix=(new_bond, r), dense=(s2)
-    R_it = ITensors._itensor_from_external_storage(
-        WrappedBlockSparse(SV_bs, (new_bond_ind, r_ind, s2_ind))
-    )
-    return L_it, R_it, spec
+  # Apply invariant ordering per side (links sorted, non-links, dense).
+  U_spL, U_spN, U_d = reorder_invariant(U_legs, dense_set)
+  V_spL, V_spN, V_d = reorder_invariant(V_legs, dense_set)
+
+  nls = length(U_spL) + length(U_spN)
+  nrs = length(V_spL) + length(V_spN)
+  nld = length(U_d)
+  nrd = length(V_d)
+
+  # ---------- KEY FIX ----------
+  # blocksparse_svd partitions positionally: dims[1:nls] is U-side sparse,
+  # dims[nls+1 : nls+nrs] is V-side sparse, then U dense, then V dense.
+  # Permute phi to match that layout so storage and the legs we picked agree.
+  desired = (U_spL..., U_spN..., V_spL..., V_spN..., U_d..., V_d...)
+  phi_p   = permute(phi, desired...; allow_alias = false)
+  bs_p    = ITensors.get_external_storage(phi_p).blocksparse
+
+  # println("itensor_blocksparse_svd: phi sp=$(nls+nrs) d=$(nld+nrd), ",
+  #         "U side nls=$nls nld=$nld")
+
+  U_bs, SV_bs, svs_kept, spec = blocksparse_svd(bs_p;
+      n_left_sparse = nls,
+      n_left_dense  = nld,
+      ortho, maxdim, mindim, cutoff)
+
+  # ----- new bond legs (one sparse + one dense). Tag carries the l-level. -----
+  n_new_sp = U_bs.dims[nls + 1]
+  n_new_d  = U_bs.dims[nls + 1 + nld + 1]
+  new_sp   = ITensors.Index(n_new_sp; tags = tags)
+  new_d    = ITensors.Index(n_new_d;  tags = tags)
+
+  # ----- inds in storage order produced by blocksparse_svd -----
+  #   U  storage: (U_spL..., U_spN..., new_sp, U_d..., new_d)
+  #   SV storage: (new_sp, V_spL..., V_spN..., new_d, V_d...)
+  U_inds_storage  = (U_spL..., U_spN..., new_sp, U_d..., new_d)
+  SV_inds_storage = (new_sp, V_spL..., V_spN..., new_d, V_d...)
+
+  # Sanity: storage and inds must agree leg-by-leg. Catches the original bug
+  # at its source if anything regresses.
+  @assert ntuple(i -> ITensors.dim(U_inds_storage[i]),  length(U_inds_storage)) ==
+          U_bs.dims  "U inds/storage dim mismatch: $(map(ITensors.dim, U_inds_storage)) vs $(U_bs.dims)"
+  @assert ntuple(i -> ITensors.dim(SV_inds_storage[i]), length(SV_inds_storage)) ==
+          SV_bs.dims "SV inds/storage dim mismatch: $(map(ITensors.dim, SV_inds_storage)) vs $(SV_bs.dims)"
+
+  L_it = ITensors._itensor_from_external_storage(WrappedBlockSparse(U_bs,  U_inds_storage))
+  R_it = ITensors._itensor_from_external_storage(WrappedBlockSparse(SV_bs, SV_inds_storage))
+
+  # ----- final permute to invariant order -----
+  # Storage order ≠ invariant order in general (e.g. a sparse non-link sits
+  # before new_sp in U's storage, but the invariant wants links first). Route
+  # through reorder_invariant — the same helper that owns the rule for
+  # contractions — so this function bakes in zero link logic of its own.
+  U_dense_set  = Set([U_d..., new_d])
+  SV_dense_set = Set([V_d..., new_d])
+
+  L_spL, L_spN, L_d = reorder_invariant(collect(U_inds_storage),  U_dense_set)
+  R_spL, R_spN, R_d = reorder_invariant(collect(SV_inds_storage), SV_dense_set)
+
+  L_it = permute(L_it, L_spL..., L_spN..., L_d...; allow_alias = true)
+  R_it = permute(R_it, R_spL..., R_spN..., R_d...; allow_alias = true)
+
+  # Round-trip diagnostic (gated). Helps localize partition / storage-permute bugs.
+  if get(ENV, "SPARSE_SVD_DEBUG", "0") != "0"
+    try
+      recon = L_it * R_it
+      # Use ITensor inner products for index-aware comparison
+      phi_norm2 = ITensors.scalar(ITensors.dag(phi) * phi)
+      rec_norm2 = ITensors.scalar(ITensors.dag(recon) * recon)
+      cross     = ITensors.scalar(ITensors.dag(phi)  * recon)
+      diff_norm2 = real(phi_norm2 - 2*real(cross) + rec_norm2)
+      err = sqrt(max(diff_norm2, 0.0)) / max(sqrt(real(phi_norm2)), 1e-300)
+      perm = ntuple(i -> findfirst(==(desired[i]), Tuple(w.inds)), length(desired))
+      P_orig = SparseBackends._P(w.blocksparse)
+      P_new = SparseBackends._P(bs_p)
+      println("[itensor_blocksparse_svd] err=$err  ‖phi‖²=$(real(phi_norm2))  ‖rec‖²=$(real(rec_norm2))  ⟨phi,rec⟩=$(real(cross))",
+              "  origP=$P_orig newP=$P_new  perm=$perm",
+              "  phi_dims=$(map(ITensors.dim, phi_inds))  desired_dims=$(map(ITensors.dim, desired))",
+              "  nls=$nls nrs=$nrs nld=$nld nrd=$nrd")
+    catch e
+      println("[itensor_blocksparse_svd] diag failed: ", sprint(showerror, e))
+    end
+  end
+
+  return L_it, R_it, spec
 end

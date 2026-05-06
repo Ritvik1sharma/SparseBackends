@@ -90,6 +90,23 @@ function setprime(w::SparseBackends.WrappedBlockSparse{T,N,N2,P}, args...) where
 end
 
 
+function replaceinds(w::SparseBackends.WrappedBlockSparse{T,N,N2,P}, inds1, inds2) where {T,N,N2,P}
+  new_inds = ITensors.replaceinds(w.inds, inds1, inds2)
+  return SparseBackends.WrappedBlockSparse{T,N,N2,P}(w.blocksparse, new_inds)
+end
+
+function replaceinds(w::SparseBackends.WrappedCOOTensor{T,N}, inds1, inds2) where {T,N}
+  new_inds = ITensors.replaceinds(w.inds, inds1, inds2)
+  return SparseBackends.WrappedCOOTensor{T,N}(w.coo, new_inds)
+end
+
+function ITensors.replaceinds(es::ITensors.ExternalStorage{S}, inds1, inds2; kwargs...) where {S}
+  data = es.data
+  data isa WrappedTensorTypes || throw(MethodError(ITensors.replaceinds, (es, inds1, inds2)))
+  newdata = replaceinds(data, inds1, inds2)
+  return ITensors._itensor_from_external_storage(newdata)
+end
+
 function ITensors.replaceprime(es::ITensors.ExternalStorage{S}, ps::Pair{Int,Int}...; kwargs...) where {S}
   data = es.data
   data isa WrappedTensorTypes || throw(MethodError(ITensors.replaceprime, (es, ps...)))

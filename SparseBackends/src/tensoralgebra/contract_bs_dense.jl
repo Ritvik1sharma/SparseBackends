@@ -617,3 +617,22 @@ function contract_shared!(
 
   return C
 end
+function contract_bs_dense_to_dense!(
+    C::AbstractArray{TC},
+    labelsC::AbstractVector{Label},
+    A::NewBlockSparseSorted{TA,NA,NA2,PA},
+    labelsA::AbstractVector{Label},
+    B::AbstractArray{TB,NB},
+    labelsB::AbstractVector{Label},
+) where {TC,TA,NA,NA2,PA,TB,NB}
+    NC    = ndims(C)
+    dimsC = ntuple(i -> size(C, i), Val(NC))
+    C_bs  = NewBlockSparseSorted{TC, NC, NC}(dimsC)
+    contract!(C_bs, labelsC, A, labelsA, B, labelsB)
+    if !isempty(C_bs.keys)
+        blk = _block_view(C_bs, C_bs.ids[1])
+        NC == 0 ? (C[] = blk[1]) : copyto!(C, reshape(blk, dimsC))
+    end
+    return C
+end
+

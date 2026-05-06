@@ -124,6 +124,17 @@ let
     any(ITensors.has_external_storage, psi_sp) || println("WARNING: psi_sp has no external storage tensors!")
     println("psi_sp tensor types: ", [ITensors.has_external_storage(psi_sp[i]) ? "BS" : "dense" for i in 1:length(psi_sp)])
 
+    # ── Pre-DMRG diagnostics (H1: orthogonalize is skipped for sparse psi) ───
+    println("[pre-DMRG dense]  norm(psi1)   = ", norm(psi1),
+            "  isortho = ", isortho(psi1),
+            "  <psi|psi> = ", inner(psi1, psi1),
+            "  <psi|H|psi> = ", inner(psi1', H, psi1))
+    println("[pre-DMRG sparse] norm(psi_sp) = ", norm(psi_sp),
+            "  isortho = ", isortho(psi_sp),
+            "  <psi|psi> = ", inner(psi_sp, psi_sp),
+            "  <psi|H|psi> = ", inner(psi_sp', H, psi_sp),
+            "  <psi|H_sparse|psi> = ", inner(psi_sp', H_sparse, psi_sp))
+
     # ── Sparse DMRG ──────────────────────────────────────────────────────────
     t_sparse = @elapsed begin
         E_sparse, psi_sparse, sw_sparse, terr_sparse = dmrg(
