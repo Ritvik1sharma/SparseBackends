@@ -1148,21 +1148,28 @@ function itensor_blocksparse_svd(
   if get(ENV, "SPARSE_SVD_DEBUG", "0") != "0"
     try
       recon = L_it * R_it
-      # Use ITensor inner products for index-aware comparison
       phi_norm2 = ITensors.scalar(ITensors.dag(phi) * phi)
       rec_norm2 = ITensors.scalar(ITensors.dag(recon) * recon)
       cross     = ITensors.scalar(ITensors.dag(phi)  * recon)
       diff_norm2 = real(phi_norm2 - 2*real(cross) + rec_norm2)
       err = sqrt(max(diff_norm2, 0.0)) / max(sqrt(real(phi_norm2)), 1e-300)
+      # Also: convert L_it and R_it to dense ITensors and contract — this isolates
+      # the sparse contraction routine vs the SVD math.
+      L_d = to_dense_itensors(L_it); R_d = to_dense_itensors(R_it)
+      recon_d = L_d * R_d
+      phi_d   = to_dense_itensors(phi)
+      cross_d = ITensors.scalar(ITensors.dag(phi_d) * recon_d)
+      rd2     = ITensors.scalar(ITensors.dag(recon_d) * recon_d)
+      pd2     = ITensors.scalar(ITensors.dag(phi_d) * phi_d)
+      diff_d2 = real(pd2 - 2*real(cross_d) + rd2)
+      err_d = sqrt(max(diff_d2, 0.0)) / max(sqrt(real(pd2)), 1e-300)
       perm = ntuple(i -> findfirst(==(desired[i]), Tuple(w.inds)), length(desired))
-      P_orig = SparseBackends._P(w.blocksparse)
-      P_new = SparseBackends._P(bs_p)
-      println("[itensor_blocksparse_svd] err=$err  ‖phi‖²=$(real(phi_norm2))  ‖rec‖²=$(real(rec_norm2))  ⟨phi,rec⟩=$(real(cross))",
-              "  origP=$P_orig newP=$P_new  perm=$perm",
-              "  phi_dims=$(map(ITensors.dim, phi_inds))  desired_dims=$(map(ITensors.dim, desired))",
+      println("[svd] sp_err=$err  d_err=$err_d  ‖phi‖²_sp=$(real(phi_norm2)) _d=$(real(pd2))",
+              "  ‖rec‖²_sp=$(real(rec_norm2)) _d=$(real(rd2))",
+              "  perm=$perm  phi_dims=$(map(ITensors.dim, phi_inds))",
               "  nls=$nls nrs=$nrs nld=$nld nrd=$nrd")
     catch e
-      println("[itensor_blocksparse_svd] diag failed: ", sprint(showerror, e))
+      println("[svd] diag failed: ", sprint(showerror, e))
     end
   end
 
