@@ -139,7 +139,7 @@ function link_level(I::ITensors.Index)
 end
 
 "Sort link indices by their l=<n> tag (ascending)."
-function sort_link_inds(link_inds::Vector{<:ITensors.Index}; missing=:error)
+function sort_link_inds(link_inds::Vector{<:ITensors.Index}; missing=:last)
   levels = map(link_level, link_inds)
   if any(==(nothing), levels)
     if missing == :error
@@ -225,23 +225,93 @@ end
 # end
 
 
-function WrappedTensor(T::ITensors.ITensor;
-                       bra_plev::Union{Nothing,Int}=nothing,
-                       ket_plev::Union{Nothing,Int}=nothing)
-  bra, ket, links = mpo_axes_itensor(T; bra_plev=bra_plev, ket_plev=ket_plev)
-  links = sort_links(links)
-  if bra !== nothing && ket !== nothing
-    inds_full = Tuple(vcat(bra, ket, links))
-  elseif bra !== nothing
-    inds_full = Tuple(vcat(bra, links))
-  elseif ket !== nothing
-    inds_full = Tuple(vcat(ket, links))
-  else
-    inds_full = Tuple(ITensors.Index[])
-  end
-  array_full = Array(T, inds_full...)
-  return WrappedTensor(array_full, inds_full)
+const _wrap_cache = Dict{UInt, Any}()
+
+function clear_wrap_cache!()
+    empty!(_wrap_cache)
 end
+
+# function _wrap_itensor_uncached(T::ITensors.ITensor;
+#                                 bra_plev::Union{Nothing,Int}=nothing,
+#                                 ket_plev::Union{Nothing,Int}=nothing)
+#   bra, ket, links = mpo_axes_itensor(T; bra_plev=bra_plev, ket_plev=ket_plev)
+#   links      = sort_links(links)
+#   if bra !== nothing && ket !== nothing
+#     inds_full = Tuple(vcat(bra, ket, links))
+#   elseif bra !== nothing
+#     inds_full = Tuple(vcat(bra, links))
+#   elseif ket !== nothing
+#     inds_full = Tuple(vcat(ket, links))
+#   else
+#     inds_full = Tuple(ITensors.Index[])
+#   end
+#   inds_full  = Tuple(vcat(bra, ket, links))
+#   array_full = Array(T, inds_full...)
+#   return WrappedTensor(array_full, inds_full)
+# end
+
+
+function _wrap_itensor_uncached(T::ITensors.ITensor;
+                                bra_plev::Union{Nothing,Int}=nothing,
+                                ket_plev::Union{Nothing,Int}=nothing)
+    bra, ket, links = mpo_axes_itensor(T; bra_plev=bra_plev, ket_plev=ket_plev)
+    links = sort_links(links)
+    # Keep original conditional logic — bra/ket may both be non-empty
+    # even when the tensor has only one site leg, so unconditional vcat
+    # would over-count indices.
+    inds_full = if !isempty(bra) && !isempty(ket)
+        Tuple(vcat(bra, ket, links))
+    elseif !isempty(bra)
+        Tuple(vcat(bra, links))
+    elseif !isempty(ket)
+        Tuple(vcat(ket, links))
+    else
+        Tuple(links)
+    end
+    dims_full = map(ITensors.dim, inds_full)
+    array_full = if ITensors.inds(T) == inds_full
+        # ITensors.data(T) returns the flat underlying Vector directly.
+        raw = ITensors.data(T)
+        reshape(raw, dims_full)
+    else
+        Array(T, inds_full...)
+    end    
+    return WrappedTensor(array_full, inds_full)
+end
+
+function WrappedTensor(T::ITensors.ITensor;
+                      backend::Symbol=:dense,   # kept for call-site compat
+                      bra_plev::Union{Nothing,Int}=nothing,
+                      ket_plev::Union{Nothing,Int}=nothing)
+    # key    = objectid(T)
+    # cached = get(_wrap_cache, key, nothing)
+    # if cached !== nothing
+    #     return cached::WrappedTensor
+    # end
+    w = _wrap_itensor_uncached(T; bra_plev=bra_plev, ket_plev=ket_plev)
+    # _wrap_cache[key] = w
+    return w
+end
+
+
+# function WrappedTensor(T::ITensors.ITensor;
+#                        bra_plev::Union{Nothing,Int}=nothing,
+#                        ket_plev::Union{Nothing,Int}=nothing)
+#   bra, ket, links = mpo_axes_itensor(T; bra_plev=bra_plev, ket_plev=ket_plev)
+#   links = sort_links(links)
+#   if bra !== nothing && ket !== nothing
+#     inds_full = Tuple(vcat(bra, ket, links))
+#   elseif bra !== nothing
+#     inds_full = Tuple(vcat(bra, links))
+#   elseif ket !== nothing
+#     inds_full = Tuple(vcat(ket, links))
+#   else
+#     inds_full = Tuple(ITensors.Index[])
+#   end
+#   array_full = Array(T, inds_full...)
+#   return WrappedTensor(array_full, inds_full)
+# end
+
 
 function WrappedCOOTensor(T::ITensors.ITensor;
                           bra_plev::Union{Nothing,Int}=nothing,
@@ -335,7 +405,15 @@ function wrap_itensor(T::ITensors.ITensor; backend::Symbol=backend_hint(T), dens
   end
 
   if backend === :dense
-    return WrappedTensor(T)
+    # Fast path for plain dense ITensors: just reshape the raw data buffer
+    # to its inds-order layout (which already matches ITensors.data(T)).
+    # Skips mpo_axes_itensor's index classification + sort_links, since
+    # downstream code only needs (data, inds) in a self-consistent order.
+    inds_full = Tuple(ITensors.inds(T))
+    dims_full = map(ITensors.dim, inds_full)
+    raw       = ITensors.data(T)
+    array_full = reshape(raw, dims_full)
+    return WrappedTensor(array_full, inds_full)
   elseif backend === :coo
     return WrappedCOOTensor(T)
   elseif backend === :blocksparse
@@ -391,23 +469,39 @@ function contract(A::ITensors.ITensor, B::ITensors.ITensor,
 end
 
 function contract(A::ITensors.ITensor, B::WrappedTensorTypes{TB,NB}; kwargs...) where {TB,NB}
-  Aw = wrap_itensor(A; backend=:dense)
+  @timeit TIMER "wrap_itensor(A,dense)" begin
+    Aw = wrap_itensor(A; backend=:dense)
+  end
   Cw = contract(Aw, B; kwargs...)
+  # Cw = contract(Aw, B; kwargs...)
   Cw isa ITensors.ITensor && return Cw
   if Cw isa WrappedBlockSparse && is_dense(Cw.blocksparse)
-    data = to_dense(Cw.blocksparse)
-    return ITensors.ITensor(data, Cw.inds...)
+    shared = Set(ITensors.inds(A)) ∩ Set(B.inds)
+    println("Dense output D*S: ", ITensors.inds(A), " x ", B.inds, " = ", shared)
+    @timeit TIMER "to_dense(C)" begin
+      data = to_dense(Cw.blocksparse)
+      out = ITensors.ITensor(data, Cw.inds...)
+    end
+    error("Output is dense but currently wrapped in a WrappedBlockSparse; consider returning a plain ITensor instead for better performance")
+    return out
   end
   return ITensors._itensor_from_external_storage(Cw)
 end
 
 function contract(A::WrappedTensorTypes{TA,NA}, B::ITensors.ITensor; kwargs...) where {TA,NA}
-  Bw = wrap_itensor(B; backend=:dense)
+  @timeit TIMER "wrap_itensor(B,dense)" begin
+    Bw = wrap_itensor(B; backend=:dense)
+  end
   Cw = contract(A, Bw; kwargs...)
   Cw isa ITensors.ITensor && return Cw
   if Cw isa WrappedBlockSparse && is_dense(Cw.blocksparse)
-    data = to_dense(Cw.blocksparse)
-    return ITensors.ITensor(data, Cw.inds...)
+    shared = Set(A.inds) ∩ Set(ITensors.inds(B))
+    println("Dense output S*D: ", A.inds, " x ", ITensors.inds(B), " = ", shared)
+    @timeit TIMER "to_dense(C)" begin
+      data = to_dense(Cw.blocksparse)
+      out = ITensors.ITensor(data, Cw.inds...)
+    end
+    return out
   end
   return ITensors._itensor_from_external_storage(Cw)
 end
@@ -418,7 +512,7 @@ end
 
 
 # Sort link indices by their l=<n> tag (ascending) with cached levels
-function sort_link_inds_cached!(link_inds::Vector{<:ITensors.Index}; missing::Symbol = :error)
+function sort_link_inds_cached!(link_inds::Vector{<:ITensors.Index}; missing::Symbol = :last)
     n = length(link_inds)
     n == 0 && return link_inds
     levels = Vector{Int}(undef, n)
@@ -522,6 +616,41 @@ function output_inds(
     return output_inds(indsA, indsB, denseA, denseB)
 end
 
+# Reorder indsC so it matches the canonical layout that `contract_bs_dense_to_dense!`
+# writes into Ctgt: [keepA (BS dense-tail kept), keepB (dense-side kept),
+# c_prefix (BS sparse-prefix kept)]. When labelsC is in canonical order, the
+# kernel takes its "write directly into C" branch and skips the trailing
+# permute_back copy. Order within each group follows the BS side's / dense
+# side's original index order, matching the kernel's classify pass.
+function canonical_indsC_for_bd(
+    indsBS::NTuple{NA,ITensors.Index{T}},
+    denseBS::Set{ITensors.Index{T}},
+    indsDense::NTuple{NB,ITensors.Index{T}},
+    indsC::Tuple,
+) where {NA,NB,T}
+    setC = Set{ITensors.Index{T}}()
+    @inbounds for I in indsC; push!(setC, I); end
+    setBS = Set{ITensors.Index{T}}()
+    @inbounds for I in indsBS; push!(setBS, I); end
+    keepA    = ITensors.Index{T}[]; sizehint!(keepA, NA)
+    c_prefix = ITensors.Index{T}[]; sizehint!(c_prefix, NA)
+    @inbounds for I in indsBS
+        (I in setC) || continue
+        if I in denseBS
+            push!(keepA, I)
+        else
+            push!(c_prefix, I)
+        end
+    end
+    keepB = ITensors.Index{T}[]; sizehint!(keepB, NB)
+    @inbounds for I in indsDense
+        if (I in setC) && !(I in setBS)
+            push!(keepB, I)
+        end
+    end
+    return Tuple(vcat(keepA, keepB, c_prefix))
+end
+
 
 function perm_from_label_reorder(old_labels::AbstractVector{Symbol},
                                  new_labels::AbstractVector{Symbol})
@@ -598,24 +727,26 @@ end
 
 
 function wrapped_contract(A::WrappedTensorTypes{TA,NA},
-                          B::WrappedTensorTypes{TB,NB}; kwargs...) where {TA,TB,NA,NB}
-    # time = @elapsed begin
+                          B::WrappedTensorTypes{TB,NB};
+                          output_backend::Symbol=:blocksparse) where {TA,TB,NA,NB}
+  @timeit TIMER "wrapped_contract" begin
+    @timeit TIMER "wc.setup" begin
       Arep = rep(A)
       Brep = rep(B)
       indsA = A.inds
       indsB = B.inds
       denseA = dense_inds(A)
       denseB = dense_inds(B)
-    # end
+    end
     if get(ENV, "SB_TRACE", "0") == "1"
       println("[SB_TRACE] wrapped_contract  A=", _backend(A), "{T=", TA, ",N=", NA, "}",
               "  B=", _backend(B), "{T=", TB, ",N=", NB, "}",
               "  → C=", infer_C_backend(A, B))
     end
-    # time2 = @elapsed begin
+    @timeit TIMER "wc.output_inds" begin
       indsC, denseC = output_inds(indsA, indsB, denseA, denseB)
-    # end
-    # time3 = @elapsed begin
+    end
+    @timeit TIMER "wc.labels" begin
       dimsC = ntuple(i -> ITensors.dim(indsC[i]), length(indsC))
       TC = promote_type(eltype(Arep), eltype(Brep))
       Cbackend = infer_C_backend(A, B)
@@ -623,54 +754,114 @@ function wrapped_contract(A::WrappedTensorTypes{TA,NA},
       labelsA_vec = fill_labels!(sc.labelsA, indsA)
       labelsB_vec = fill_labels!(sc.labelsB, indsB)
       labelsC_vec = fill_labels!(sc.labelsC, indsC)
-    # end    
+    end
     if Cbackend === :blocksparse
-        # println("inds of a and b: ", indsA, " ", indsB)
-        # println("number of sparse and dense of A and B ", length(indsA) - length(denseA), " ", length(denseA), " ", length(indsB) - length(denseB), " ", length(denseB))
-        # println("Contracting into BlockSparse. dimsC: ", dimsC, " denseC: ", denseC)
         denseLinksC = length(denseC)
         if denseLinksC == length(indsC)
             # P_C = 0: all output indices are dense → return plain ITensor
-            C_data = zeros(TC, dimsC...)
+            @timeit TIMER "wc.alloc_dense" begin
+              C_data = zeros(TC, dimsC...)
+            end
             if Arep isa NewBlockSparseSorted && Brep isa NewBlockSparseSorted
+              @timeit TIMER "kern.bs_bs_to_dense" begin
                 SparseBackends.contract_bs_bs_to_dense!(
                     C_data, labelsC_vec, Arep, labelsA_vec, Brep, labelsB_vec)
+              end
             elseif Arep isa NewBlockSparseSorted && Brep isa AbstractArray
+              @timeit TIMER "kern.bs_dense_to_dense" begin
                 SparseBackends.contract_bs_dense_to_dense!(
                     C_data, labelsC_vec, Arep, labelsA_vec, Brep, labelsB_vec)
+              end
             elseif Arep isa AbstractArray && Brep isa NewBlockSparseSorted
+              @timeit TIMER "kern.bs_dense_to_dense" begin
                 SparseBackends.contract_bs_dense_to_dense!(
                     C_data, labelsC_vec, Brep, labelsB_vec, Arep, labelsA_vec)
+              end
             else
-                # Both dense: direct tensor contraction via einsum
+              @timeit TIMER "kern.dense_dense_einsum" begin
                 C_bs = NewBlockSparseSorted{TC, length(dimsC), length(dimsC)}(dimsC)
                 contract!(C_bs, labelsC_vec, NewBlockSparseSorted(Arep), labelsA_vec, Brep, labelsB_vec)
+              end
             end
             return length(indsC) == 0 ? ITensors.ITensor(C_data[]) : ITensors.ITensor(C_data, indsC...)
         end
-        # time = @elapsed begin
-          C = WrappedBlockSparse(TC, dimsC, denseLinksC, indsC)
-        # end
-        # println("Time to construct empty blocksparse: $time")
-        # time = @elapsed begin
-        C.blocksparse = SparseBackends.contract!(
-            C.blocksparse, labelsC_vec,
-            Arep, labelsA_vec,
-            Brep, labelsB_vec
-        )
-        # println("Time to contract into blocksparse: $time")
+
+        # if output_backend === :dense
+        shared = indsA ∩ indsB
+        # println("Shared indices: ", shared, " with dense ", denseA, " and ", denseB)
+        if (A isa WrappedTensor && B isa WrappedBlockSparse) ||
+          (A isa WrappedBlockSparse && B isa WrappedTensor)
+          output_backend = :dense  
+          for I in shared
+            if !(I in denseA) && !(I in denseB)
+              output_backend = :blocksparse
+              break
+            end
+          end
+          # if output_backend === :dense
+          #   println("Output will be dense because shared index ", shared, " is dense")
+          # else
+          #   println("Output will be block-sparse because shared index ", shared, " is sparse")
+          # end
+        end
+
+        if output_backend === :dense
+          # Reorder indsC to canonical [keepA, keepB, c_prefix] for the bd
+          # kernel so it skips its trailing permute_back copy. Only applies
+          # to BS×Dense (and Dense×BS); BS×BS keeps the original output_inds
+          # order. ITensor identifies by Index identity, so the reorder is
+          # invisible to callers.
+          if Arep isa NewBlockSparseSorted && !(Brep isa NewBlockSparseSorted)
+              indsC = canonical_indsC_for_bd(indsA, denseA, indsB, indsC)
+              dimsC = ntuple(i -> ITensors.dim(indsC[i]), length(indsC))
+              labelsC_vec = fill_labels!(sc.labelsC, indsC)
+          end
+          @timeit TIMER "wc.alloc_dense" begin
+            C_data = zeros(TC, dimsC...)
+          end
+          if Arep isa NewBlockSparseSorted
+            if Brep isa NewBlockSparseSorted
+              @timeit TIMER "kern.bs_bs_to_dense" begin
+                SparseBackends.contract_bs_bs_to_dense!(
+                    C_data, labelsC_vec, Arep, labelsA_vec, Brep, labelsB_vec)
+              end
+            else Brep isa AbstractArray
+              @timeit TIMER "kern.bs_dense_to_dense" begin
+                SparseBackends.contract_bs_dense_to_dense!(
+                    C_data, labelsC_vec, Arep, labelsA_vec, Brep, labelsB_vec)
+              end
+            end
+          end
+          return length(indsC) == 0 ? ITensors.ITensor(C_data[]) : ITensors.ITensor(C_data, indsC...)
+        else
+          @timeit TIMER "wc.alloc_bs" begin
+            C = WrappedBlockSparse(TC, dimsC, denseLinksC, indsC)
+          end
+          @timeit TIMER "kern.contract!_bs_out" begin
+            C.blocksparse = SparseBackends.contract!(
+                C.blocksparse, labelsC_vec,
+                Arep, labelsA_vec,
+                Brep, labelsB_vec
+            )
+          end
+        end
         return C
     elseif Cbackend === :coo
-        C = WrappedCOOTensor(TC, dimsC, indsC)
-        C.coo = SparseBackends.contract!(
-            C.coo, labelsC_vec,
-            Arep, labelsA_vec,
-            Brep, labelsB_vec
-        )
+        @timeit TIMER "wc.alloc_coo" begin
+          C = WrappedCOOTensor(TC, dimsC, indsC)
+        end
+        @timeit TIMER "kern.contract!_coo_out" begin
+          C.coo = SparseBackends.contract!(
+              C.coo, labelsC_vec,
+              Arep, labelsA_vec,
+              Brep, labelsB_vec
+          )
+        end
         return C
     else
         error("Unsupported backend: $Cbackend")
     end
+  end  # @timeit "wrapped_contract"
 end
 
 
@@ -757,6 +948,26 @@ function to_dense(T::ITensors.ITensor)
     # # println("\tConverting ITensor to dense. inds: ", inds, " dims: ", ITensors.dim.(inds))
     # return arr
   end
+end
+
+"""
+    to_dense_itensors_unfused(T) -> ITensor
+
+Same as `to_dense_itensors` but does NOT fuse doubled-link indices. Returns a
+dense ITensor with EXACTLY the same Index objects as `T`, just dense storage.
+Required when downstream code (e.g. `factorize`/`uniqueinds`) needs to keep
+Index identity stable across the conversion.
+"""
+function to_dense_itensors_unfused(T::ITensors.ITensor)::ITensors.ITensor
+  if T.tensor isa ITensors.ExternalStorage
+    es = T.tensor::ITensors.ExternalStorage
+    data = es.data
+    if data isa WrappedBlockSparse
+      arr = to_dense(data.blocksparse)         # no merged_axes — keep all axes
+      return ITensors.ITensor(arr, ITensors.inds(T)...)
+    end
+  end
+  return ITensors.ITensor(to_dense(T), ITensors.inds(T)...)
 end
 
 function to_dense_itensors(T::ITensors.ITensor)::ITensors.ITensor
@@ -922,8 +1133,9 @@ end
 
 function ITensors._contract_external_storage(A::ITensors.ITensor,
                                              Bw::WrappedTensorTypes; kwargs...)
-  # println("A")
-  result = contract(A, Bw; kwargs...)
+  @timeit TIMER "ext_dispatch[dense×wrapped]" begin
+    result = contract(A, Bw; kwargs...)
+  end
   return result
 end
 
@@ -931,16 +1143,18 @@ end
 # external-storage × ITensor
 function ITensors._contract_external_storage(Aw::WrappedTensorTypes,
                                              B::ITensors.ITensor; kwargs...)
-  # println("B")
-  result = contract(Aw, B; kwargs...)
+  @timeit TIMER "ext_dispatch[wrapped×dense]" begin
+    result = contract(Aw, B; kwargs...)
+  end
   return result
 end
 
 function ITensors._contract_external_storage(Aw::WrappedTensorTypes, Bw::WrappedTensorTypes; kwargs...)
-  # println("C")
-  result = contract(Aw, Bw; kwargs...)
-  result isa ITensors.ITensor && return result  # P_C=0: already a plain Dense ITensor, use directly
-  return ITensors._itensor_from_external_storage(result)
+  @timeit TIMER "ext_dispatch[wrapped×wrapped]" begin
+    result = contract(Aw, Bw; kwargs...)
+    result isa ITensors.ITensor && return result  # P_C=0: already a plain Dense ITensor, use directly
+    return ITensors._itensor_from_external_storage(result)
+  end
 end
 
 function ITensors._dims(w::WrappedTensorTypes)
@@ -1062,6 +1276,152 @@ function reorder_invariant(legs, dense_set)
 end
 
 
+# Channel-aware SVD: factorizes phi back into L, R where L and R inherit
+# the EXACT block-key structure of the OLD M[b] and M[b+1] respectively.
+# The new bond reuses the old bond's sparse Index, so each channel value k
+# (= old bond sparse-axis value) labels the corresponding new-bond sector.
+# Phi blocks are partitioned by channel via lookups built from M[b]/M[b+1]'s
+# block keys: for each phi block (lk_tuple, rk_tuple) the unique channel k
+# satisfying (lk_tuple, k) ∈ M[b]_blocks AND (k, rk_tuple) ∈ M[b+1]_blocks is
+# located, and phi is SVD'd per channel. Cross-channel rows are disjoint
+# (each channel pairs with disjoint (lk, k) sets), so the isometric factor
+# is globally isometric.
+function itensor_blocksparse_svd_channel_aware(
+    phi::ITensors.ITensor,
+    M_b::ITensors.ITensor,
+    M_b1::ITensors.ITensor;
+    ortho::String   = "left",
+    maxdim::Int     = typemax(Int),
+    mindim::Int     = 1,
+    cutoff::Float64 = 0.0,
+)
+    @assert ITensors.has_external_storage(phi) "phi must be block-sparse"
+    @assert ITensors.has_external_storage(M_b) "M_b must be block-sparse"
+    @assert ITensors.has_external_storage(M_b1) "M_b1 must be block-sparse"
+    w_phi = ITensors.get_external_storage(phi)::WrappedBlockSparse
+    w_b   = ITensors.get_external_storage(M_b)::WrappedBlockSparse
+    w_b1  = ITensors.get_external_storage(M_b1)::WrappedBlockSparse
+
+    # Identify OLD shared bond between M_b and M_b1.
+    shared      = collect(ITensors.commoninds(M_b, M_b1))
+    dense_b     = dense_inds(w_b)
+    bond_sparse = first(I for I in shared if !(I in dense_b))
+    bond_mult   = first(I for I in shared if  (I in dense_b))
+    bond_sp_dim = ITensors.dim(bond_sparse)
+
+    # indsMb = legs of M_b that survive into phi's L-side (everything except shared bond).
+    indsMb = [I for I in ITensors.inds(M_b) if !(I in shared)]
+
+    # ----- bipartition phi (mirror itensor_blocksparse_svd) -----
+    phi_inds_all = collect(w_phi.inds)
+    dense_set    = Set(dense_inds(w_phi))
+    in_U   = Set(filter(i -> i ∈ phi_inds_all, indsMb))
+    U_legs = filter(i ->  i ∈ in_U, phi_inds_all)
+    V_legs = filter(i -> !(i ∈ in_U), phi_inds_all)
+    U_spL, U_spN, U_d = reorder_invariant(U_legs, dense_set)
+    V_spL, V_spN, V_d = reorder_invariant(V_legs, dense_set)
+    nls = length(U_spL) + length(U_spN)
+    nrs = length(V_spL) + length(V_spN)
+    nld = length(U_d)
+    nrd = length(V_d)
+
+    desired = (U_spL..., U_spN..., V_spL..., V_spN..., U_d..., V_d...)
+    phi_p   = permute(phi, desired...; allow_alias = true)
+    bs_p    = ITensors.get_external_storage(phi_p).blocksparse
+
+    L_phi_sparse = (U_spL..., U_spN...)
+    R_phi_sparse = (V_spL..., V_spN...)
+
+    # ---- Build templates from M_b, M_b1 blocks -------------------------------
+    M_b_inds        = collect(w_b.inds)
+    M_b1_inds       = collect(w_b1.inds)
+    dense_b1        = dense_inds(w_b1)
+    M_b_sparse_pos  = [i for i in 1:length(M_b_inds)  if !(M_b_inds[i]  in dense_b)]
+    M_b1_sparse_pos = [i for i in 1:length(M_b1_inds) if !(M_b1_inds[i] in dense_b1)]
+
+    bond_pos_in_b  = findfirst(p -> M_b_inds[p]  == bond_sparse, M_b_sparse_pos)
+    bond_pos_in_b1 = findfirst(p -> M_b1_inds[p] == bond_sparse, M_b1_sparse_pos)
+
+    # Map each non-bond sparse axis of M_b to its slot in L_phi_sparse storage order.
+    non_bond_b_pos  = [p for (i, p) in enumerate(M_b_sparse_pos)  if i != bond_pos_in_b]
+    non_bond_b1_pos = [p for (i, p) in enumerate(M_b1_sparse_pos) if i != bond_pos_in_b1]
+    perm_b  = [findfirst(I -> I == M_b_inds[p],  L_phi_sparse) for p in non_bond_b_pos]
+    perm_b1 = [findfirst(I -> I == M_b1_inds[p], R_phi_sparse) for p in non_bond_b1_pos]
+    @assert all(!isnothing, perm_b)  "M_b non-bond sparse axes don't all map into L_phi_sparse"
+    @assert all(!isnothing, perm_b1) "M_b1 non-bond sparse axes don't all map into R_phi_sparse"
+
+    Kt = eltype(eltype(w_b.blocksparse.keys))
+    LTupT = NTuple{nls, Kt}
+    RTupT = NTuple{nrs, Kt}
+
+    left_template = Tuple{LTupT, Kt}[]
+    for key in w_b.blocksparse.keys
+        vals     = [key[p] for p in M_b_sparse_pos]
+        ch       = Kt(vals[bond_pos_in_b])
+        non_bond = [vals[i] for i in 1:length(vals) if i != bond_pos_in_b]
+        lk       = Vector{Kt}(undef, nls)
+        for (s, d) in enumerate(perm_b); lk[d] = Kt(non_bond[s]); end
+        push!(left_template, (NTuple{nls,Kt}(lk), ch))
+    end
+    right_template = Tuple{Kt, RTupT}[]
+    for key in w_b1.blocksparse.keys
+        vals     = [key[p] for p in M_b1_sparse_pos]
+        ch       = Kt(vals[bond_pos_in_b1])
+        non_bond = [vals[i] for i in 1:length(vals) if i != bond_pos_in_b1]
+        rk       = Vector{Kt}(undef, nrs)
+        for (s, d) in enumerate(perm_b1); rk[d] = Kt(non_bond[s]); end
+        push!(right_template, (ch, NTuple{nrs,Kt}(rk)))
+    end
+
+    U_bs, SV_bs, svs_kept, spec = blocksparse_svd_channel_aware(bs_p;
+        n_left_sparse = nls,
+        n_left_dense  = nld,
+        left_template, right_template,
+        bond_sparse_dim = bond_sp_dim,
+        ortho, maxdim, mindim, cutoff)
+
+    # Reuse old bond_sparse Index as new bond's sparse axis. Fresh Index for mult.
+    new_sp  = bond_sparse
+    n_new_d = U_bs.dims[nls + 1 + nld + 1]
+    new_d   = ITensors.Index(n_new_d; tags = ITensors.tags(bond_mult))
+
+    U_inds_storage  = (U_spL..., U_spN..., new_sp, U_d..., new_d)
+    SV_inds_storage = (new_sp, V_spL..., V_spN..., new_d, V_d...)
+
+    @assert ntuple(i -> ITensors.dim(U_inds_storage[i]),  length(U_inds_storage)) ==
+            U_bs.dims  "U inds/storage dim mismatch"
+    @assert ntuple(i -> ITensors.dim(SV_inds_storage[i]), length(SV_inds_storage)) ==
+            SV_bs.dims "SV inds/storage dim mismatch"
+
+    L_it = ITensors._itensor_from_external_storage(WrappedBlockSparse(U_bs,  U_inds_storage))
+    R_it = ITensors._itensor_from_external_storage(WrappedBlockSparse(SV_bs, SV_inds_storage))
+
+    U_dense_set  = Set([U_d..., new_d])
+    SV_dense_set = Set([V_d..., new_d])
+    L_spL, L_spN, L_d = reorder_invariant(collect(U_inds_storage),  U_dense_set)
+    R_spL, R_spN, R_d = reorder_invariant(collect(SV_inds_storage), SV_dense_set)
+    L_it = permute(L_it, L_spL..., L_spN..., L_d...; allow_alias = true)
+    R_it = permute(R_it, R_spL..., R_spN..., R_d...; allow_alias = true)
+
+    return L_it, R_it, spec
+end
+
+
+# Sparse-axis dim of the bond shared between two adjacent block-sparse tensors.
+# Returns -1 if either tensor lacks BlockSparse external storage (i.e. no
+# structured target to preserve — caller will use the SVD's natural sparse dim).
+function shared_bond_sparse_dim(A::ITensors.ITensor, B::ITensors.ITensor)::Int
+    (ITensors.has_external_storage(A) && ITensors.has_external_storage(B)) || return -1
+    wA = ITensors.get_external_storage(A)
+    wA isa WrappedBlockSparse || return -1
+    dA = dense_inds(wA)
+    shared = ITensors.commoninds(A, B)
+    sparse_shared = [I for I in shared if !(I in dA)]
+    isempty(sparse_shared) && return -1
+    return prod(ITensors.dim(I) for I in sparse_shared; init = 1)
+end
+
+
 function itensor_blocksparse_svd(
     phi::ITensors.ITensor,
     indsMb;
@@ -1070,6 +1430,12 @@ function itensor_blocksparse_svd(
     mindim::Int     = 1,
     cutoff::Float64 = 0.0,
     tags            = ITensors.ts"Link,l",   # caller MUST encode the level, see §3
+    bin_by_right::Bool = false,              # when true, bin per-right-sparse-key
+                                              # (use this in orthogonalize! to preserve
+                                              # the right-bond's sparse structure)
+    target_n_new_sp::Int = -1,               # if positive, pad new bond's sparse dim
+                                              # to at least this size (boundary case
+                                              # where natural binning would give 1).
 )
   w        = ITensors.get_external_storage(phi)::WrappedBlockSparse
   phi_inds = collect(w.inds)
@@ -1097,16 +1463,35 @@ function itensor_blocksparse_svd(
   # dims[nls+1 : nls+nrs] is V-side sparse, then U dense, then V dense.
   # Permute phi to match that layout so storage and the legs we picked agree.
   desired = (U_spL..., U_spN..., V_spL..., V_spN..., U_d..., V_d...)
-  phi_p   = permute(phi, desired...; allow_alias = false)
+  phi_p   = permute(phi, desired...; allow_alias = true)
   bs_p    = ITensors.get_external_storage(phi_p).blocksparse
 
   # println("itensor_blocksparse_svd: phi sp=$(nls+nrs) d=$(nld+nrd), ",
   #         "U side nls=$nls nld=$nld")
 
-  U_bs, SV_bs, svs_kept, spec = blocksparse_svd(bs_p;
-      n_left_sparse = nls,
-      n_left_dense  = nld,
-      ortho, maxdim, mindim, cutoff)
+  U_bs, SV_bs, svs_kept, spec = if bin_by_right
+      # Bin by only the right-side LINK-typed sparse axes (V_spL count).
+      # This prevents the new bond's sparse dim from blowing up over right-side
+      # site (non-link) indices — those fold into sub-matrix cols instead and
+      # contribute to n_new_d (multiplicity dim). R is globally isometric.
+      blocksparse_svd_right_binned(bs_p;
+          n_left_sparse        = nls,
+          n_left_dense         = nld,
+          n_right_bin_sparse   = length(V_spL),
+          target_n_new_sp,
+          ortho, maxdim, mindim, cutoff)
+  else
+      # Mirror of the above: bin by left-side LINK-typed sparse axes (U_spL).
+      # Left-side site (non-link) sparse axes fold into matrix rows. L is
+      # globally isometric and the new bond's sparse dim matches the
+      # left-link structure rather than collapsing to total-QN-sector count.
+      blocksparse_svd_left_binned(bs_p;
+          n_left_sparse       = nls,
+          n_left_dense        = nld,
+          n_left_bin_sparse   = length(U_spL),
+          target_n_new_sp,
+          ortho, maxdim, mindim, cutoff)
+  end
 
   # ----- new bond legs (one sparse + one dense). Tag carries the l-level. -----
   n_new_sp = U_bs.dims[nls + 1]
@@ -1143,35 +1528,6 @@ function itensor_blocksparse_svd(
 
   L_it = permute(L_it, L_spL..., L_spN..., L_d...; allow_alias = true)
   R_it = permute(R_it, R_spL..., R_spN..., R_d...; allow_alias = true)
-
-  # Round-trip diagnostic (gated). Helps localize partition / storage-permute bugs.
-  if get(ENV, "SPARSE_SVD_DEBUG", "0") != "0"
-    try
-      recon = L_it * R_it
-      phi_norm2 = ITensors.scalar(ITensors.dag(phi) * phi)
-      rec_norm2 = ITensors.scalar(ITensors.dag(recon) * recon)
-      cross     = ITensors.scalar(ITensors.dag(phi)  * recon)
-      diff_norm2 = real(phi_norm2 - 2*real(cross) + rec_norm2)
-      err = sqrt(max(diff_norm2, 0.0)) / max(sqrt(real(phi_norm2)), 1e-300)
-      # Also: convert L_it and R_it to dense ITensors and contract — this isolates
-      # the sparse contraction routine vs the SVD math.
-      L_d = to_dense_itensors(L_it); R_d = to_dense_itensors(R_it)
-      recon_d = L_d * R_d
-      phi_d   = to_dense_itensors(phi)
-      cross_d = ITensors.scalar(ITensors.dag(phi_d) * recon_d)
-      rd2     = ITensors.scalar(ITensors.dag(recon_d) * recon_d)
-      pd2     = ITensors.scalar(ITensors.dag(phi_d) * phi_d)
-      diff_d2 = real(pd2 - 2*real(cross_d) + rd2)
-      err_d = sqrt(max(diff_d2, 0.0)) / max(sqrt(real(pd2)), 1e-300)
-      perm = ntuple(i -> findfirst(==(desired[i]), Tuple(w.inds)), length(desired))
-      println("[svd] sp_err=$err  d_err=$err_d  ‖phi‖²_sp=$(real(phi_norm2)) _d=$(real(pd2))",
-              "  ‖rec‖²_sp=$(real(rec_norm2)) _d=$(real(rd2))",
-              "  perm=$perm  phi_dims=$(map(ITensors.dim, phi_inds))",
-              "  nls=$nls nrs=$nrs nld=$nld nrd=$nrd")
-    catch e
-      println("[svd] diag failed: ", sprint(showerror, e))
-    end
-  end
 
   return L_it, R_it, spec
 end
