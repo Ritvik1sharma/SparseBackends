@@ -1,5 +1,14 @@
 module SparseBackends
 
+using TimerOutputs: TimerOutputs, TimerOutput, @timeit, reset_timer!, print_timer
+
+# Always-on instrumentation timer for the SparseBackends contract paths.
+# Reset between phases via `reset_timer!(SparseBackends.TIMER)` and print with
+# `print_timer(SparseBackends.TIMER)` from user code.
+const TIMER = TimerOutput()
+
+export TIMER
+
 # export whatever should be public:
 export NewBlockSparseSorted, blocksparse_from_dense, to_dense
 export COOTensor, coo_from_dense, to_dense
@@ -39,4 +48,8 @@ include("tensor_wrappers.jl")
 include("tensor_index.jl")
 include("tensor_contraction.jl")
 include("tensor_wrappers_aliased.jl")   # WrappedAliasedBlockSparse + top-level aliased contract functions
+
+# Path-B (generalized eigsolve) helpers for sparse DMRG. Must be after
+# tensor_wrappers.jl so contract_preserve_bs / recast_bs_to_template are in scope.
+include("path_b_helpers.jl")
 end

@@ -142,11 +142,18 @@ function contract!(
             (axisBr <= PB ? "  → prefix_outer" : "  → dense_bb"))
   end
   if axisBr <= PB
-    A, labelsA, mapA, _ = _permute_r_to_last_prefix(A, labelsA, mapA, rlab)  # axisAr == PA
-    B, labelsB, mapB, _ = _permute_r_to_last_prefix(B, labelsB, mapB, rlab)  # axisBr == PB
-    return contract_prefix_outer_bb!(C, labelsC, A, labelsA, B, labelsB, mapA, mapB, rlab)
+    @timeit TIMER "kbb.dispatch.prefix_outer_bb" begin
+      A, labelsA, mapA, _ = _permute_r_to_last_prefix(A, labelsA, mapA, rlab)  # axisAr == PA
+      B, labelsB, mapB, _ = _permute_r_to_last_prefix(B, labelsB, mapB, rlab)  # axisBr == PB
+      return contract_prefix_outer_bb!(C, labelsC, A, labelsA, B, labelsB, mapA, mapB, rlab)
+    end
   else
-    return contract_dense_bb!(C, labelsC, A, labelsA, B, labelsB, mapA, mapB, rlab)
+    error("CHECK IF ENCOUNTERED 22")
+
+    @timeit TIMER "kbb.dispatch.dense_bb" begin
+      return contract_dense_bb!(C, labelsC, A, labelsA, B, labelsB, mapA, mapB, rlab)
+    end
+    # return contract_dense_bb!(C, labelsC, A, labelsA, B, labelsB, mapA, mapB, rlab)
   end
 end
 
@@ -428,8 +435,13 @@ end
 # -----------------------------------------
 
 @inline function _cmp_join_tuple(akey, bkey, posA::Vector{Int}, posB::Vector{Int})
+  # Keys are sorted column-major in `_prefix_lin`: position 1 is the
+  # fastest-changing (least significant) axis, last position is slowest
+  # (most significant). For merge-join iteration over sorted keys to work,
+  # this comparison must be consistent with that sort order — compare
+  # from the LAST shared position down to the first.
   isempty(posA) && return 0
-  @inbounds for t in 1:length(posA)
+  @inbounds for t in length(posA):-1:1
     av = akey[posA[t]]
     bv = bkey[posB[t]]
     if av < bv
@@ -579,152 +591,174 @@ function contract_shared!(
     mapA::Dict,
     mapB::Dict,
     shared_labels::Vector;
+    output_inds_hint::Union{Nothing,AbstractSet}=nothing,
+    allowed_keys_C::Union{Nothing,AbstractSet}=nothing,
 ) where {TC,NC,N2C,PC,TA,NA,N2A,PA,TB,NB,N2B,PB}
+  # BS×BS hint path not yet implemented; accept kwargs to keep dispatch consistent.
+  # Original assertions still fire if Cdense doesn't fully match keepA0+keepB0.
 
-  # shared labels are ALWAYS reduced
-  @inbounds for lab in shared_labels
-    @assert !(lab in labelsC) "shared label $lab must be reduced (must not appear in labelsC)"
-  end
-
-  # -----------------------------
-  # 0) Classify shared labels
-  # -----------------------------
-  shared_prefix = eltype(shared_labels)[]
-  shared_dense  = eltype(shared_labels)[]
-  @inbounds for lab in shared_labels
-    @assert haskey(mapA, lab) && haskey(mapB, lab) "shared label $lab must exist in both A and B"
-    a_pos = mapA[lab]; b_pos = mapB[lab]
-    a_pref = a_pos <= PA; b_pref = b_pos <= PB
-    if a_pref && b_pref
-      push!(shared_prefix, lab)
-    elseif (!a_pref) && (!b_pref)
-      push!(shared_dense, lab)
-    else
-      error("shared label $lab crosses prefix/dense (A pos=$a_pos, B pos=$b_pos); not supported")
-    end
-  end
-
-  # -----------------------------
-  # 1) Compute keep/red sets from CURRENT labels (before permute)
-  #    red_dense order = A dense order filtered by shared_dense
-  # -----------------------------
-  Adense0 = labelsA[PA+1:NA]
-  Bdense0 = labelsB[PB+1:NB]
-  redset  = Set(shared_dense)
-
-  red_dense = [lab for lab in Adense0 if lab in redset]         # reduction order (from A)
-  keepA0    = [lab for lab in Adense0 if !(lab in redset)]      # A kept dense labels
-  keepB0    = [lab for lab in Bdense0 if !(lab in redset)]      # B kept dense labels
-
-  Cdense = labelsC[PC+1:NC]
-  mode, desired_keepA, desired_keepB = _cdense_grouping_and_orders(Cdense, keepA0, keepB0)
-  mode == :interleaved && error("Cdense interleaves A/B kept dims; would require permuting C (unsupported; sort/fallback)")
-
-  # sanity: desired orders must include all kept dims exactly once
-  @assert length(desired_keepA) == length(keepA0) && Set(desired_keepA) == Set(keepA0)
-  @assert length(desired_keepB) == length(keepB0) && Set(desired_keepB) == Set(keepB0)
-
-  # -----------------------------
-  # 2) Build ONE perm for A and ONE perm for B that satisfy BOTH:
-  #    - join-friendly prefix layout
-  #    - GEMM-friendly dense layout
-  #    - C dense order within each group (A-keep or B-keep)
-  # -----------------------------
-  permA = _find_perm_for_A_join_and_dense_order(A, labelsA, mapA, shared_prefix, desired_keepA, red_dense)
-  permB = _find_perm_for_B_join_and_dense_redfirst_order(B, labelsB, mapB, shared_prefix, red_dense, desired_keepB)
-  A = permutedims(A, permA)
-  B = permutedims(B, permB)
-  # permutedims!(A, permA)
-  # permutedims!(B, permB)
-
-  labelsA = labelsA[permA]
-  labelsB = labelsB[permB]
-  mapA = Dict(l => i for (i,l) in enumerate(labelsA))
-  mapB = Dict(l => i for (i,l) in enumerate(labelsB))
-
-  keepA = desired_keepA
-  keepB = desired_keepB
-  n_keepA = length(keepA)
-  n_keepB = length(keepB)
-  n_red   = length(red_dense)
-
-  # -----------------------------
-  # 3) Build C prefix key assembly plan
-  # -----------------------------
-  src = Vector{Int}(undef, PC)  # +i => A key axis i; -i => B key axis i
-  @inbounds for j in 1:PC
-    lab = labelsC[j]
-    if haskey(mapA, lab) && mapA[lab] <= PA
-      src[j] = mapA[lab]
-    elseif haskey(mapB, lab) && mapB[lab] <= PB
-      src[j] = -mapB[lab]
-    else
-      error("C prefix label $lab must come from A/B prefix")
-    end
-  end
-  join_posA = Int[mapA[lab] for lab in shared_prefix]
-  join_posB = Int[mapB[lab] for lab in shared_prefix]
-
-  # -----------------------------
-  # 4) Dense contraction shapes
-  # -----------------------------
-  dimsA_dense = A.dims[PA+1:NA]  # [keepA..., red...]
-  dimsB_dense = B.dims[PB+1:NB]  # [red..., keepB...]
-
-  M = (n_keepA == 0) ? 1 : prod(dimsA_dense[1:n_keepA])
-  K = (n_red   == 0) ? 1 : prod(dimsA_dense[n_keepA+1:end])
-  N = (n_keepB == 0) ? 1 : prod(dimsB_dense[n_red+1:end])
-
-  if n_red > 0
-    @assert K == prod(dimsB_dense[1:n_red]) "Reduced dense extents mismatch between A and B"
-  end
-  @assert C.blksize == M * N "C.blksize must equal M*N (got $(C.blksize), expected $(M*N))"
-
-  empty!(C.keys); empty!(C.ids); empty!(C.data)
-  iA = firstindex(A.keys); nA = lastindex(A.keys)
-  iB = firstindex(B.keys); nB = lastindex(B.keys)
-
-  @inbounds while iA <= nA && iB <= nB
-    cmp = _cmp_join_tuple(A.keys[iA], B.keys[iB], join_posA, join_posB)
-    if cmp < 0
-      iA = _advance_run(A.keys, iA, nA, join_posA)
-      continue
-    elseif cmp > 0
-      iB = _advance_run(B.keys, iB, nB, join_posB)
-      continue
+  @timeit TIMER "kbb.contract_shared.label!" begin
+  
+    # shared labels are ALWAYS reduced
+    @inbounds for lab in shared_labels
+      @assert !(lab in labelsC) "shared label $lab must be reduced (must not appear in labelsC)"
     end
 
-    iA2 = _advance_run(A.keys, iA, nA, join_posA)
-    iB2 = _advance_run(B.keys, iB, nB, join_posB)
-
-    for ii in iA:(iA2-1)
-      akey = A.keys[ii]
-      Avec = _block_view(A, A.ids[ii])
-      Amat = reshape(Avec, M, K)
-
-      for jj in iB:(iB2-1)
-        bkey = B.keys[jj]
-        Bvec = _block_view(B, B.ids[jj])
-        Bmat = reshape(Bvec, K, N)
-        ckey = ntuple(Val(PC)) do j
-          s = src[j]
-          s > 0 ? akey[s] : bkey[-s]
-        end
-        cid  = _ensure_block!(C, ckey)
-        Cvec = _block_view(C, cid)
-        if mode == :AthenB
-          # Cdense == [keepA..., keepB...] with your desired within-group orders
-          Cmat = reshape(Cvec, M, N)
-          mul!(Cmat, Amat, Bmat, one(TC), one(TC))
-        else
-          # Cdense == [keepB..., keepA...]
-          Cmat = reshape(Cvec, N, M)
-          mul!(Cmat, transpose(Bmat), transpose(Amat), one(TC), one(TC))
-        end
+    # -----------------------------
+    # 0) Classify shared labels
+    # -----------------------------
+    shared_prefix = eltype(shared_labels)[]
+    shared_dense  = eltype(shared_labels)[]
+    @inbounds for lab in shared_labels
+      @assert haskey(mapA, lab) && haskey(mapB, lab) "shared label $lab must exist in both A and B"
+      a_pos = mapA[lab]; b_pos = mapB[lab]
+      a_pref = a_pos <= PA; b_pref = b_pos <= PB
+      if a_pref && b_pref
+        push!(shared_prefix, lab)
+      elseif (!a_pref) && (!b_pref)
+        push!(shared_dense, lab)
+      else
+        # Detailed diagnostic on the cross failure.
+        println("\n[contract_bs_bs CROSS-FAIL DIAG]")
+        println("  shared label that crosses: ", lab, "  A_pos=", a_pos, " (PA=", PA, ")  B_pos=", b_pos, " (PB=", PB, ")")
+        println("  A labels (all): ", labelsA)
+        println("  B labels (all): ", labelsB)
+        println("  C labels (all): ", labelsC)
+        println("  shared_labels  : ", shared_labels)
+        error("shared label $lab crosses prefix/dense (A pos=$a_pos, B pos=$b_pos); not supported")
       end
     end
-    iA = iA2
-    iB = iB2
+  end
+
+  @timeit TIMER "kbb.contract_shared.permute!" begin
+    # -----------------------------
+    # 1) Compute keep/red sets from CURRENT labels (before permute)
+    #    red_dense order = A dense order filtered by shared_dense
+    # -----------------------------
+    Adense0 = labelsA[PA+1:NA]
+    Bdense0 = labelsB[PB+1:NB]
+    redset  = Set(shared_dense)
+
+    red_dense = [lab for lab in Adense0 if lab in redset]         # reduction order (from A)
+    keepA0    = [lab for lab in Adense0 if !(lab in redset)]      # A kept dense labels
+    keepB0    = [lab for lab in Bdense0 if !(lab in redset)]      # B kept dense labels
+
+    Cdense = labelsC[PC+1:NC]
+    mode, desired_keepA, desired_keepB = _cdense_grouping_and_orders(Cdense, keepA0, keepB0)
+    mode == :interleaved && error("Cdense interleaves A/B kept dims; would require permuting C (unsupported; sort/fallback)")
+
+    # sanity: desired orders must include all kept dims exactly once
+    @assert length(desired_keepA) == length(keepA0) && Set(desired_keepA) == Set(keepA0)
+    @assert length(desired_keepB) == length(keepB0) && Set(desired_keepB) == Set(keepB0)
+
+    # -----------------------------
+    # 2) Build ONE perm for A and ONE perm for B that satisfy BOTH:
+    #    - join-friendly prefix layout
+    #    - GEMM-friendly dense layout
+    #    - C dense order within each group (A-keep or B-keep)
+    # -----------------------------
+    permA = _find_perm_for_A_join_and_dense_order(A, labelsA, mapA, shared_prefix, desired_keepA, red_dense)
+    permB = _find_perm_for_B_join_and_dense_redfirst_order(B, labelsB, mapB, shared_prefix, red_dense, desired_keepB)
+    A = permutedims(A, permA)
+    B = permutedims(B, permB)
+    # permutedims!(A, permA)
+    # permutedims!(B, permB)
+
+    labelsA = labelsA[permA]
+    labelsB = labelsB[permB]
+    mapA = Dict(l => i for (i,l) in enumerate(labelsA))
+    mapB = Dict(l => i for (i,l) in enumerate(labelsB))
+
+    keepA = desired_keepA
+    keepB = desired_keepB
+    n_keepA = length(keepA)
+    n_keepB = length(keepB)
+    n_red   = length(red_dense)
+  end
+
+  @timeit TIMER "kbb.contract_shared.join_and_contract!" begin
+    # -----------------------------
+    # 3) Build C prefix key assembly plan
+    # -----------------------------
+    src = Vector{Int}(undef, PC)  # +i => A key axis i; -i => B key axis i
+    @inbounds for j in 1:PC
+      lab = labelsC[j]
+      if haskey(mapA, lab) && mapA[lab] <= PA
+        src[j] = mapA[lab]
+      elseif haskey(mapB, lab) && mapB[lab] <= PB
+        src[j] = -mapB[lab]
+      else
+        error("C prefix label $lab must come from A/B prefix")
+      end
+    end
+    join_posA = Int[mapA[lab] for lab in shared_prefix]
+    join_posB = Int[mapB[lab] for lab in shared_prefix]
+  end
+
+  @timeit TIMER "kbb.contract_shared.dense_contract!" begin
+    # -----------------------------
+    # 4) Dense contraction shapes
+    # -----------------------------
+    dimsA_dense = A.dims[PA+1:NA]  # [keepA..., red...]
+    dimsB_dense = B.dims[PB+1:NB]  # [red..., keepB...]
+
+    M = (n_keepA == 0) ? 1 : prod(dimsA_dense[1:n_keepA])
+    K = (n_red   == 0) ? 1 : prod(dimsA_dense[n_keepA+1:end])
+    N = (n_keepB == 0) ? 1 : prod(dimsB_dense[n_red+1:end])
+
+    if n_red > 0
+      @assert K == prod(dimsB_dense[1:n_red]) "Reduced dense extents mismatch between A and B"
+    end
+    @assert C.blksize == M * N "C.blksize must equal M*N (got $(C.blksize), expected $(M*N))"
+
+    empty!(C.keys); empty!(C.ids); empty!(C.data)
+    iA = firstindex(A.keys); nA = lastindex(A.keys)
+    iB = firstindex(B.keys); nB = lastindex(B.keys)
+
+    @inbounds while iA <= nA && iB <= nB
+      cmp = _cmp_join_tuple(A.keys[iA], B.keys[iB], join_posA, join_posB)
+      if cmp < 0
+        iA = _advance_run(A.keys, iA, nA, join_posA)
+        continue
+      elseif cmp > 0
+        iB = _advance_run(B.keys, iB, nB, join_posB)
+        continue
+      end
+
+      iA2 = _advance_run(A.keys, iA, nA, join_posA)
+      iB2 = _advance_run(B.keys, iB, nB, join_posB)
+
+      for ii in iA:(iA2-1)
+        akey = A.keys[ii]
+        Avec = _block_view(A, A.ids[ii])
+        Amat = reshape(Avec, M, K)
+
+        for jj in iB:(iB2-1)
+          bkey = B.keys[jj]
+          Bvec = _block_view(B, B.ids[jj])
+          Bmat = reshape(Bvec, K, N)
+          ckey = ntuple(Val(PC)) do j
+            s = src[j]
+            s > 0 ? akey[s] : bkey[-s]
+          end
+          cid  = _ensure_block!(C, ckey)
+          Cvec = _block_view(C, cid)
+          @timeit TIMER "kbb.contract_shared.gemm" begin
+            if mode == :AthenB
+              # Cdense == [keepA..., keepB...] with your desired within-group orders
+              Cmat = reshape(Cvec, M, N)
+              mul!(Cmat, Amat, Bmat, one(TC), one(TC))
+            else
+              # Cdense == [keepB..., keepA...]
+              Cmat = reshape(Cvec, N, M)
+              mul!(Cmat, transpose(Bmat), transpose(Amat), one(TC), one(TC))
+            end
+          end
+        end
+      end
+      iA = iA2
+      iB = iB2
+    end
   end
   return C
 end

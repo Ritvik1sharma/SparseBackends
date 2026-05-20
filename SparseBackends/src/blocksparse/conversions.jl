@@ -186,6 +186,35 @@ function to_dense(B::NewBlockSparseSorted{T,N,N2,P,K};
   return out
 end
 
+"""
+    to_dense!(out, B)
+
+In-place densification into a pre-allocated buffer `out::Array{T,N}` of shape `B.dims`.
+Equivalent to `out .= to_dense(B)` but allocates nothing. Only supports the
+no-`merged_axes` case (the only one needed by recast_bs_to_template).
+"""
+function to_dense!(out::AbstractArray{T,N}, B::NewBlockSparseSorted{T,N,N2,P,K};
+                   init::T = zero(T)) where {T,N,N2,P,K}
+  size(out) == B.dims || error("to_dense! buffer size $(size(out)) ≠ B.dims $(B.dims)")
+  fill!(out, init)
+  blksize = B.blksize
+  suffix_dims = ntuple(i -> B.dims[P+i], Val(N2))
+  suffix_CI = CartesianIndices(suffix_dims)
+  suffix_LI = LinearIndices(suffix_dims)
+  @inbounds for i in eachindex(B.keys)
+    prefix = B.keys[i]
+    bid    = B.ids[i]
+    base   = (bid - 1) * blksize
+    for sCI in suffix_CI
+      suffix = Tuple(sCI)::NTuple{N2,Int}
+      full = _full_index(prefix, suffix, Val(N))
+      lin = suffix_LI[sCI]
+      out[full...] = B.data[base + lin]
+    end
+  end
+  return out
+end
+
 # function to_dense(B::NewBlockSparseSorted{T,N,N2,P,K};
 #                   init::T = zero(T),
 #                   merged_axes::Union{Nothing,Vector{Int}} = nothing) where {T,N,N2,P}

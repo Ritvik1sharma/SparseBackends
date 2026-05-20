@@ -65,8 +65,14 @@ end
 end
 
 @inline function _alloc_block!(A::NewBlockSparseSorted{T,N,N2,P,K}) where {T,N,N2,P,K}
-  id = length(A.data) ÷ A.blksize + 1
-  append!(A.data, fill(zero(T), A.blksize))
+  # Avoid `append!(A.data, fill(zero(T), blksize))` which allocates a temporary
+  # zero-vector and copies it into A.data. `resize!` grows A.data in place
+  # (using pre-reserved capacity from `sizehint!` at the kernel entry) and
+  # `fill!` zero-fills the new range without the intermediate.
+  oldlen = length(A.data)
+  resize!(A.data, oldlen + A.blksize)
+  fill!(view(A.data, oldlen+1:oldlen+A.blksize), zero(T))
+  id = oldlen ÷ A.blksize + 1
   return id
 end
 
