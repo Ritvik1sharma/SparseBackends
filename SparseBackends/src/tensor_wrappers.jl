@@ -3,6 +3,7 @@
 import ITensors
 # import ITensorMPS
 using SparseBackends
+import Base
 
 abstract type WrappedTensorTypes{T,N} end  
 
@@ -457,15 +458,373 @@ function contract(A::ITensors.ITensor, B::ITensors.ITensor,
                   Abackend::Symbol,
                   Bbackend::Symbol;
                   denseLinksA::Union{Nothing,Int}=nothing,
-                  denseLinksB::Union{Nothing,Int}=nothing)
+                  denseLinksB::Union{Nothing,Int}=nothing,
+                  preserve_bs_output::Bool=false)
   if Abackend === :dense && Bbackend === :dense
     return ITensors.contract(A, B)
   end
   Aw = wrap_itensor(A; backend=Abackend, denseLinks=denseLinksA)
   Bw = wrap_itensor(B; backend=Bbackend, denseLinks=denseLinksB)
-  Cw = contract(Aw, Bw)
+  Cw = contract(Aw, Bw; preserve_bs_output=preserve_bs_output)
   Cw isa ITensors.ITensor && return Cw  # P_C=0: already a plain Dense ITensor
   return ITensors._itensor_from_external_storage(Cw)
+end
+
+# Convenience: contract two ITensors (each carrying any storage) while forcing
+# the output to keep its WrappedBlockSparse storage even when the natural
+# output would be a plain dense ITensor. Used by Path-B sparse DMRG where
+# KrylovKit's geneigsolve needs storage stability across Krylov iterations.
+#
+# If `template` is given (an ITensor with WrappedBlockSparse external storage
+# whose Indices match the natural output's), the result is re-cast so that
+# its (dense-axes, sparse-axes) classification AND inds-ordering match the
+# template's. This makes the result type-identical to the template, which is
+# what KrylovKit's `scale!`/`axpy!` require across operator applications.
+function contract_preserve_bs(A::ITensors.ITensor, B::ITensors.ITensor;
+                              template::Union{Nothing,ITensors.ITensor}=nothing,
+                              output_inds_hint::Union{Nothing,AbstractSet}=nothing)
+ @timeit TIMER "contract_preserve_bs" begin
+  # Both inputs plain dense → no BS storage to preserve; standard contract.
+  if !ITensors.has_external_storage(A) && !ITensors.has_external_storage(B)
+    return ITensors.contract(A, B)
+  end
+  if ITensors.has_external_storage(A)
+    Aw = ITensors.get_external_storage(A)
+  else
+    Aw = wrap_itensor(A; backend=:dense)
+  end
+  if ITensors.has_external_storage(B)
+    Bw = ITensors.get_external_storage(B)
+  else
+    Bw = wrap_itensor(B; backend=:dense)
+  end
+  # Auto-derive hint from template if caller didn't supply one (template's
+  # dense_inds is exactly the set of axes that should be dense in the output).
+  # GATED: requires BMF_USE_HINT=1 because the in-kernel hint path is not yet
+  # implemented (without kernel support, hint causes correctness errors).
+  if get(ENV, "BMF_USE_HINT", "0") == "1" &&
+     output_inds_hint === nothing && template !== nothing &&
+     ITensors.has_external_storage(template) &&
+     ITensors.get_external_storage(template) isa WrappedBlockSparse
+    output_inds_hint = dense_inds(ITensors.get_external_storage(template))
+  end
+  template_for_filter = nothing
+  if get(ENV, "BMF_USE_HINT", "0") == "1" && template !== nothing &&
+     ITensors.has_external_storage(template) &&
+     ITensors.get_external_storage(template) isa WrappedBlockSparse
+    template_for_filter = ITensors.get_external_storage(template)::WrappedBlockSparse
+  end
+  Cw = @timeit TIMER "cpb.contract" contract(Aw, Bw; preserve_bs_output=true,
+                                              output_inds_hint=output_inds_hint,
+                                              template_for_filter=template_for_filter)
+  Cw isa ITensors.ITensor && return Cw
+
+  # Optionally recast to match template's axis classification + ordering.
+  if template !== nothing && ITensors.has_external_storage(template) &&
+     Cw isa WrappedBlockSparse
+    Tw = ITensors.get_external_storage(template)
+    if Tw isa WrappedBlockSparse
+      Cw = @timeit TIMER "cpb.recast" recast_bs_to_template(Cw, Tw)
+    end
+  end
+  return ITensors._itensor_from_external_storage(Cw)
+ end
+end
+
+# Re-cast a WrappedBlockSparse result so its inds-ordering, axis classification
+# (N2 = #dense axes), AND block-key list+ordering all match the template.
+# Requires the result's Index identities to form the same set as the template's.
+#
+# The block-key match is critical: KrylovKit / VectorInterface in-place ops
+# (`scale!`, `axpy!`, etc.) iterate the raw `.data` buffer position-by-position
+# and assume both operands have the same .keys list. A mismatch silently
+# scrambles values. By copying the template's key list verbatim, we make the
+# result drop-in compatible with Krylov subspace bookkeeping.
+#
+# Data is taken from Cw via densify → permute → gather. Cost is O(nnz_dense)
+# per call; for Krylov inner loops this is negligible next to the contraction.
+# Layer 1 of in-kernel filter: when Cw and Tw have IDENTICAL axis split
+# (same inds order, same blksize), recasting reduces to dropping non-Tw keys.
+# No densify, no permute. O(nblocks) instead of O(prod(dims)).
+function filter_bs_keys_to_template(Cw::WrappedBlockSparse{TC,N,N2c,Pc},
+                                    Tw::WrappedBlockSparse{TT,N,N2t,Pt}) where {TC,TT,N,N2c,Pc,N2t,Pt}
+  # Strict prereq: both BS storages already share order, split, and inds.
+  if Cw.inds !== Tw.inds && Cw.inds != Tw.inds
+    return nothing  # signal: structure mismatch, fall back to full recast
+  end
+  N2c == N2t || return nothing
+  Pc == Pt || return nothing
+  Cw.blocksparse.blksize == Tw.blocksparse.blksize || return nothing
+
+  bs_c = Cw.blocksparse
+  bs_t = Tw.blocksparse
+  blksize = bs_c.blksize
+  c_keymap = Dict{NTuple{Pc,Int}, Int}()
+  sizehint!(c_keymap, length(bs_c.keys))
+  @inbounds for i in eachindex(bs_c.keys)
+    c_keymap[bs_c.keys[i]] = bs_c.ids[i]
+  end
+  new_keys = copy(bs_t.keys)
+  new_ids  = copy(bs_t.ids)
+  new_data = Vector{TC}(undef, length(bs_t.data))
+  @inbounds for i in eachindex(bs_t.keys)
+    k = bs_t.keys[i]
+    out_id = bs_t.ids[i]
+    out_base = (out_id - 1) * blksize
+    src_id = get(c_keymap, k, 0)
+    if src_id == 0
+      # Key in template but not in Cw → zero block.
+      for j in 1:blksize
+        new_data[out_base + j] = zero(TC)
+      end
+    else
+      src_base = (src_id - 1) * blksize
+      for j in 1:blksize
+        new_data[out_base + j] = bs_c.data[src_base + j]
+      end
+    end
+  end
+  bs_new = NewBlockSparseSorted{TC,N,N2t,Pt,Int}(
+      bs_t.dims, blksize, new_keys, new_ids, new_data)
+  return WrappedBlockSparse(bs_new, Tw.inds)
+end
+
+# Fission a BS storage: take a BS with some axes in its dense suffix, move
+# specified axes into the sparse prefix. Each natural block splits into multiple
+# smaller blocks indexed by the moved axes' values. No densification — one
+# pass over `.data` writing into the new key list.
+#
+# Inputs:
+#   Cw_natural : the BS storage with natural axis split
+#   target_inds : Tuple of Index that defines the desired axis order in output
+#   target_n2   : number of dense axes in output (last `target_n2` of target_inds)
+function fission_bs(Cw_natural::WrappedBlockSparse{TC,N,N2nat,Pnat},
+                    target_inds::NTuple{N,ITensors.Index},
+                    target_n2::Int) where {TC,N,N2nat,Pnat}
+  target_P = N - target_n2
+  bs_nat = Cw_natural.blocksparse
+  nat_inds = Cw_natural.inds
+  # 1. Locate each target_inds[k] in nat_inds (by Index identity).
+  nat_pos_of_target = ntuple(k -> findfirst(==(target_inds[k]), nat_inds), Val(N))
+  any(==(nothing), nat_pos_of_target) && error("fission_bs: target inds not subset of natural inds")
+  # 2. Classify each natural axis by whether it ends up in target's prefix or dense.
+  target_pos_of_nat = ntuple(j -> findfirst(==(nat_inds[j]), target_inds), Val(N))
+  is_target_prefix = ntuple(j -> target_pos_of_nat[j] <= target_P, Val(N))
+  # 3. For each natural block, iterate over its dense slab using nat-axes order.
+  #    For each dense element, compute the target block key (from prefix-positioned axes)
+  #    and the target dense offset (from dense-positioned axes).
+  nat_blksize = bs_nat.blksize
+  nat_dims = bs_nat.dims
+  nat_suffix_dims = ntuple(j -> nat_dims[Pnat + j], Val(N2nat))
+  nat_suffix_CI = CartesianIndices(nat_suffix_dims)
+  nat_suffix_LI = LinearIndices(nat_suffix_dims)
+  # Target dimensions
+  target_dims = ntuple(k -> ITensors.dim(target_inds[k]), Val(N))
+  target_suffix_dims = ntuple(k -> target_dims[target_P + k], Val(target_n2))
+  target_suffix_LI = LinearIndices(target_suffix_dims)
+  target_blksize = prod(target_suffix_dims; init=1)
+  # Build target keys via Dict-dedup
+  new_keys = NTuple{target_P,Int}[]
+  new_data_dict = Dict{NTuple{target_P,Int}, Vector{TC}}()
+  @inbounds for bi in eachindex(bs_nat.keys)
+    nat_prefix = bs_nat.keys[bi]
+    bid = bs_nat.ids[bi]
+    base = (bid - 1) * nat_blksize
+    for sCI in nat_suffix_CI
+      suffix = Tuple(sCI)::NTuple{N2nat,Int}
+      lin = nat_suffix_LI[sCI]
+      val = bs_nat.data[base + lin]
+      # Build full N-tuple of natural indices for this element
+      nat_full = _full_index(nat_prefix, suffix, Val(N))
+      # Build target prefix tuple and target dense linear index
+      tprefix = ntuple(k -> nat_full[nat_pos_of_target[k]], Val(target_P))
+      tsuffix = ntuple(k -> nat_full[nat_pos_of_target[target_P + k]], Val(target_n2))
+      tlin = target_suffix_LI[CartesianIndex(tsuffix)]
+      buf = get(new_data_dict, tprefix, nothing)
+      if buf === nothing
+        buf = zeros(TC, target_blksize)
+        new_data_dict[tprefix] = buf
+        push!(new_keys, tprefix)
+      end
+      buf[tlin] = val
+    end
+  end
+  # 4. Sort keys lex (BS invariant) and assemble final .data buffer
+  target_prefix_dims = ntuple(k -> target_dims[k], Val(target_P))
+  sort!(new_keys; by = k -> _prefix_lin(k, target_prefix_dims))
+  new_ids = collect(1:length(new_keys))
+  new_data = Vector{TC}(undef, length(new_keys) * target_blksize)
+  @inbounds for (i, k) in enumerate(new_keys)
+    buf = new_data_dict[k]
+    copyto!(new_data, (i-1)*target_blksize + 1, buf, 1, target_blksize)
+  end
+  bs_new = NewBlockSparseSorted{TC, N, target_n2, target_P, Int}(
+      target_dims, target_blksize, new_keys, new_ids, new_data)
+  return WrappedBlockSparse(bs_new, target_inds)
+end
+
+const RECAST_SCRATCH = Dict{Tuple{DataType, NTuple, NTuple}, NamedTuple}()
+
+@inline function _get_recast_scratch(::Type{TC}, dims_C::NTuple{N,Int}, dims_T::NTuple{N,Int}) where {TC, N}
+  key = (TC, dims_C, dims_T)
+  buf = get(RECAST_SCRATCH, key, nothing)
+  if buf === nothing
+    new_buf = (data_dense = Array{TC,N}(undef, dims_C),
+               data_perm  = Array{TC,N}(undef, dims_T))
+    RECAST_SCRATCH[key] = new_buf
+    return new_buf
+  end
+  return buf::NamedTuple{(:data_dense, :data_perm), Tuple{Array{TC,N}, Array{TC,N}}}
+end
+
+# Clear scratch pool. Called between eigsolves / bonds if buffer dims churn.
+recast_scratch_clear!() = empty!(RECAST_SCRATCH)
+
+function _recast_per_block(Cw::WrappedBlockSparse{TC,N,N2c,Pc},
+                            Tw::WrappedBlockSparse{TT,N,N2t,Pt},
+                            c_inds, t_inds) where {TC,TT,N,N2c,Pc,N2t,Pt}
+  # Build full-axis permutation: c_axis_for_t[k] = position in C.inds of t_inds[k]
+  c_axis_for_t = ntuple(k -> findfirst(==(t_inds[k]), c_inds), Val(N))
+  any(==(nothing), c_axis_for_t) && return nothing  # shouldn't happen given Set check
+  # Every T-prefix axis must map to a C-prefix axis, AND every T-dense axis to
+  # a C-dense axis. Otherwise classification crosses; bail to slow path.
+  @inbounds for k in 1:Pt
+    c_axis_for_t[k] <= Pc || return nothing
+  end
+  @inbounds for k in (Pt+1):N
+    c_axis_for_t[k] > Pc || return nothing
+  end
+  # σ_prefix[j] (j ∈ 1..Pc) = position in T.prefix of C.prefix axis j
+  # Inverse view: for each C prefix axis j, find which T prefix axis maps there.
+  σ_prefix = Vector{Int}(undef, Pc)
+  @inbounds for k in 1:Pt
+    σ_prefix[c_axis_for_t[k]] = k
+  end
+  # perm_block[k] = C-dense axis (1..N2c) that becomes T-dense axis k
+  perm_block = ntuple(k -> c_axis_for_t[Pt + k] - Pc, Val(N2t))
+
+  bs_c = Cw.blocksparse
+  bs_t = Tw.blocksparse
+  blksize_c = bs_c.blksize
+  blksize_t = bs_t.blksize
+  blksize_c == blksize_t || return nothing  # shouldn't differ; safety
+
+  c_dense_dims = ntuple(i -> bs_c.dims[Pc + i], Val(N2c))
+  t_dense_dims = ntuple(i -> bs_t.dims[Pt + i], Val(N2t))
+
+  c_keymap = Dict{NTuple{Pc,Int}, Int}()
+  sizehint!(c_keymap, length(bs_c.keys))
+  @inbounds for i in eachindex(bs_c.keys)
+    c_keymap[bs_c.keys[i]] = bs_c.ids[i]
+  end
+
+  new_keys = copy(bs_t.keys)
+  new_ids  = copy(bs_t.ids)
+  new_data = Vector{TC}(undef, length(bs_t.data))
+
+  is_identity_block = all(perm_block[i] == i for i in 1:N2t)
+
+  @inbounds for i in eachindex(bs_t.keys)
+    tk = bs_t.keys[i]
+    tid = bs_t.ids[i]
+    t_base = (tid - 1) * blksize_t
+    # ck[j] = tk[σ_prefix[j]]  for j ∈ 1..Pc
+    ck = ntuple(j -> tk[σ_prefix[j]], Val(Pc))
+    c_id = get(c_keymap, ck, 0)
+    if c_id == 0
+      for j in 1:blksize_t
+        new_data[t_base + j] = zero(TC)
+      end
+    else
+      c_base = (c_id - 1) * blksize_c
+      if is_identity_block
+        copyto!(new_data, t_base + 1, bs_c.data, c_base + 1, blksize_t)
+      else
+        c_block = reshape(view(bs_c.data, c_base+1:c_base+blksize_c), c_dense_dims)
+        t_block = reshape(view(new_data, t_base+1:t_base+blksize_t), t_dense_dims)
+        Base.permutedims!(t_block, c_block, perm_block)
+      end
+    end
+  end
+
+  bs_new = NewBlockSparseSorted{TC,N,N2t,Pt,Int}(
+      bs_t.dims, blksize_t, new_keys, new_ids, new_data)
+  return WrappedBlockSparse(bs_new, Tw.inds)
+end
+
+function recast_bs_to_template(Cw::WrappedBlockSparse{TC,N,N2c,Pc},
+                                Tw::WrappedBlockSparse{TT,N,N2t,Pt}) where {TC,TT,N,N2c,Pc,N2t,Pt}
+  c_inds = collect(Cw.inds)
+  t_inds = collect(Tw.inds)
+  if Set(c_inds) != Set(t_inds)
+    return Cw  # Cannot recast — Index identities differ.
+  end
+  # Layer-1 fast path: if structures already match, just key-filter (no densify).
+  fast = @timeit TIMER "recast.layer1_try" filter_bs_keys_to_template(Cw, Tw)
+  if fast !== nothing
+    @timeit TIMER "recast.layer1_hit" begin end
+    return fast
+  end
+
+  # Layer-2 fast path: when same dense/sparse classification (N2c == N2t and
+  # every T-dense axis is also C-dense), skip the full densify. For each T key,
+  # find C's block (via permuted key lookup), permute that small block's dense
+  # axes into T's order, write to new_data. Cost O(num_keys × blksize) vs slow
+  # path's O(prod(dims)) densify+permute. Triggers automatically whenever the
+  # allowed_keys_C filter has made C.keys a subset of T.keys (after axis perm).
+  if N2c == N2t
+    fast2 = @timeit TIMER "recast.layer2_try" _recast_per_block(Cw, Tw, c_inds, t_inds)
+    if fast2 !== nothing
+      @timeit TIMER "recast.layer2_hit" begin end
+      return fast2
+    end
+  end
+  @timeit TIMER "recast.slow_densify" begin end
+  # Permute Cw's dense form into the template's inds order.
+  perm = ntuple(i -> findfirst(==(t_inds[i]), c_inds), Val(N))
+  # Use cached scratch buffers for the two big intermediates. Output `new_data`
+  # (held by the returned WrappedBlockSparse) is still freshly allocated.
+  scratch = _get_recast_scratch(TC, Cw.blocksparse.dims, Tw.blocksparse.dims)
+  data_dense = scratch.data_dense
+  data_perm  = scratch.data_perm
+  to_dense!(data_dense, Cw.blocksparse)
+  if N === 0
+    # 0-D edge case — scratch already-aligned.
+    data_perm = data_dense
+  else
+    Base.permutedims!(data_perm, data_dense, perm)
+  end
+
+  # Build new storage with the template's exact (keys, ids) list. Gather
+  # block data from data_perm using the template's key prefixes.
+  bs_t = Tw.blocksparse
+  dims_t = bs_t.dims
+  blksize_t = bs_t.blksize
+  P_t = Pt
+  suffix_dims = ntuple(i -> dims_t[P_t + i], Val(N2t))
+  suffix_CI = CartesianIndices(suffix_dims)
+  suffix_LI = LinearIndices(suffix_dims)
+
+  new_keys = copy(bs_t.keys)
+  new_ids  = copy(bs_t.ids)
+  new_data = Vector{TC}(undef, length(bs_t.data))
+
+  @inbounds for i in eachindex(new_keys)
+    prefix = new_keys[i]            # NTuple{P_t,Int}
+    bid    = new_ids[i]
+    base   = (bid - 1) * blksize_t
+    for sCI in suffix_CI
+      suffix  = Tuple(sCI)::NTuple{N2t,Int}
+      full    = _full_index(prefix, suffix, Val(N))
+      lin     = suffix_LI[sCI]
+      new_data[base + lin] = data_perm[full...]
+    end
+  end
+
+  bs_new = NewBlockSparseSorted{TC,N,N2t,P_t,Int}(
+    dims_t, blksize_t, new_keys, new_ids, new_data
+  )
+  return WrappedBlockSparse(bs_new, Tw.inds)
 end
 
 function contract(A::ITensors.ITensor, B::WrappedTensorTypes{TB,NB}; kwargs...) where {TB,NB}
@@ -558,7 +917,8 @@ function output_inds(
     indsA::NTuple{NA,ITensors.Index{T}},
     indsB::NTuple{NB,ITensors.Index{T}},
     denseA::Set{ITensors.Index{T}},
-    denseB::Set{ITensors.Index{T}},
+    denseB::Set{ITensors.Index{T}};
+    output_inds_hint::Union{Nothing,AbstractSet}=nothing,
 ) where {NA,NB,T}
     # Build membership set for intersection test with minimal allocation
     setA = Set{ITensors.Index{T}}()
@@ -569,10 +929,39 @@ function output_inds(
     # Preallocate buckets with decent upper bounds
     sparse_nonlink = Vector{ITensors.Index}(undef, 0); sizehint!(sparse_nonlink, NA + NB)
     sparse_link    = Vector{ITensors.Index}(undef, 0); sizehint!(sparse_link,    NA + NB)
-    dense_tail     = Vector{ITensors.Index}(undef, 0); sizehint!(dense_tail,     NA + NB)
+    # moved_dense_links: when hint is provided, axes that were dense in operands
+    # but classified sparse in output (kernel will FISSION them). Placed LAST
+    # in the sparse section so lex-sort of C keys puts A_pref axes FIRST →
+    # consecutive sorted C blocks for one A_pref differ only in moved axes →
+    # consecutive in C.data → single mul! writes directly (free fission).
+    moved_dense_links = Vector{ITensors.Index}(undef, 0); sizehint!(moved_dense_links, NA + NB)
+    dense_tail        = Vector{ITensors.Index}(undef, 0); sizehint!(dense_tail,        NA + NB)
 
     # helper: classify a single index
+    # Match hint by Index id (ignoring plev) — the contract output may have
+    # axes at plev=1 that get replaceprime'd to plev=0 downstream, but they
+    # have the SAME id as the hint entries (plev=0). So id-matching is correct.
+    hint_ids = output_inds_hint === nothing ?
+               nothing :
+               Set(ITensors.id(I) for I in output_inds_hint)
     @inline function push_classified!(I::ITensors.Index)
+        if hint_ids !== nothing
+            if ITensors.id(I) in hint_ids
+                push!(dense_tail, I)
+            else
+                # Sparse in output. If from an operand's DENSE set, it's a
+                # "moved" axis (will be fissioned) → go LAST in sparse.
+                from_dense = (I in denseA) || (I in denseB)
+                if from_dense && is_link(I)
+                    push!(moved_dense_links, I)
+                elseif is_link(I)
+                    push!(sparse_link, I)
+                else
+                    push!(sparse_nonlink, I)
+                end
+            end
+            return nothing
+        end
         if (I in denseA) || (I in denseB)
             push!(dense_tail, I)
         elseif is_link(I)
@@ -601,7 +990,12 @@ function output_inds(
     end
     # Sort sparse_link by l=<n> tag once, without repeated parsing in comparator
     sort_link_inds_cached!(sparse_link)
-    indsC_vec = vcat(sparse_link, sparse_nonlink, dense_tail)
+    sort_link_inds_cached!(moved_dense_links)
+    # sparse_link LAST (simpler heuristic). Empirically plev-based subsort
+    # gave only ~14% permA_identity hits and the per-call sort overhead
+    # negated savings. The current ordering is a no-op cost-wise. Larger gain
+    # would require eliminating the permutedims COPY (in-place / data-share).
+    indsC_vec = vcat(sparse_nonlink, moved_dense_links, sparse_link, dense_tail)
     return Tuple(indsC_vec), dense_tail
 end
 
@@ -609,11 +1003,12 @@ function output_inds(
     indsA::NTuple{NA,ITensors.Index{T}},
     indsB::NTuple{NB,ITensors.Index{T}},
     denseA_in::AbstractSet{<:ITensors.Index},
-    denseB_in::AbstractSet{<:ITensors.Index},
+    denseB_in::AbstractSet{<:ITensors.Index};
+    output_inds_hint::Union{Nothing,AbstractSet}=nothing,
 ) where {NA,NB,T}
     denseA = Set{ITensors.Index{T}}(denseA_in)  # OK: iterable ctor
     denseB = Set{ITensors.Index{T}}(denseB_in)
-    return output_inds(indsA, indsB, denseA, denseB)
+    return output_inds(indsA, indsB, denseA, denseB; output_inds_hint=output_inds_hint)
 end
 
 # Reorder indsC so it matches the canonical layout that `contract_bs_dense_to_dense!`
@@ -726,9 +1121,54 @@ end
 
 
 
+# Build the set of allowed C-prefix keys, in C's prefix order, from a template
+# WrappedBlockSparse. The template's keys are in its own prefix order; we permute
+# them so each j-th entry of the C-tuple is the value from the template axis
+# whose Index id matches indsC[j]. Returns nothing if template/indsC are
+# structurally incompatible (different PC, or some indsC[j] not found in
+# template) — in that case the caller skips filtering.
+function _allowed_keys_from_template(Tw::WrappedBlockSparse{TT,NT,N2T,PT},
+                                     indsC::NTuple{N,ITensors.Index},
+                                     denseLinksC::Int) where {TT,NT,N2T,PT,N}
+  PC = N - denseLinksC
+  PC == PT || return nothing  # classification mismatch
+  N == NT || return nothing
+  # σ[j] = position (in 1..PT) of indsC[j] within Tw.inds, matching by Index id.
+  σ = Vector{Int}(undef, PC)
+  t_ids = ntuple(i -> ITensors.id(Tw.inds[i]), Val(length(Tw.inds)))
+  @inbounds for j in 1:PC
+    target_id = ITensors.id(indsC[j])
+    pos = 0
+    for i in 1:PT
+      if t_ids[i] == target_id
+        pos = i; break
+      end
+    end
+    pos == 0 && return nothing  # indsC[j] not in template prefix
+    σ[j] = pos
+  end
+  PCv = PC
+  allowed = Set{NTuple{PCv, Int}}()
+  sizehint!(allowed, length(Tw.blocksparse.keys))
+  @inbounds for tk in Tw.blocksparse.keys
+    push!(allowed, ntuple(j -> tk[σ[j]], Val(PCv)))
+  end
+  return allowed
+end
+
 function wrapped_contract(A::WrappedTensorTypes{TA,NA},
                           B::WrappedTensorTypes{TB,NB};
-                          output_backend::Symbol=:blocksparse) where {TA,TB,NA,NB}
+                          output_backend::Symbol=:blocksparse,
+                          preserve_bs_output::Bool=false,
+                          output_inds_hint::Union{Nothing,AbstractSet}=nothing,
+                          template_for_filter::Union{Nothing,WrappedBlockSparse}=nothing) where {TA,TB,NA,NB}
+  # `preserve_bs_output=true` is an opt-in pathway that forces the result of
+  # a BlockSparse-involving contraction to remain WrappedBlockSparse, even
+  # when the natural output has no sparse axes (P_C = 0) or shares only
+  # dense indices. The default (false) preserves the existing behavior of
+  # returning a plain dense ITensor in those cases. Used by Path-B sparse
+  # DMRG where the Krylov subspace requires storage-type stability across
+  # operator applications.
   @timeit TIMER "wrapped_contract" begin
     @timeit TIMER "wc.setup" begin
       Arep = rep(A)
@@ -744,7 +1184,12 @@ function wrapped_contract(A::WrappedTensorTypes{TA,NA},
               "  → C=", infer_C_backend(A, B))
     end
     @timeit TIMER "wc.output_inds" begin
-      indsC, denseC = output_inds(indsA, indsB, denseA, denseB)
+      # Gate: hint path only supported by the BS×Dense kernel. For BS×BS or
+      # other paths, suppress the hint so output_inds + kernel run the
+      # natural ordering (no regression on those paths).
+      hint_for_kernel = (Arep isa NewBlockSparseSorted && Brep isa NewBlockSparseSorted) ?
+                       nothing : output_inds_hint
+      indsC, denseC = output_inds(indsA, indsB, denseA, denseB; output_inds_hint=hint_for_kernel)
     end
     @timeit TIMER "wc.labels" begin
       dimsC = ntuple(i -> ITensors.dim(indsC[i]), length(indsC))
@@ -757,7 +1202,7 @@ function wrapped_contract(A::WrappedTensorTypes{TA,NA},
     end
     if Cbackend === :blocksparse
         denseLinksC = length(denseC)
-        if denseLinksC == length(indsC)
+        if denseLinksC == length(indsC) && !preserve_bs_output
             # P_C = 0: all output indices are dense → return plain ITensor
             @timeit TIMER "wc.alloc_dense" begin
               C_data = zeros(TC, dimsC...)
@@ -783,7 +1228,15 @@ function wrapped_contract(A::WrappedTensorTypes{TA,NA},
                 contract!(C_bs, labelsC_vec, NewBlockSparseSorted(Arep), labelsA_vec, Brep, labelsB_vec)
               end
             end
-            return length(indsC) == 0 ? ITensors.ITensor(C_data[]) : ITensors.ITensor(C_data, indsC...)
+            @timeit TIMER "wc.wrap_output" begin
+              if get(ENV, "SB_NO_ALIAS_OUTPUT", "0") == "1"
+                out = length(indsC) == 0 ? ITensors.ITensor(C_data[]) : ITensors.ITensor(C_data, indsC...)
+              else
+                out = length(indsC) == 0 ? ITensors.ITensor(C_data[]) :
+                      ITensors.ITensor(ITensors.AllowAlias(), C_data, indsC...)
+              end
+            end
+            return out
         end
 
         # if output_backend === :dense
@@ -791,11 +1244,15 @@ function wrapped_contract(A::WrappedTensorTypes{TA,NA},
         # println("Shared indices: ", shared, " with dense ", denseA, " and ", denseB)
         if (A isa WrappedTensor && B isa WrappedBlockSparse) ||
           (A isa WrappedBlockSparse && B isa WrappedTensor)
-          output_backend = :dense  
-          for I in shared
-            if !(I in denseA) && !(I in denseB)
-              output_backend = :blocksparse
-              break
+          if preserve_bs_output
+            output_backend = :blocksparse
+          else
+            output_backend = :dense
+            for I in shared
+              if !(I in denseA) && !(I in denseB)
+                output_backend = :blocksparse
+                break
+              end
             end
           end
           # if output_backend === :dense
@@ -805,16 +1262,30 @@ function wrapped_contract(A::WrappedTensorTypes{TA,NA},
           # end
         end
 
+        _trace = get(ENV, "SB_TRACE_ONE", "0") == "1"
         if output_backend === :dense
+          if _trace
+            println("\n[TRACE] wrapped_contract bs×dense path")
+            println("  indsA (BS):   ", [(ITensors.dim(i), ITensors.tags(i), ITensors.plev(i)) for i in indsA])
+            println("  indsB (dense):", [(ITensors.dim(i), ITensors.tags(i), ITensors.plev(i)) for i in indsB])
+            println("  indsC (pre-canonical):", [(ITensors.dim(i), ITensors.tags(i), ITensors.plev(i)) for i in indsC])
+            println("  denseA (BS dense axes):", [(ITensors.dim(i), ITensors.tags(i), ITensors.plev(i)) for i in denseA])
+          end
           # Reorder indsC to canonical [keepA, keepB, c_prefix] for the bd
           # kernel so it skips its trailing permute_back copy. Only applies
           # to BS×Dense (and Dense×BS); BS×BS keeps the original output_inds
           # order. ITensor identifies by Index identity, so the reorder is
           # invisible to callers.
           if Arep isa NewBlockSparseSorted && !(Brep isa NewBlockSparseSorted)
-              indsC = canonical_indsC_for_bd(indsA, denseA, indsB, indsC)
-              dimsC = ntuple(i -> ITensors.dim(indsC[i]), length(indsC))
-              labelsC_vec = fill_labels!(sc.labelsC, indsC)
+              @timeit TIMER "wc.canonicalize" begin
+                indsC = canonical_indsC_for_bd(indsA, denseA, indsB, indsC)
+                dimsC = ntuple(i -> ITensors.dim(indsC[i]), length(indsC))
+                labelsC_vec = fill_labels!(sc.labelsC, indsC)
+              end
+              if _trace
+                println("  indsC (post-canonical [keepA,keepB,c_prefix]):",
+                        [(ITensors.dim(i), ITensors.tags(i), ITensors.plev(i)) for i in indsC])
+              end
           end
           @timeit TIMER "wc.alloc_dense" begin
             C_data = zeros(TC, dimsC...)
@@ -832,16 +1303,48 @@ function wrapped_contract(A::WrappedTensorTypes{TA,NA},
               end
             end
           end
-          return length(indsC) == 0 ? ITensors.ITensor(C_data[]) : ITensors.ITensor(C_data, indsC...)
+          @timeit TIMER "wc.wrap_output" begin
+            # C_data is freshly allocated in wc.alloc_dense and not referenced
+            # elsewhere — safe to alias into the returned ITensor instead of
+            # copying. Saved ~3.8 s + 4.4 GiB at md=80 single-core.
+            # Gate-able via SB_NO_ALIAS_OUTPUT=1 to compare against the
+            # copying path for regression checks.
+            if get(ENV, "SB_NO_ALIAS_OUTPUT", "0") == "1"
+              out = length(indsC) == 0 ? ITensors.ITensor(C_data[]) : ITensors.ITensor(C_data, indsC...)
+            else
+              out = length(indsC) == 0 ? ITensors.ITensor(C_data[]) :
+                    ITensors.ITensor(ITensors.AllowAlias(), C_data, indsC...)
+              if _trace
+                println("  inds(out) wrapped: ", [(ITensors.dim(i), ITensors.tags(i), ITensors.plev(i)) for i in inds(out)])
+                println("  size(C_data): ", size(C_data))
+                println("  dimsC: ", dimsC)
+                ENV["SB_TRACE_ONE"] = "0"  # only trace once
+              end
+            end
+          end
+          return out
         else
           @timeit TIMER "wc.alloc_bs" begin
             C = WrappedBlockSparse(TC, dimsC, denseLinksC, indsC)
+          end
+          # Build allowed_keys_C from template by permuting template's keys
+          # into C's prefix coordinate system. Only when (a) template provided,
+          # (b) hint path is active (BS×Dense only), (c) prefix sizes match.
+          allowed_keys_C = nothing
+          if template_for_filter !== nothing && hint_for_kernel !== nothing &&
+             Arep isa NewBlockSparseSorted && !(Brep isa NewBlockSparseSorted)
+            @timeit TIMER "wc.build_allowed_keys" begin
+              allowed_keys_C = _allowed_keys_from_template(
+                  template_for_filter, indsC, denseLinksC)
+            end
           end
           @timeit TIMER "kern.contract!_bs_out" begin
             C.blocksparse = SparseBackends.contract!(
                 C.blocksparse, labelsC_vec,
                 Arep, labelsA_vec,
-                Brep, labelsB_vec
+                Brep, labelsB_vec;
+                output_inds_hint=hint_for_kernel,
+                allowed_keys_C=allowed_keys_C,
             )
           end
         end
@@ -1294,6 +1797,7 @@ function itensor_blocksparse_svd_channel_aware(
     maxdim::Int     = typemax(Int),
     mindim::Int     = 1,
     cutoff::Float64 = 0.0,
+    relax_iso_cap::Bool = false,
 )
     @assert ITensors.has_external_storage(phi) "phi must be block-sparse"
     @assert ITensors.has_external_storage(M_b) "M_b must be block-sparse"
@@ -1373,12 +1877,38 @@ function itensor_blocksparse_svd_channel_aware(
         push!(right_template, (ch, NTuple{nrs,Kt}(rk)))
     end
 
+    # Auto-detect bond factor structure from M_b's and M_b1's other LINK sparse
+    # axes. If their dims multiply to bond_sp_dim, the bond is at the overlap of
+    # two (I+C) factors → factor_dims = [left_link_dim, right_link_dim]. Else
+    # treat as monolithic (single factor).
+    other_link_dim_b  = 1
+    for p in M_b_sparse_pos
+        I = M_b_inds[p]
+        if I != bond_sparse && ITensors.hastags(I, "Link")
+            other_link_dim_b = max(other_link_dim_b, ITensors.dim(I))
+        end
+    end
+    other_link_dim_b1 = 1
+    for p in M_b1_sparse_pos
+        I = M_b1_inds[p]
+        if I != bond_sparse && ITensors.hastags(I, "Link")
+            other_link_dim_b1 = max(other_link_dim_b1, ITensors.dim(I))
+        end
+    end
+    bond_factor_dims = if other_link_dim_b * other_link_dim_b1 == bond_sp_dim &&
+                          other_link_dim_b > 1 && other_link_dim_b1 > 1
+        Int[other_link_dim_b, other_link_dim_b1]
+    else
+        Int[bond_sp_dim]
+    end
+
     U_bs, SV_bs, svs_kept, spec = blocksparse_svd_channel_aware(bs_p;
         n_left_sparse = nls,
         n_left_dense  = nld,
         left_template, right_template,
         bond_sparse_dim = bond_sp_dim,
-        ortho, maxdim, mindim, cutoff)
+        bond_factor_dims = bond_factor_dims,
+        ortho, maxdim, mindim, cutoff, relax_iso_cap)
 
     # Reuse old bond_sparse Index as new bond's sparse axis. Fresh Index for mult.
     new_sp  = bond_sparse

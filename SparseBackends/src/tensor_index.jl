@@ -40,6 +40,22 @@ end
   return _map_inds(inds, I -> _prime_index(I, n))
 end
 
+# Selective prime: increment plev only on indices that match the given target(s).
+# Supports a single Index target and a Tuple/Vector of Index targets, matching
+# ITensors' `prime(T, I)` / `prime(T, (I1, I2))` semantics. The `n` increment
+# defaults to 1.
+@inline function _prime_inds(inds::NTuple{N,ITensors.Index}, target::ITensors.Index) where {N}
+  return _map_inds(inds, I -> (I == target ? _prime_index(I, 1) : I))
+end
+
+@inline function _prime_inds(inds::NTuple{N,ITensors.Index}, targets::Tuple{Vararg{ITensors.Index}}) where {N}
+  return _map_inds(inds, I -> (I in targets ? _prime_index(I, 1) : I))
+end
+
+@inline function _prime_inds(inds::NTuple{N,ITensors.Index}, targets::AbstractVector{<:ITensors.Index}) where {N}
+  return _map_inds(inds, I -> (I in targets ? _prime_index(I, 1) : I))
+end
+
 @inline function _noprime_inds(inds::NTuple{N,ITensors.Index}) where {N}
   return _map_inds(inds, I -> _noprime_index(I, ITensors.plev(I)))
 end

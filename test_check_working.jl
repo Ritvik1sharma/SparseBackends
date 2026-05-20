@@ -1,6 +1,56 @@
 # using CSV, DataFrames
 using SparseBackends, Random
 using ITensors, ITensorMPS
+using TimerOutputs: reset_timer!, print_timer
+using LinearAlgebra: BLAS
+BLAS.set_num_threads(1)
+println("[BLAS threads pinned to ", BLAS.get_num_threads(), "]")
+
+# Diagnostic timing harness. Toggle the size of the run with env vars:
+#   DMRG_DIAG=1 → small run (nsweeps=3, maxdim=20) for fast iteration on timing data
+#   DMRG_DIAG unset/0 → full run at the original 25/40 used for the apples-to-apples final check.
+const _DIAG = get(ENV, "DMRG_DIAG", "0") == "1"
+
+
+function run_dmrg_with_timers(label, H, psi0; kwargs...)
+  # JIT warmup: 1-sweep DMRG on a deepcopy of psi0 with minimal kwargs, so that
+  # all hot-path methods are compiled before the timed run. Results discarded;
+  # then we reset timers and do the real DMRG call. Set DMRG_NO_WARMUP=1 to skip.
+  do_warmup = get(ENV, "DMRG_NO_WARMUP", "0") != "1"
+  if do_warmup
+    println("[warmup pass: 1 JIT sweep, results discarded]")
+    kw = NamedTuple(kwargs)
+    md = haskey(kw, :maxdim) ? kw.maxdim : [20]
+    mn = haskey(kw, :mindim) ? kw.mindim : md
+    co = haskey(kw, :cutoff) ? kw.cutoff : 1e-10
+    try
+      dmrg(H, deepcopy(psi0);
+           nsweeps = 1, maxdim = md, mindim = mn, cutoff = co,
+           outputlevel = 0, use_early_exit = false)
+    catch e
+      println("  (warmup failed: ", sprint(showerror, e), " — continuing without warmup)")
+    end
+  end
+  reset_timer!(SparseBackends.TIMER)
+  reset_timer!(ITensorMPS.PROJMPO_TIMER)
+  GC.gc(); GC.gc()
+
+
+  wall = @elapsed result = dmrg(H, psi0; kwargs...)
+  # Stash the JIT-excluded wall time so the caller can build a fair ratio
+  # (the @elapsed around `run_dmrg_with_timers(...)` includes warmup).
+  global LAST_DMRG_WALL = wall
+  println("\n========== TIMER REPORT: $label  (wall = $(round(wall; digits=3)) s, JIT excluded) ==========")
+  println("\n--- ProjMPO matvec breakdown (sparse vs dense H[j]) ---")
+  print_timer(ITensorMPS.PROJMPO_TIMER; sortby=:firstexec)
+  println("\n--- SparseBackends contract dispatch breakdown ---")
+  print_timer(SparseBackends.TIMER; sortby=:firstexec)
+  println("==========\n")
+  return result
+end
+
+# Global to share the JIT-excluded wall from run_dmrg_with_timers back out.
+LAST_DMRG_WALL = 0.0
 
 # const SBX = let m = Base.get_extension(SparseBackends, :SparseBackendsITensorsExt)
 #   m === nothing && error("SparseBackendsITensorsExt did not load. Did you `using ITensors` and set up [extensions]/[weakdeps]?")
@@ -257,15 +307,17 @@ end
 
 
 
+length(ARGS) < 1 && error("Usage: julia test_check_working.jl <N_plaq>")
+
 let
-    spin = 3
+    spin = parse(Int, get(ENV, "BENCH_SPIN", "3"))
     error = 10
     lambda = 0.0
     spin_sector = 1.0
     maxdim_list = [10]
 
     is_ctn_compression = false # Let's start with no compression to verify correctness first
-    N = 10 # 10 plaquettes = 22 sites
+    N = parse(Int, ARGS[1])
 
     states = 2*N+2
     if spin == 2
@@ -357,11 +409,11 @@ let
       end
     end
 
-    mem_bytes_projected = mpo_memory_bytes(H_new)
-    mem_bytes_projected2 = mpo_memory_bytes(H_new2)
-    mem_bytes_original = mpo_memory_bytes(H)
-    mem_bytes_constraints = mpo_memory_bytes(ConsOpsCombined)
-    println("Mem comparison ", mem_bytes_projected, " ", mem_bytes_projected2, " ", mem_bytes_original, " ", mem_bytes_constraints)
+    # mem_bytes_projected = mpo_memory_bytes(H_new)
+    # mem_bytes_projected2 = mpo_memory_bytes(H_new2)
+    # mem_bytes_original = mpo_memory_bytes(H)
+    # mem_bytes_constraints = mpo_memory_bytes(ConsOpsCombined)
+    # println("Mem comparison ", mem_bytes_projected, " ", mem_bytes_projected2, " ", mem_bytes_original, " ", mem_bytes_constraints)
 
 
     Random.seed!(42)
@@ -391,33 +443,77 @@ let
 
 
     tensor_tracker = Any[]
-    maxdim = [40]
-    mindim = [40]
+    _md_default = _DIAG ? 20 : 40
+    _ns_default = _DIAG ? 3 : 25
+    _md = parse(Int, get(ENV, "BENCH_MAXDIM", string(_md_default)))
+    _ns = parse(Int, get(ENV, "BENCH_NSWEEPS", string(_ns_default)))
+    maxdim = [_md]
+    mindim = [_md]
     target_energy = nothing
-    nsweeps = 25
+    nsweeps = _ns
     last_sweep_energy = nothing
+    println("\n[diag=$_DIAG] Running DENSE DMRG (H_new2) with nsweeps=$nsweeps, maxdim=$_md ...")
+    # ENV["DMRG_NO_WARMUP"] = "0"
+    ENV["SB_RUN_LABEL"] = "DENSE"
+    let base = get(ENV, "SB_DENSEDENSE_LOG_BASE", "")
+        if !isempty(base); ENV["SB_DENSEDENSE_LOG"] = base * "_denseDMRG.tsv"; end
+    end
     t = @elapsed begin
-        energy, psi, sweeps, t_err = dmrg(H_new2, psi1; nsweeps, maxdim, mindim, cutoff, target_energy, use_early_exit=false, last_sweep_energy=last_sweep_energy, outputlevel=1, tensor_tracker=tensor_tracker, only_store=true)
+        energy, psi, sweeps, t_err = run_dmrg_with_timers("DENSE H_new2",
+            H_new2, psi1; nsweeps, maxdim, mindim, cutoff, target_energy,
+            use_early_exit=false, last_sweep_energy=last_sweep_energy,
+            outputlevel=1, tensor_tracker=tensor_tracker, only_store=true)
     end
     E_0 = inner(copy(psi0)', H, copy(psi0))
     E_1 = inner(psi', H, psi)
     println("\n\t Energy at start ", E_0, " and at end ", E_1, " in sweeps ", sweeps, " and truncation error ", t_err)
-    println("Energy under Hamiltonian: $E_1 in sweeps $sweeps and terr $t_err and total time $t seconds")
+    println("[DENSE]  Energy: $E_1 in sweeps $sweeps and terr $t_err and total time $t seconds")
+    dense_wall = t                     # includes warmup
+    dense_wall_jit_excluded = LAST_DMRG_WALL  # only the measured run
 
 
 
-    maxdim = [40]
+
+    maxdim = [_md]
 
     target_energy = nothing
-    nsweeps = 25
+    nsweeps = _ns
     last_sweep_energy = nothing
+    println("\n[diag=$_DIAG] Running SPARSE DMRG (H_new) with nsweeps=$nsweeps, maxdim=$_md ...")
+    # ENV["DMRG_NO_WARMUP"] = "0"
+
+    if get(ENV, "SB_CPFX_STATS", "0") == "1"
+        SparseBackends.reset_cpfx_stats!()
+    end
+    ENV["SB_RUN_LABEL"] = "SPARSE"
+    let base = get(ENV, "SB_DENSEDENSE_LOG_BASE", "")
+        if !isempty(base); ENV["SB_DENSEDENSE_LOG"] = base * "_sparseDMRG.tsv"; end
+    end
     t = @elapsed begin
-        energy, psi, sweeps, t_err = dmrg(H_new, psi2; nsweeps, maxdim, mindim, cutoff, target_energy, use_early_exit=false, last_sweep_energy=last_sweep_energy, outputlevel=1, tensor_tracker=tensor_tracker)
+        energy, psi, sweeps, t_err = run_dmrg_with_timers("SPARSE H_new",
+            H_new, psi2; nsweeps, maxdim, mindim, cutoff, target_energy,
+            use_early_exit=false, last_sweep_energy=last_sweep_energy,
+            outputlevel=1, tensor_tracker=tensor_tracker)
+    end
+    if get(ENV, "SB_CPFX_STATS", "0") == "1"
+        SparseBackends.print_cpfx_stats()
     end
     E_0 = inner(copy(psi0)', H, copy(psi0))
     E_1 = inner(psi', H, psi)
     # println("\n\t Energy at start ", E_0, " and at end ", E_1, " in sweeps ", sweeps, " and truncation error ", t_err)
-    println("Energy under Hamiltonian: $E_1 in sweeps $sweeps and terr $t_err and total time $t seconds")
+    println("[SPARSE] Energy: $E_1 in sweeps $sweeps and terr $t_err and total time $t seconds")
+    sparse_wall = t                    # includes warmup
+    sparse_wall_jit_excluded = LAST_DMRG_WALL
+
+    println("\n========== HEAD-TO-HEAD WALL TIME ==========")
+    println("  Includes-warmup totals (for reference):")
+    println("    DENSE  total: $(round(dense_wall;  digits=3)) s")
+    println("    SPARSE total: $(round(sparse_wall; digits=3)) s")
+    println("    ratio = $(round(sparse_wall/dense_wall; digits=3))")
+    println("\n  JIT-EXCLUDED (post-warmup) totals — this is the fair comparison:")
+    println("    DENSE  measured: $(round(dense_wall_jit_excluded;  digits=3)) s")
+    println("    SPARSE measured: $(round(sparse_wall_jit_excluded; digits=3)) s")
+    println("    ratio sparse/dense = $(round(sparse_wall_jit_excluded/dense_wall_jit_excluded; digits=3))  (want < 1)")
 
 
 end

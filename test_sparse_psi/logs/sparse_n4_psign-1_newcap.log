@@ -1,0 +1,225 @@
+BMF_ISO_PATH = 1  (1 ⇒ standard eigsolve, no M⁻¹ wrap)
+Projector sign = -1  (P = ∏(I-C)/2)
+Building setup for N=4 plaquettes ...
+System: 10 sites
+  initial psi_sp: footprint=0.022 MiB  reported_maxlinkdim=4  honest_maxlinkdim=4
+    linkdims(reported, single shared idx)=[2, 2, 4, 2, 4, 2, 4, 2, 2]
+    linkdims(honest, ∏all shared)=[2, 2, 4, 2, 4, 2, 4, 2, 2]
+    site 1 [BS] axis_dims=(3, 2, 1)  blksize=1  nblocks=6  payload=0.09KiB
+    site 2 [BS] axis_dims=(3, 2, 2, 1, 1)  blksize=1  nblocks=6  payload=0.09KiB
+    site 3 [BS] axis_dims=(3, 2, 4, 1, 1)  blksize=1  nblocks=12  payload=0.19KiB
+    site 4 [BS] axis_dims=(3, 4, 2, 1, 1)  blksize=1  nblocks=12  payload=0.19KiB
+    site 5 [BS] axis_dims=(3, 2, 4, 1, 1)  blksize=1  nblocks=12  payload=0.19KiB
+    site 6 [BS] axis_dims=(3, 4, 2, 1, 1)  blksize=1  nblocks=12  payload=0.19KiB
+    site 7 [BS] axis_dims=(3, 2, 4, 1, 1)  blksize=1  nblocks=12  payload=0.19KiB
+    site 8 [BS] axis_dims=(3, 4, 2, 1, 1)  blksize=1  nblocks=12  payload=0.19KiB
+    site 9 [BS] axis_dims=(3, 2, 2, 1, 1)  blksize=1  nblocks=6  payload=0.09KiB
+    site 10 [BS] axis_dims=(3, 2, 1)  blksize=1  nblocks=6  payload=0.09KiB
+    payload(numeric only)=1.5 KiB   summarysize=22.03 KiB  overhead_ratio=14.69×
+
+=== WARMUP (2 sweeps, ramp 20 → 40) ===
+Use early exit is set to false num sweeeps are 1
+[CAP_DIAG] ortho=right maxdim=9223372036854775807 n_chan_possible=2 n_active_chan=2 mult_cap=4611686018427387903 n_new_d_natural=1 n_new_d=1 eff_bond=2 dropped_by_cap_svs=0
+[CAP_DIAG] ortho=right maxdim=9223372036854775807 n_chan_possible=2 n_active_chan=2 mult_cap=4611686018427387903 n_new_d_natural=1 n_new_d=1 eff_bond=2 dropped_by_cap_svs=0
+[CAP_DIAG] ortho=right maxdim=9223372036854775807 n_chan_possible=4 n_active_chan=4 mult_cap=2305843009213693951 n_new_d_natural=1 n_new_d=1 eff_bond=4 dropped_by_cap_svs=0
+[CAP_DIAG] ortho=right maxdim=9223372036854775807 n_chan_possible=2 n_active_chan=2 mult_cap=4611686018427387903 n_new_d_natural=1 n_new_d=1 eff_bond=2 dropped_by_cap_svs=0
+[CAP_DIAG] ortho=right maxdim=9223372036854775807 n_chan_possible=4 n_active_chan=4 mult_cap=2305843009213693951 n_new_d_natural=1 n_new_d=1 eff_bond=4 dropped_by_cap_svs=0
+[CAP_DIAG] ortho=right maxdim=9223372036854775807 n_chan_possible=2 n_active_chan=2 mult_cap=4611686018427387903 n_new_d_natural=1 n_new_d=1 eff_bond=2 dropped_by_cap_svs=0
+[CAP_DIAG] ortho=right maxdim=9223372036854775807 n_chan_possible=4 n_active_chan=4 mult_cap=2305843009213693951 n_new_d_natural=1 n_new_d=1 eff_bond=4 dropped_by_cap_svs=0
+[CAP_DIAG] ortho=right maxdim=9223372036854775807 n_chan_possible=2 n_active_chan=2 mult_cap=4611686018427387903 n_new_d_natural=1 n_new_d=1 eff_bond=2 dropped_by_cap_svs=0
+[CAP_DIAG] ortho=right maxdim=9223372036854775807 n_chan_possible=2 n_active_chan=2 mult_cap=4611686018427387903 n_new_d_natural=1 n_new_d=1 eff_bond=2 dropped_by_cap_svs=0
+Time to position at start of DMRG: 15.510897451 seconds
+ Check time breakdown Time spent in position! 0.03593593800000001 seconds. Time spent in optimization step (eigsolve + replacebond!) 28.51820926 seconds.
+=====================================
+After sweep 1 energy=-5.768475731029898  maxlinkdim=4 maxerr=9.60E-10 time=31.689
+  [warm sweep 1 / md=20] 77.97s  E=-5.768475731029898
+  after sweep 1: footprint=0.09 MiB  reported_maxlinkdim=4  honest_maxlinkdim=80
+    linkdims(reported, single shared idx)=[2, 4, 4, 4, 4, 4, 4, 2, 2]
+    linkdims(honest, ∏all shared)=[6, 60, 80, 40, 80, 40, 80, 18, 6]  E=-5.768475731029898
+Use early exit is set to false num sweeeps are 1
+Time to position at start of DMRG: 0.044382304 seconds
+ Check time breakdown Time spent in position! 0.265838744 seconds. Time spent in optimization step (eigsolve + replacebond!) 1.136157239 seconds.
+=====================================
+After sweep 1 energy=-6.080391480802339  maxlinkdim=4 maxerr=8.29E-07 time=1.462
+  [warm sweep 2 / md=40] 1.52s  E=-6.080391480802339
+  after sweep 2: footprint=0.424 MiB  reported_maxlinkdim=4  honest_maxlinkdim=160
+    linkdims(reported, single shared idx)=[2, 4, 4, 4, 4, 4, 4, 2, 2]
+    linkdims(honest, ∏all shared)=[6, 36, 108, 144, 160, 160, 108, 18, 6]  E=-6.080391480802339
+    site 1 [BS] axis_dims=(2, 3, 3)  blksize=3  nblocks=3  payload=0.14KiB
+    site 2 [BS] axis_dims=(2, 4, 3, 3, 9)  blksize=27  nblocks=3  payload=1.27KiB
+    site 3 [BS] axis_dims=(4, 4, 3, 9, 27)  blksize=243  nblocks=3  payload=11.39KiB
+    site 4 [BS] axis_dims=(4, 4, 3, 27, 36)  blksize=972  nblocks=3  payload=45.56KiB
+    site 5 [BS] axis_dims=(4, 4, 3, 36, 40)  blksize=1440  nblocks=3  payload=67.5KiB
+    site 6 [BS] axis_dims=(4, 4, 3, 40, 40)  blksize=1600  nblocks=3  payload=75.0KiB
+    site 7 [BS] axis_dims=(4, 4, 3, 40, 27)  blksize=1080  nblocks=3  payload=50.62KiB
+    site 8 [BS] axis_dims=(4, 2, 3, 27, 9)  blksize=243  nblocks=3  payload=11.39KiB
+    site 9 [BS] axis_dims=(2, 2, 3, 9, 3)  blksize=27  nblocks=3  payload=1.27KiB
+    site 10 [BS] axis_dims=(2, 3, 3)  blksize=3  nblocks=3  payload=0.14KiB
+    payload(numeric only)=264.28 KiB   summarysize=434.17 KiB  overhead_ratio=1.64×
+Warmup done in 79.6s.
+
+=== PROFILE (3 sweeps at maxdim=40 with reset timers) ===
+Use early exit is set to false num sweeeps are 1
+Time to position at start of DMRG: 0.108072434 seconds
+ Check time breakdown Time spent in position! 0.160533324 seconds. Time spent in optimization step (eigsolve + replacebond!) 0.858851363 seconds.
+=====================================
+After sweep 1 energy=-6.086774138863267  maxlinkdim=4 maxerr=7.68E-07 time=1.108
+  [prof sweep 1 / md=40] 1.25s  E=-6.086774138863267
+  after sweep 1: footprint=0.464 MiB  reported_maxlinkdim=4  honest_maxlinkdim=160
+    linkdims(reported, single shared idx)=[2, 4, 4, 4, 4, 4, 4, 2, 2]
+    linkdims(honest, ∏all shared)=[6, 36, 108, 160, 160, 160, 108, 18, 6]  E=-6.086774138863267
+Use early exit is set to false num sweeeps are 1
+Time to position at start of DMRG: 0.073984174 seconds
+ Check time breakdown Time spent in position! 0.15052365500000003 seconds. Time spent in optimization step (eigsolve + replacebond!) 1.6351545859999999 seconds.
+=====================================
+After sweep 1 energy=-6.090865172464504  maxlinkdim=4 maxerr=3.63E-07 time=1.887
+  [prof sweep 2 / md=40] 1.99s  E=-6.090865172464504
+  after sweep 2: footprint=0.464 MiB  reported_maxlinkdim=4  honest_maxlinkdim=160
+    linkdims(reported, single shared idx)=[2, 4, 4, 4, 4, 4, 4, 2, 2]
+    linkdims(honest, ∏all shared)=[6, 36, 108, 160, 160, 160, 108, 18, 6]  E=-6.090865172464504
+Use early exit is set to false num sweeeps are 1
+Time to position at start of DMRG: 0.068107246 seconds
+ Check time breakdown Time spent in position! 0.16828386 seconds. Time spent in optimization step (eigsolve + replacebond!) 1.051158272 seconds.
+=====================================
+After sweep 1 energy=-6.109534177342227  maxlinkdim=4 maxerr=6.59E-07 time=1.317
+Precompiling packages...
+   4738.8 ms  ✓ SparseBackends
+  1 dependency successfully precompiled in 5 seconds. 124 already precompiled.
+Precompiling packages...
+   4698.6 ms  ✓ ITensorMPS
+   2384.1 ms  ✓ ITensorMPS → ITensorMPSChainRulesCoreExt
+  2 dependencies successfully precompiled in 7 seconds. 127 already precompiled.
+  [prof sweep 3 / md=40] 1.41s  E=-6.109534177342227
+  after sweep 3: footprint=0.464 MiB  reported_maxlinkdim=4  honest_maxlinkdim=160
+    linkdims(reported, single shared idx)=[2, 4, 4, 4, 4, 4, 4, 2, 2]
+    linkdims(honest, ∏all shared)=[6, 36, 108, 160, 160, 160, 108, 18, 6]  E=-6.109534177342227
+    site 1 [BS] axis_dims=(2, 3, 3)  blksize=3  nblocks=3  payload=0.14KiB
+    site 2 [BS] axis_dims=(2, 4, 3, 3, 9)  blksize=27  nblocks=3  payload=1.27KiB
+    site 3 [BS] axis_dims=(4, 4, 3, 9, 27)  blksize=243  nblocks=3  payload=11.39KiB
+    site 4 [BS] axis_dims=(4, 4, 3, 27, 40)  blksize=1080  nblocks=3  payload=50.62KiB
+    site 5 [BS] axis_dims=(4, 4, 3, 40, 40)  blksize=1600  nblocks=3  payload=75.0KiB
+    site 6 [BS] axis_dims=(4, 4, 3, 40, 40)  blksize=1600  nblocks=3  payload=75.0KiB
+    site 7 [BS] axis_dims=(4, 4, 3, 40, 27)  blksize=1080  nblocks=3  payload=50.62KiB
+    site 8 [BS] axis_dims=(4, 2, 3, 27, 9)  blksize=243  nblocks=3  payload=11.39KiB
+    site 9 [BS] axis_dims=(2, 2, 3, 9, 3)  blksize=27  nblocks=3  payload=1.27KiB
+    site 10 [BS] axis_dims=(2, 3, 3)  blksize=3  nblocks=3  payload=0.14KiB
+    payload(numeric only)=276.84 KiB   summarysize=475.52 KiB  overhead_ratio=1.72×
+Profile sweeps done in 4.7s. E = -6.109534177342227
+
+========== ITensorMPS.PROJMPO_TIMER ==========
+──────────────────────────────────────────────────────────────────────────────────────
+                                             Time                    Allocations      
+                                    ───────────────────────   ────────────────────────
+         Tot / % measured:               4.90s /  85.9%           4.11GiB /  90.5%    
+
+Section                     ncalls     time    %tot     avg     alloc    %tot      avg
+──────────────────────────────────────────────────────────────────────────────────────
+dmrg.eigsolve                   54    3.55s   84.2%  65.6ms   3.09GiB   83.1%  58.6MiB
+  ProjMPO.contract             216    3.14s   74.7%  14.6ms   2.78GiB   74.9%  13.2MiB
+    matvec.denseH_wrapV_4      168    1.23s   29.3%  7.34ms   1.06GiB   28.4%  6.44MiB
+    matvec.denseH_wrapV_3      216    1.08s   25.7%  5.01ms    693MiB   18.2%  3.21MiB
+    matvec.denseH_wrapV_1      216    481ms   11.4%  2.22ms    471MiB   12.4%  2.18MiB
+    matvec.denseH_wrapV_2      216    339ms    8.0%  1.57ms    604MiB   15.9%  2.80MiB
+    matvec.OneITensor_0         48   70.1μs    0.0%  1.46μs     0.00B    0.0%    0.00B
+dmrg.position!                  54    479ms   11.4%  8.87ms    583MiB   15.3%  10.8MiB
+dmrg.replacebond!               54    185ms    4.4%  3.42ms   58.7MiB    1.5%  1.09MiB
+──────────────────────────────────────────────────────────────────────────────────────
+
+========== SparseBackends.TIMER ==========
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+                                                                    Time                    Allocations      
+                                                           ───────────────────────   ────────────────────────
+                     Tot / % measured:                          4.90s /  81.1%           4.11GiB /  78.4%    
+
+Section                                            ncalls     time    %tot     avg     alloc    %tot      avg
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+contract_preserve_bs                                  816    3.13s   78.7%  3.84ms   2.78GiB   86.4%  3.49MiB
+  cpb.contract                                        816    3.11s   78.3%  3.81ms   2.78GiB   86.4%  3.49MiB
+    wrapped_contract                                  816    3.11s   78.2%  3.81ms   2.78GiB   86.4%  3.49MiB
+      kern.contract!_bs_out                           816    3.02s   76.0%  3.70ms   2.75GiB   85.5%  3.46MiB
+        disp.body_full                                816    3.01s   75.8%  3.69ms   2.75GiB   85.5%  3.46MiB
+          kbd.general_contract                        816    3.01s   75.7%  3.69ms   2.75GiB   85.5%  3.45MiB
+            kdb.dispatch.main_loop!                   816    2.24s   56.4%  2.75ms   1.03GiB   31.9%  1.29MiB
+              kdb.gemm                              1.68k    1.29s   32.6%   770μs    882KiB    0.0%     538B
+              kdb.dispatch.alloc_C                    816    916ms   23.0%  1.12ms   1.03GiB   31.8%  1.29MiB
+            kdb.dispatch.permute_and_validate!        816    749ms   18.8%   918μs   1.72GiB   53.4%  2.16MiB
+            kdb.dispatch.prep_labels!                 816   8.60ms    0.2%  10.5μs   5.10MiB    0.2%  6.40KiB
+            kdb.dispatch.contract!                    816   3.66ms    0.1%  4.48μs   90.0KiB    0.0%     113B
+            kdb.dispatch.validate_and_prep!           816   2.55ms    0.1%  3.12μs    598KiB    0.0%     751B
+          disp.build_maps                             816   1.29ms    0.0%  1.59μs    918KiB    0.0%  1.12KiB
+          disp.find_shared                            816    783μs    0.0%   959ns    106KiB    0.0%     134B
+          disp.find_reduced                           816    446μs    0.0%   546ns   89.2KiB    0.0%     112B
+          disp.preamble                               816    124μs    0.0%   152ns     0.00B    0.0%    0.00B
+      wc.alloc_bs                                     816   25.9ms    0.7%  31.8μs   2.96MiB    0.1%  3.71KiB
+      wc.output_inds                                  816   18.6ms    0.5%  22.8μs   10.1MiB    0.3%  12.7KiB
+      wc.labels                                       816   15.3ms    0.4%  18.7μs   2.97MiB    0.1%  3.73KiB
+      wc.setup                                        816   14.4ms    0.4%  17.7μs   6.38MiB    0.2%  8.01KiB
+ext_dispatch[dense×wrapped]                           276    392ms    9.9%  1.42ms    169MiB    5.1%   628KiB
+  wrapped_contract                                    276    387ms    9.7%  1.40ms    169MiB    5.1%   626KiB
+    kern.bs_dense_to_dense                            276    277ms    7.0%  1.00ms   10.1MiB    0.3%  37.4KiB
+      bdd.permute_B                                   276    135ms    3.4%   488μs    272KiB    0.0%  0.98KiB
+      bdd.main_loop                                   276    106ms    2.7%   386μs    755KiB    0.0%  2.74KiB
+        bdd.gemm                                      828   96.3ms    2.4%   116μs    332KiB    0.0%     411B
+        bdd.slice_B                                   828   4.98ms    0.1%  6.02μs    312KiB    0.0%     385B
+      bdd.permute_A                                   276   14.4ms    0.4%  52.3μs   7.74MiB    0.2%  28.7KiB
+      bdd.classify                                    276   11.9ms    0.3%  43.2μs   0.99MiB    0.0%  3.67KiB
+      bdd.setup                                       276   7.70ms    0.2%  27.9μs    310KiB    0.0%  1.12KiB
+    wc.alloc_dense                                    276   76.4ms    1.9%   277μs    146MiB    4.4%   543KiB
+    wc.wrap_output                                    276   7.03ms    0.2%  25.5μs   1.46MiB    0.0%  5.43KiB
+    wc.output_inds                                    276   5.96ms    0.1%  21.6μs   3.11MiB    0.1%  11.5KiB
+    wc.canonicalize                                   270   5.41ms    0.1%  20.0μs   3.18MiB    0.1%  12.1KiB
+    wc.labels                                         276   5.04ms    0.1%  18.3μs    820KiB    0.0%  2.97KiB
+    wc.setup                                          276   3.92ms    0.1%  14.2μs   1.90MiB    0.1%  7.03KiB
+  wrap_itensor(A,dense)                               276   3.95ms    0.1%  14.3μs    524KiB    0.0%  1.90KiB
+ext_dispatch[wrapped×dense]                            96    353ms    8.9%  3.67ms    160MiB    4.8%  1.66MiB
+  wrapped_contract                                     96    350ms    8.8%  3.65ms    159MiB    4.8%  1.66MiB
+    kern.bs_dense_to_dense                             96    310ms    7.8%  3.23ms    976KiB    0.0%  10.2KiB
+      bdd.permute_B                                    96    197ms    5.0%  2.05ms    119KiB    0.0%  1.24KiB
+      bdd.main_loop                                    96    100ms    2.5%  1.04ms    309KiB    0.0%  3.22KiB
+        bdd.gemm                                      288   93.3ms    2.3%   324μs    125KiB    0.0%     445B
+        bdd.slice_B                                   288   3.18ms    0.1%  11.1μs    144KiB    0.0%     513B
+      bdd.classify                                     96   5.42ms    0.1%  56.5μs    367KiB    0.0%  3.82KiB
+      bdd.setup                                        96   4.93ms    0.1%  51.3μs    118KiB    0.0%  1.23KiB
+      bdd.permute_A                                    96   1.87ms    0.0%  19.5μs   49.3KiB    0.0%     526B
+    wc.alloc_dense                                     96   24.8ms    0.6%   258μs    154MiB    4.7%  1.60MiB
+    wc.wrap_output                                     96   3.35ms    0.1%  34.9μs    625KiB    0.0%  6.51KiB
+    wc.output_inds                                     96   2.78ms    0.1%  29.0μs   1.13MiB    0.0%  12.0KiB
+    wc.labels                                          96   2.30ms    0.1%  23.9μs    340KiB    0.0%  3.54KiB
+    wc.setup                                           96   2.28ms    0.1%  23.8μs    688KiB    0.0%  7.17KiB
+    wc.canonicalize                                    96   2.05ms    0.1%  21.4μs   1.21MiB    0.0%  12.9KiB
+  wrap_itensor(B,dense)                                96   2.13ms    0.1%  22.2μs    240KiB    0.0%  2.50KiB
+ext_dispatch[wrapped×wrapped]                         648    100ms    2.5%   155μs    118MiB    3.6%   187KiB
+  wrapped_contract                                    648    100ms    2.5%   154μs    118MiB    3.6%   187KiB
+    kern.bs_bs_to_dense                               594   51.9ms    1.3%  87.3μs   91.5MiB    2.8%   158KiB
+      disp.body_full                                  594   50.8ms    1.3%  85.6μs   91.5MiB    2.8%   158KiB
+        kbd.general_contract                          594   48.4ms    1.2%  81.6μs   90.6MiB    2.7%   156KiB
+          kbb.contract_shared.permute!                594   28.2ms    0.7%  47.4μs   90.2MiB    2.7%   155KiB
+          kbb.contract_shared.dense_contract!         594   18.3ms    0.5%  30.9μs    133KiB    0.0%     229B
+            kbb.contract_shared.gemm                5.35k   15.5ms    0.4%  2.91μs     0.00B    0.0%    0.00B
+          kbb.contract_shared.label!                  594    685μs    0.0%  1.15μs    209KiB    0.0%     361B
+          kbb.contract_shared.join_and_contract!      594    305μs    0.0%   514ns    107KiB    0.0%     185B
+        disp.build_maps                               594    791μs    0.0%  1.33μs    668KiB    0.0%  1.12KiB
+        disp.find_shared                              594    347μs    0.0%   583ns   88.7KiB    0.0%     153B
+        disp.find_reduced                             594    236μs    0.0%   397ns   88.7KiB    0.0%     153B
+        disp.preamble                                 594   67.4μs    0.0%   113ns     0.00B    0.0%    0.00B
+    kern.contract!_bs_out                              54   15.7ms    0.4%   290μs   14.7MiB    0.4%   279KiB
+      disp.body_full                                   54   15.3ms    0.4%   283μs   14.7MiB    0.4%   279KiB
+        kbd.general_contract                           54   15.0ms    0.4%   278μs   14.6MiB    0.4%   277KiB
+          kbb.contract_shared.dense_contract!          54   11.5ms    0.3%   212μs   10.9MiB    0.3%   206KiB
+            kbb.contract_shared.gemm                  486   6.01ms    0.2%  12.4μs     0.00B    0.0%    0.00B
+          kbb.contract_shared.permute!                 54   3.23ms    0.1%  59.9μs   3.72MiB    0.1%  70.6KiB
+          kbb.contract_shared.join_and_contract!       54    162μs    0.0%  3.00μs   11.6KiB    0.0%     220B
+          kbb.contract_shared.label!                   54   44.8μs    0.0%   829ns   11.8KiB    0.0%     224B
+        disp.build_maps                                54   85.0μs    0.0%  1.57μs   60.8KiB    0.0%  1.12KiB
+        disp.find_shared                               54   54.8μs    0.0%  1.02μs   7.22KiB    0.0%     137B
+        disp.find_reduced                              54   23.8μs    0.0%   440ns   5.91KiB    0.0%     112B
+        disp.preamble                                  54   8.26μs    0.0%   153ns     0.00B    0.0%    0.00B
+    wc.output_inds                                    648   7.78ms    0.2%  12.0μs   4.76MiB    0.1%  7.52KiB
+    wc.setup                                          648   7.37ms    0.2%  11.4μs   4.97MiB    0.2%  7.85KiB
+    wc.labels                                         648   5.20ms    0.1%  8.02μs   1.59MiB    0.0%  2.52KiB
+    wc.wrap_output                                    594   3.63ms    0.1%  6.10μs   83.5KiB    0.0%     144B
+    wc.alloc_bs                                        54   2.41ms    0.1%  44.6μs    184KiB    0.0%  3.40KiB
+    wc.alloc_dense                                    594   1.71ms    0.0%  2.88μs   65.0KiB    0.0%     112B
+recast.layer1_try                                     216    605μs    0.0%  2.80μs     0.00B    0.0%    0.00B
+recast.slow_densify                                   216   13.8μs    0.0%  63.9ns     0.00B    0.0%    0.00B
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────

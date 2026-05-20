@@ -1,0 +1,374 @@
+BMF_ISO_PATH = 1  (1 ⇒ standard eigsolve, no M⁻¹ wrap)
+Projector sign = -1  (P = ∏(I-C)/2)
+Building setup for N=4 plaquettes ...
+System: 10 sites
+  initial psi_sp: footprint=0.022 MiB  reported_maxlinkdim=4  honest_maxlinkdim=4
+    linkdims(reported, single shared idx)=[2, 2, 4, 2, 4, 2, 4, 2, 2]
+    linkdims(honest, ∏all shared)=[2, 2, 4, 2, 4, 2, 4, 2, 2]
+    site 1 [BS] axis_dims=(3, 2, 1)  blksize=1  nblocks=6  payload=0.09KiB
+    site 2 [BS] axis_dims=(3, 2, 2, 1, 1)  blksize=1  nblocks=6  payload=0.09KiB
+    site 3 [BS] axis_dims=(3, 2, 4, 1, 1)  blksize=1  nblocks=12  payload=0.19KiB
+    site 4 [BS] axis_dims=(3, 4, 2, 1, 1)  blksize=1  nblocks=12  payload=0.19KiB
+    site 5 [BS] axis_dims=(3, 2, 4, 1, 1)  blksize=1  nblocks=12  payload=0.19KiB
+    site 6 [BS] axis_dims=(3, 4, 2, 1, 1)  blksize=1  nblocks=12  payload=0.19KiB
+    site 7 [BS] axis_dims=(3, 2, 4, 1, 1)  blksize=1  nblocks=12  payload=0.19KiB
+    site 8 [BS] axis_dims=(3, 4, 2, 1, 1)  blksize=1  nblocks=12  payload=0.19KiB
+    site 9 [BS] axis_dims=(3, 2, 2, 1, 1)  blksize=1  nblocks=6  payload=0.09KiB
+    site 10 [BS] axis_dims=(3, 2, 1)  blksize=1  nblocks=6  payload=0.09KiB
+    payload(numeric only)=1.5 KiB   summarysize=22.03 KiB  overhead_ratio=14.69×
+
+=== WARMUP (2 sweeps, ramp 20 → 40) ===
+Use early exit is set to false num sweeeps are 1
+[BSCAW_CALL #1] maxdim=9223372036854775807 n_new_sp=2 n_new_d_natural=1 relax=false
+[CAP_DIAG] ortho=right maxdim=9223372036854775807 n_chan_possible=2 n_active_chan=2 mult_cap=4611686018427387903 n_new_d_natural=1 n_new_d=1 eff_bond=2 dropped_by_cap_svs=0
+[BSCAW_CALL #2] maxdim=9223372036854775807 n_new_sp=2 n_new_d_natural=1 relax=false
+[CAP_DIAG] ortho=right maxdim=9223372036854775807 n_chan_possible=2 n_active_chan=2 mult_cap=4611686018427387903 n_new_d_natural=1 n_new_d=1 eff_bond=2 dropped_by_cap_svs=0
+[BSCAW_CALL #3] maxdim=9223372036854775807 n_new_sp=4 n_new_d_natural=1 relax=false
+[CAP_DIAG] ortho=right maxdim=9223372036854775807 n_chan_possible=4 n_active_chan=4 mult_cap=2305843009213693951 n_new_d_natural=1 n_new_d=1 eff_bond=4 dropped_by_cap_svs=0
+[BSCAW_CALL #4] maxdim=9223372036854775807 n_new_sp=2 n_new_d_natural=1 relax=false
+[CAP_DIAG] ortho=right maxdim=9223372036854775807 n_chan_possible=2 n_active_chan=2 mult_cap=4611686018427387903 n_new_d_natural=1 n_new_d=1 eff_bond=2 dropped_by_cap_svs=0
+[BSCAW_CALL #5] maxdim=9223372036854775807 n_new_sp=4 n_new_d_natural=1 relax=false
+[CAP_DIAG] ortho=right maxdim=9223372036854775807 n_chan_possible=4 n_active_chan=4 mult_cap=2305843009213693951 n_new_d_natural=1 n_new_d=1 eff_bond=4 dropped_by_cap_svs=0
+[CAP_DIAG] ortho=right maxdim=9223372036854775807 n_chan_possible=2 n_active_chan=2 mult_cap=4611686018427387903 n_new_d_natural=1 n_new_d=1 eff_bond=2 dropped_by_cap_svs=0
+[CAP_DIAG] ortho=right maxdim=9223372036854775807 n_chan_possible=4 n_active_chan=4 mult_cap=2305843009213693951 n_new_d_natural=1 n_new_d=1 eff_bond=4 dropped_by_cap_svs=0
+[CAP_DIAG] ortho=right maxdim=9223372036854775807 n_chan_possible=2 n_active_chan=2 mult_cap=4611686018427387903 n_new_d_natural=1 n_new_d=1 eff_bond=2 dropped_by_cap_svs=0
+[CAP_DIAG] ortho=right maxdim=9223372036854775807 n_chan_possible=2 n_active_chan=2 mult_cap=4611686018427387903 n_new_d_natural=1 n_new_d=1 eff_bond=2 dropped_by_cap_svs=0
+Time to position at start of DMRG: 15.675748512 seconds
+[CAP_DIAG_RB] ortho=right maxdim=20 n_active=2 mult_cap=10 n_new_d_natural=3 n_new_d=3 eff_bond=6 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=20 n_active=4 mult_cap=5 n_new_d_natural=3 n_new_d=3 eff_bond=12 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=20 n_active=2 mult_cap=10 n_new_d_natural=3 n_new_d=3 eff_bond=6 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=20 n_active=4 mult_cap=5 n_new_d_natural=3 n_new_d=3 eff_bond=12 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=20 n_active=2 mult_cap=10 n_new_d_natural=3 n_new_d=3 eff_bond=6 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=20 n_active=4 mult_cap=5 n_new_d_natural=3 n_new_d=3 eff_bond=12 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=20 n_active=2 mult_cap=10 n_new_d_natural=3 n_new_d=3 eff_bond=6 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=20 n_active=2 mult_cap=10 n_new_d_natural=3 n_new_d=3 eff_bond=6 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=20 n_active=1 mult_cap=20 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=20 n_active=1 mult_cap=20 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=20 n_active=1 mult_cap=20 n_new_d_natural=9 n_new_d=9 eff_bond=9 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=20 n_active=1 mult_cap=20 n_new_d_natural=20 n_new_d=20 eff_bond=20 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=20 n_active=1 mult_cap=20 n_new_d_natural=10 n_new_d=10 eff_bond=10 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=20 n_active=1 mult_cap=20 n_new_d_natural=20 n_new_d=20 eff_bond=20 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=20 n_active=1 mult_cap=20 n_new_d_natural=10 n_new_d=10 eff_bond=10 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=20 n_active=1 mult_cap=20 n_new_d_natural=20 n_new_d=20 eff_bond=20 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=20 n_active=1 mult_cap=20 n_new_d_natural=15 n_new_d=15 eff_bond=15 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=20 n_active=1 mult_cap=20 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+ Check time breakdown Time spent in position! 0.04454409499999999 seconds. Time spent in optimization step (eigsolve + replacebond!) 32.168520575 seconds.
+=====================================
+After sweep 1 energy=-5.768475731029898  maxlinkdim=4 maxerr=9.60E-10 time=36.129
+  [warm sweep 1 / md=20] 83.46s  E=-5.768475731029898
+  after sweep 1: footprint=0.09 MiB  reported_maxlinkdim=4  honest_maxlinkdim=80
+    linkdims(reported, single shared idx)=[2, 4, 4, 4, 4, 4, 4, 2, 2]
+    linkdims(honest, ∏all shared)=[6, 60, 80, 40, 80, 40, 80, 18, 6]  E=-5.768475731029898
+Use early exit is set to false num sweeeps are 1
+Time to position at start of DMRG: 0.015875315 seconds
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=9 n_new_d=9 eff_bond=9 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=23 n_new_d=23 eff_bond=23 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=31 n_new_d=31 eff_bond=31 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=30 n_new_d=30 eff_bond=30 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=31 n_new_d=31 eff_bond=31 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=27 n_new_d=27 eff_bond=27 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=9 n_new_d=9 eff_bond=9 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=9 n_new_d=9 eff_bond=9 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=27 n_new_d=27 eff_bond=27 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=36 n_new_d=36 eff_bond=36 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=27 n_new_d=27 eff_bond=27 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=9 n_new_d=9 eff_bond=9 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+ Check time breakdown Time spent in position! 0.188328887 seconds. Time spent in optimization step (eigsolve + replacebond!) 0.5902107450000001 seconds.
+=====================================
+After sweep 1 energy=-6.080391480802339  maxlinkdim=4 maxerr=8.29E-07 time=0.849
+  [warm sweep 2 / md=40] 0.9s  E=-6.080391480802339
+  after sweep 2: footprint=0.424 MiB  reported_maxlinkdim=4  honest_maxlinkdim=160
+    linkdims(reported, single shared idx)=[2, 4, 4, 4, 4, 4, 4, 2, 2]
+    linkdims(honest, ∏all shared)=[6, 36, 108, 144, 160, 160, 108, 18, 6]  E=-6.080391480802339
+    site 1 [BS] axis_dims=(2, 3, 3)  blksize=3  nblocks=3  payload=0.14KiB
+    site 2 [BS] axis_dims=(2, 4, 3, 3, 9)  blksize=27  nblocks=3  payload=1.27KiB
+    site 3 [BS] axis_dims=(4, 4, 3, 9, 27)  blksize=243  nblocks=3  payload=11.39KiB
+    site 4 [BS] axis_dims=(4, 4, 3, 27, 36)  blksize=972  nblocks=3  payload=45.56KiB
+    site 5 [BS] axis_dims=(4, 4, 3, 36, 40)  blksize=1440  nblocks=3  payload=67.5KiB
+    site 6 [BS] axis_dims=(4, 4, 3, 40, 40)  blksize=1600  nblocks=3  payload=75.0KiB
+    site 7 [BS] axis_dims=(4, 4, 3, 40, 27)  blksize=1080  nblocks=3  payload=50.62KiB
+    site 8 [BS] axis_dims=(4, 2, 3, 27, 9)  blksize=243  nblocks=3  payload=11.39KiB
+    site 9 [BS] axis_dims=(2, 2, 3, 9, 3)  blksize=27  nblocks=3  payload=1.27KiB
+    site 10 [BS] axis_dims=(2, 3, 3)  blksize=3  nblocks=3  payload=0.14KiB
+    payload(numeric only)=264.28 KiB   summarysize=434.17 KiB  overhead_ratio=1.64×
+Warmup done in 84.5s.
+
+=== PROFILE (5 sweeps at maxdim=40 with reset timers) ===
+Use early exit is set to false num sweeeps are 1
+Time to position at start of DMRG: 0.101744397 seconds
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=9 n_new_d=9 eff_bond=9 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=27 n_new_d=27 eff_bond=27 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=27 n_new_d=27 eff_bond=27 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=9 n_new_d=9 eff_bond=9 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=9 n_new_d=9 eff_bond=9 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=27 n_new_d=27 eff_bond=27 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=27 n_new_d=27 eff_bond=27 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=9 n_new_d=9 eff_bond=9 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+ Check time breakdown Time spent in position! 0.172829697 seconds. Time spent in optimization step (eigsolve + replacebond!) 0.9564743460000001 seconds.
+=====================================
+After sweep 1 energy=-6.086774138863267  maxlinkdim=4 maxerr=7.68E-07 time=1.222
+  [prof sweep 1 / md=40] 1.35s  E=-6.086774138863267
+  after sweep 1: footprint=0.464 MiB  reported_maxlinkdim=4  honest_maxlinkdim=160
+    linkdims(reported, single shared idx)=[2, 4, 4, 4, 4, 4, 4, 2, 2]
+    linkdims(honest, ∏all shared)=[6, 36, 108, 160, 160, 160, 108, 18, 6]  E=-6.086774138863267
+Use early exit is set to false num sweeeps are 1
+Time to position at start of DMRG: 0.177336003 seconds
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=9 n_new_d=9 eff_bond=9 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=27 n_new_d=27 eff_bond=27 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=27 n_new_d=27 eff_bond=27 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=9 n_new_d=9 eff_bond=9 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=9 n_new_d=9 eff_bond=9 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=27 n_new_d=27 eff_bond=27 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=27 n_new_d=27 eff_bond=27 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=9 n_new_d=9 eff_bond=9 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+ Check time breakdown Time spent in position! 0.15708550699999999 seconds. Time spent in optimization step (eigsolve + replacebond!) 0.9635941459999999 seconds.
+=====================================
+After sweep 1 energy=-6.090865172464504  maxlinkdim=4 maxerr=3.63E-07 time=1.212
+  [prof sweep 2 / md=40] 1.93s  E=-6.090865172464504
+  after sweep 2: footprint=0.464 MiB  reported_maxlinkdim=4  honest_maxlinkdim=160
+    linkdims(reported, single shared idx)=[2, 4, 4, 4, 4, 4, 4, 2, 2]
+    linkdims(honest, ∏all shared)=[6, 36, 108, 160, 160, 160, 108, 18, 6]  E=-6.090865172464504
+Use early exit is set to false num sweeeps are 1
+Time to position at start of DMRG: 0.082486315 seconds
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=9 n_new_d=9 eff_bond=9 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=27 n_new_d=27 eff_bond=27 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=27 n_new_d=27 eff_bond=27 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=9 n_new_d=9 eff_bond=9 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=9 n_new_d=9 eff_bond=9 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=27 n_new_d=27 eff_bond=27 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=27 n_new_d=27 eff_bond=27 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=9 n_new_d=9 eff_bond=9 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+ Check time breakdown Time spent in position! 0.155708986 seconds. Time spent in optimization step (eigsolve + replacebond!) 0.8758161099999999 seconds.
+=====================================
+After sweep 1 energy=-6.109534177342227  maxlinkdim=4 maxerr=6.59E-07 time=1.138
+  [prof sweep 3 / md=40] 1.24s  E=-6.109534177342227
+  after sweep 3: footprint=0.464 MiB  reported_maxlinkdim=4  honest_maxlinkdim=160
+    linkdims(reported, single shared idx)=[2, 4, 4, 4, 4, 4, 4, 2, 2]
+    linkdims(honest, ∏all shared)=[6, 36, 108, 160, 160, 160, 108, 18, 6]  E=-6.109534177342227
+Use early exit is set to false num sweeeps are 1
+Time to position at start of DMRG: 0.086579896 seconds
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=9 n_new_d=9 eff_bond=9 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=27 n_new_d=27 eff_bond=27 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=27 n_new_d=27 eff_bond=27 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=9 n_new_d=9 eff_bond=9 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=9 n_new_d=9 eff_bond=9 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=27 n_new_d=27 eff_bond=27 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=27 n_new_d=27 eff_bond=27 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=9 n_new_d=9 eff_bond=9 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+ Check time breakdown Time spent in position! 0.15986546 seconds. Time spent in optimization step (eigsolve + replacebond!) 0.9244338719999998 seconds.
+=====================================
+After sweep 1 energy=-6.127215576339166  maxlinkdim=4 maxerr=8.65E-07 time=1.178
+  [prof sweep 4 / md=40] 1.29s  E=-6.127215576339166
+  after sweep 4: footprint=0.464 MiB  reported_maxlinkdim=4  honest_maxlinkdim=160
+    linkdims(reported, single shared idx)=[2, 4, 4, 4, 4, 4, 4, 2, 2]
+    linkdims(honest, ∏all shared)=[6, 36, 108, 160, 160, 160, 108, 18, 6]  E=-6.127215576339166
+Use early exit is set to false num sweeeps are 1
+Time to position at start of DMRG: 0.07779408 seconds
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=9 n_new_d=9 eff_bond=9 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=27 n_new_d=27 eff_bond=27 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=27 n_new_d=27 eff_bond=27 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=9 n_new_d=9 eff_bond=9 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=9 n_new_d=9 eff_bond=9 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=27 n_new_d=27 eff_bond=27 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=40 n_new_d=40 eff_bond=40 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=27 n_new_d=27 eff_bond=27 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=9 n_new_d=9 eff_bond=9 dropped_svs=0
+[CAP_DIAG_RB] ortho=right maxdim=40 n_active=1 mult_cap=40 n_new_d_natural=3 n_new_d=3 eff_bond=3 dropped_svs=0
+ Check time breakdown Time spent in position! 0.14744221400000002 seconds. Time spent in optimization step (eigsolve + replacebond!) 0.8273050190000001 seconds.
+=====================================
+After sweep 1 energy=-6.131098899508878  maxlinkdim=4 maxerr=4.73E-07 time=1.070
+Precompiling packages...
+   5976.5 ms  ✓ SparseBackends
+  1 dependency successfully precompiled in 7 seconds. 124 already precompiled.
+Precompiling packages...
+   5639.7 ms  ✓ ITensorMPS
+   3024.8 ms  ✓ ITensorMPS → ITensorMPSChainRulesCoreExt
+  2 dependencies successfully precompiled in 9 seconds. 127 already precompiled.
+  [prof sweep 5 / md=40] 1.17s  E=-6.131098899508878
+  after sweep 5: footprint=0.464 MiB  reported_maxlinkdim=4  honest_maxlinkdim=160
+    linkdims(reported, single shared idx)=[2, 4, 4, 4, 4, 4, 4, 2, 2]
+    linkdims(honest, ∏all shared)=[6, 36, 108, 160, 160, 160, 108, 18, 6]  E=-6.131098899508878
+    site 1 [BS] axis_dims=(2, 3, 3)  blksize=3  nblocks=3  payload=0.14KiB
+    site 2 [BS] axis_dims=(2, 4, 3, 3, 9)  blksize=27  nblocks=3  payload=1.27KiB
+    site 3 [BS] axis_dims=(4, 4, 3, 9, 27)  blksize=243  nblocks=3  payload=11.39KiB
+    site 4 [BS] axis_dims=(4, 4, 3, 27, 40)  blksize=1080  nblocks=3  payload=50.62KiB
+    site 5 [BS] axis_dims=(4, 4, 3, 40, 40)  blksize=1600  nblocks=3  payload=75.0KiB
+    site 6 [BS] axis_dims=(4, 4, 3, 40, 40)  blksize=1600  nblocks=3  payload=75.0KiB
+    site 7 [BS] axis_dims=(4, 4, 3, 40, 27)  blksize=1080  nblocks=3  payload=50.62KiB
+    site 8 [BS] axis_dims=(4, 2, 3, 27, 9)  blksize=243  nblocks=3  payload=11.39KiB
+    site 9 [BS] axis_dims=(2, 2, 3, 9, 3)  blksize=27  nblocks=3  payload=1.27KiB
+    site 10 [BS] axis_dims=(2, 3, 3)  blksize=3  nblocks=3  payload=0.14KiB
+    payload(numeric only)=276.84 KiB   summarysize=475.52 KiB  overhead_ratio=1.72×
+Profile sweeps done in 7.0s. E = -6.131098899508878
+
+========== ITensorMPS.PROJMPO_TIMER ==========
+──────────────────────────────────────────────────────────────────────────────────────
+                                             Time                    Allocations      
+                                    ───────────────────────   ────────────────────────
+         Tot / % measured:               7.24s /  78.0%           6.83GiB /  90.5%    
+
+Section                     ncalls     time    %tot     avg     alloc    %tot      avg
+──────────────────────────────────────────────────────────────────────────────────────
+dmrg.eigsolve                   90    4.55s   80.5%  50.5ms   5.14GiB   83.1%  58.5MiB
+  ProjMPO.contract             360    3.95s   70.0%  11.0ms   4.64GiB   75.1%  13.2MiB
+    matvec.denseH_wrapV_4      280    1.88s   33.2%  6.70ms   1.76GiB   28.5%  6.44MiB
+    matvec.denseH_wrapV_1      360    738ms   13.1%  2.05ms    785MiB   12.4%  2.18MiB
+    matvec.denseH_wrapV_3      360    725ms   12.8%  2.02ms   1.13GiB   18.3%  3.21MiB
+    matvec.denseH_wrapV_2      360    593ms   10.5%  1.65ms   0.98GiB   15.9%  2.80MiB
+    matvec.OneITensor_0         80   85.8μs    0.0%  1.07μs     0.00B    0.0%    0.00B
+dmrg.position!                  90    792ms   14.0%  8.80ms   0.95GiB   15.3%  10.8MiB
+dmrg.replacebond!               90    307ms    5.4%  3.41ms   97.9MiB    1.5%  1.09MiB
+──────────────────────────────────────────────────────────────────────────────────────
+
+========== SparseBackends.TIMER ==========
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+                                                                    Time                    Allocations      
+                                                           ───────────────────────   ────────────────────────
+                     Tot / % measured:                          7.24s /  80.2%           6.83GiB /  78.6%    
+
+Section                                            ncalls     time    %tot     avg     alloc    %tot      avg
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+contract_preserve_bs                                1.36k    3.93s   67.6%  2.89ms   4.64GiB   86.4%  3.49MiB
+  cpb.contract                                      1.36k    3.89s   67.1%  2.86ms   4.64GiB   86.4%  3.49MiB
+    wrapped_contract                                1.36k    3.89s   67.0%  2.86ms   4.64GiB   86.4%  3.49MiB
+      kern.contract!_bs_out                         1.36k    3.74s   64.4%  2.75ms   4.59GiB   85.5%  3.46MiB
+        disp.body_full                              1.36k    3.72s   64.2%  2.74ms   4.59GiB   85.5%  3.46MiB
+          kbd.general_contract                      1.36k    3.72s   64.0%  2.73ms   4.59GiB   85.5%  3.46MiB
+            kdb.dispatch.main_loop!                 1.36k    2.53s   43.7%  1.86ms   1.71GiB   31.9%  1.29MiB
+              kdb.gemm                              2.80k    1.98s   34.2%   708μs   1.44MiB    0.0%     538B
+              kdb.dispatch.alloc_C                  1.36k    497ms    8.6%   365μs   1.71GiB   31.8%  1.29MiB
+            kdb.dispatch.permute_and_validate!      1.36k    1.15s   19.9%   848μs   2.87GiB   53.4%  2.16MiB
+            kdb.dispatch.prep_labels!               1.36k   14.5ms    0.3%  10.7μs   8.50MiB    0.2%  6.40KiB
+            kdb.dispatch.contract!                  1.36k   6.39ms    0.1%  4.70μs    150KiB    0.0%     113B
+            kdb.dispatch.validate_and_prep!         1.36k   4.03ms    0.1%  2.97μs   0.97MiB    0.0%     751B
+          disp.build_maps                           1.36k   2.24ms    0.0%  1.64μs   1.49MiB    0.0%  1.12KiB
+          disp.find_shared                          1.36k   1.12ms    0.0%   825ns    178KiB    0.0%     134B
+          disp.find_reduced                         1.36k    681μs    0.0%   501ns    149KiB    0.0%     112B
+          disp.preamble                             1.36k    189μs    0.0%   139ns     0.00B    0.0%    0.00B
+      wc.alloc_bs                                   1.36k   46.2ms    0.8%  34.0μs   4.93MiB    0.1%  3.71KiB
+      wc.output_inds                                1.36k   29.6ms    0.5%  21.8μs   16.8MiB    0.3%  12.7KiB
+      wc.labels                                     1.36k   27.0ms    0.5%  19.8μs   4.96MiB    0.1%  3.73KiB
+      wc.setup                                      1.36k   24.6ms    0.4%  18.1μs   10.6MiB    0.2%  8.01KiB
+ext_dispatch[dense×wrapped]                           460    1.08s   18.7%  2.35ms    283MiB    5.1%   629KiB
+  wrapped_contract                                    460    1.07s   18.5%  2.34ms    282MiB    5.1%   627KiB
+    wc.alloc_dense                                    460    578ms   10.0%  1.26ms    244MiB    4.4%   544KiB
+    kern.bs_dense_to_dense                            460    442ms    7.6%   961μs   16.8MiB    0.3%  37.4KiB
+      bdd.permute_B                                   460    221ms    3.8%   480μs    453KiB    0.0%  0.98KiB
+      bdd.main_loop                                   460    165ms    2.8%   359μs   1.23MiB    0.0%  2.74KiB
+        bdd.gemm                                    1.38k    147ms    2.5%   107μs    554KiB    0.0%     411B
+        bdd.slice_B                                 1.38k   8.53ms    0.1%  6.18μs    519KiB    0.0%     385B
+      bdd.permute_A                                   460   21.8ms    0.4%  47.4μs   12.9MiB    0.2%  28.8KiB
+      bdd.classify                                    460   18.6ms    0.3%  40.4μs   1.65MiB    0.0%  3.67KiB
+      bdd.setup                                       460   12.9ms    0.2%  28.0μs    516KiB    0.0%  1.12KiB
+    wc.wrap_output                                    460   11.0ms    0.2%  23.9μs   2.44MiB    0.0%  5.43KiB
+    wc.output_inds                                    460   9.38ms    0.2%  20.4μs   5.19MiB    0.1%  11.5KiB
+    wc.labels                                         460   9.27ms    0.2%  20.2μs   1.33MiB    0.0%  2.97KiB
+    wc.canonicalize                                   450   9.20ms    0.2%  20.4μs   5.30MiB    0.1%  12.1KiB
+    wc.setup                                          460   6.62ms    0.1%  14.4μs   3.16MiB    0.1%  7.03KiB
+  wrap_itensor(A,dense)                               460   7.02ms    0.1%  15.3μs    873KiB    0.0%  1.90KiB
+ext_dispatch[wrapped×dense]                           160    624ms   10.8%  3.90ms    267MiB    4.8%  1.67MiB
+  wrapped_contract                                    160    620ms   10.7%  3.87ms    266MiB    4.8%  1.66MiB
+    kern.bs_dense_to_dense                            160    542ms    9.3%  3.39ms   1.59MiB    0.0%  10.2KiB
+      bdd.permute_B                                   160    354ms    6.1%  2.21ms    198KiB    0.0%  1.24KiB
+      bdd.main_loop                                   160    163ms    2.8%  1.02ms    515KiB    0.0%  3.22KiB
+        bdd.gemm                                      480    152ms    2.6%   317μs    209KiB    0.0%     445B
+        bdd.slice_B                                   480   5.48ms    0.1%  11.4μs    240KiB    0.0%     513B
+      bdd.classify                                    160   10.3ms    0.2%  64.2μs    611KiB    0.0%  3.82KiB
+      bdd.setup                                       160   8.38ms    0.1%  52.4μs    197KiB    0.0%  1.23KiB
+      bdd.permute_A                                   160   3.97ms    0.1%  24.8μs   82.2KiB    0.0%     526B
+    wc.alloc_dense                                    160   50.4ms    0.9%   315μs    257MiB    4.7%  1.61MiB
+    wc.wrap_output                                    160   5.61ms    0.1%  35.1μs   1.02MiB    0.0%  6.51KiB
+    wc.labels                                         160   5.26ms    0.1%  32.9μs    566KiB    0.0%  3.54KiB
+    wc.output_inds                                    160   4.64ms    0.1%  29.0μs   1.88MiB    0.0%  12.0KiB
+    wc.setup                                          160   3.87ms    0.1%  24.2μs   1.12MiB    0.0%  7.17KiB
+    wc.canonicalize                                   160   3.84ms    0.1%  24.0μs   2.02MiB    0.0%  12.9KiB
+  wrap_itensor(B,dense)                               160   3.58ms    0.1%  22.4μs    400KiB    0.0%  2.50KiB
+ext_dispatch[wrapped×wrapped]                       1.08k    172ms    3.0%   159μs    197MiB    3.6%   187KiB
+  wrapped_contract                                  1.08k    171ms    2.9%   158μs    197MiB    3.6%   187KiB
+    kern.bs_bs_to_dense                               990   85.1ms    1.5%  85.9μs    153MiB    2.8%   158KiB
+      disp.body_full                                  990   83.5ms    1.4%  84.4μs    153MiB    2.8%   158KiB
+        kbd.general_contract                          990   79.8ms    1.4%  80.6μs    151MiB    2.7%   156KiB
+          kbb.contract_shared.permute!                990   49.5ms    0.9%  50.0μs    150MiB    2.7%   156KiB
+          kbb.contract_shared.dense_contract!         990   27.2ms    0.5%  27.5μs    221KiB    0.0%     228B
+            kbb.contract_shared.gemm                8.91k   23.1ms    0.4%  2.59μs     0.00B    0.0%    0.00B
+          kbb.contract_shared.label!                  990   1.04ms    0.0%  1.05μs    349KiB    0.0%     361B
+          kbb.contract_shared.join_and_contract!      990    515μs    0.0%   521ns    179KiB    0.0%     185B
+        disp.build_maps                               990   1.29ms    0.0%  1.30μs   1.09MiB    0.0%  1.12KiB
+        disp.find_shared                              990    588μs    0.0%   594ns    148KiB    0.0%     153B
+        disp.find_reduced                             990    323μs    0.0%   326ns    148KiB    0.0%     153B
+        disp.preamble                                 990    106μs    0.0%   107ns     0.00B    0.0%    0.00B
+    kern.contract!_bs_out                              90   31.0ms    0.5%   345μs   24.5MiB    0.4%   279KiB
+      disp.body_full                                   90   30.4ms    0.5%   337μs   24.5MiB    0.4%   279KiB
+        kbd.general_contract                           90   29.9ms    0.5%   332μs   24.4MiB    0.4%   278KiB
+          kbb.contract_shared.dense_contract!          90   17.0ms    0.3%   189μs   18.1MiB    0.3%   206KiB
+            kbb.contract_shared.gemm                  810   8.30ms    0.1%  10.2μs     0.00B    0.0%    0.00B
+          kbb.contract_shared.permute!                 90   12.3ms    0.2%   136μs   6.21MiB    0.1%  70.7KiB
+          kbb.contract_shared.join_and_contract!       90    287μs    0.0%  3.19μs   19.4KiB    0.0%     220B
+          kbb.contract_shared.label!                   90   74.8μs    0.0%   831ns   19.7KiB    0.0%     224B
+        disp.build_maps                                90    157μs    0.0%  1.74μs    101KiB    0.0%  1.12KiB
+        disp.find_shared                               90   88.8μs    0.0%   987ns   12.0KiB    0.0%     137B
+        disp.find_reduced                              90   40.6μs    0.0%   451ns   9.84KiB    0.0%     112B
+        disp.preamble                                  90   11.6μs    0.0%   129ns     0.00B    0.0%    0.00B
+    wc.setup                                        1.08k   15.5ms    0.3%  14.4μs   8.28MiB    0.2%  7.85KiB
+    wc.output_inds                                  1.08k   12.6ms    0.2%  11.7μs   7.93MiB    0.1%  7.52KiB
+    wc.labels                                       1.08k   8.46ms    0.1%  7.83μs   2.65MiB    0.0%  2.52KiB
+    wc.wrap_output                                    990   4.31ms    0.1%  4.35μs    139KiB    0.0%     144B
+    wc.alloc_bs                                        90   4.24ms    0.1%  47.1μs    306KiB    0.0%  3.40KiB
+    wc.alloc_dense                                    990   2.97ms    0.1%  3.00μs    108KiB    0.0%     112B
+recast.layer1_try                                     360   1.03ms    0.0%  2.86μs     0.00B    0.0%    0.00B
+recast.slow_densify                                   360   21.8μs    0.0%  60.5ns     0.00B    0.0%    0.00B
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────
