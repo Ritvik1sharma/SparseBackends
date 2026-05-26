@@ -491,30 +491,148 @@ function blocksparse_svd_channel_aware_fixed(
         println(stdout, "[SVD_DIAG_CA] dropped=$dropped (‖²=$dropped_norm2)  kept_‖²=$kept_norm2  ambiguous=$ambiguous")
     end
 
-    # ---- SVD per channel (full SVD so we can extend padded slots with orthonormal basis) ----
+    # ---- Grouped joint SVD with column-partition (cross-c_m iso for free).
+    # Group channels by fA value (ortho="left") or fB (ortho="right"). All
+    # channels in same group share lk row support (for the (I±C) projector).
+    # Per group: one joint SVD over M_G = [M_{c_1} | M_{c_2} | …]. Then
+    # partition U_G's columns among c_m's in the group by argmax of
+    # ‖V†[j, col_range(c_m)]‖². Each U_G column is assigned to exactly ONE
+    # c_m → L's c_m blocks live in DISJOINT subspaces of U_G's column
+    # space → cross-c_m iso is automatic. Reconstruction L*R = phi is
+    # lossless because the partition covers all kept columns exactly once.
     channel_keys = sort!(collect(keys(by_channel)))
     block_svds = Vector{Tuple{K, Matrix{T}, Vector{real(T)}, Matrix{T}, Vector{LKey}, Vector{RKey}}}()
-    for k in channel_keys
-        entries = by_channel[k]
-        l_list = sort!(unique!([lk for (lk, _, _) in entries]))
-        r_list = sort!(unique!([rk for (_, rk, _) in entries]))
-        n_Li = length(l_list); n_Ri = length(r_list)
-        l_pos = Dict(lk => i for (i, lk) in enumerate(l_list))
-        r_pos = Dict(rk => j for (j, rk) in enumerate(r_list))
 
-        M_i = zeros(T, n_Li * d_left, n_Ri * d_right)
-        for (lk, rk, id) in entries
-            li = l_pos[lk]; rj = r_pos[rk]
-            blk = reshape(_block_view(A, id), d_left, d_right)
-            M_i[(li-1)*d_left+1 : li*d_left, (rj-1)*d_right+1 : rj*d_right] .= blk
+    group_of_k(k) = (ortho == "left") ? fA_of(k) : fB_of(k)
+    groups_dict = Dict{Int, Vector{K}}()
+    for k in channel_keys
+        push!(get!(groups_dict, group_of_k(k), K[]), k)
+    end
+    sorted_group_ids = sort!(collect(keys(groups_dict)))
+
+    for g in sorted_group_ids
+        ks_in_g = sort!(groups_dict[g])
+        l_list_g_set = Set{LKey}()
+        for k in ks_in_g
+            for (lk, _, _) in by_channel[k]
+                push!(l_list_g_set, lk)
+            end
         end
-        # Full SVD: U is m×m, Vt is n×n, S has min(m,n) singular values.
-        # Truncation (below) uses F.S (natural ranks only). The extra
-        # orthonormal columns of U / rows of Vt are used to pad the
-        # uniform multiplicity axis with zero-SV orthonormal extensions
-        # (preserves isometry of the iso side without contributing to L*R).
-        F = svd(M_i; full = true)
-        push!(block_svds, (k, F.U, F.S, F.Vt, l_list, r_list))
+        l_list_g = sort!(collect(l_list_g_set))
+        l_pos_g  = Dict(lk => i for (i, lk) in enumerate(l_list_g))
+        n_Lg     = length(l_list_g)
+
+        r_list_of_k     = Dict{K, Vector{RKey}}()
+        col_offset_of_k = Dict{K, Int}()
+        total_cols = 0
+        for k in ks_in_g
+            rl = sort!(unique!([rk for (_, rk, _) in by_channel[k]]))
+            r_list_of_k[k]     = rl
+            col_offset_of_k[k] = total_cols
+            total_cols += length(rl) * d_right
+        end
+
+        M_G = zeros(T, n_Lg * d_left, total_cols)
+        for k in ks_in_g
+            rl = r_list_of_k[k]
+            r_pos_k = Dict(rk => i for (i, rk) in enumerate(rl))
+            for (lk, rk, id) in by_channel[k]
+                li = l_pos_g[lk]; rj = r_pos_k[rk]
+                blk = reshape(_block_view(A, id), d_left, d_right)
+                r0 = (li - 1) * d_left
+                c0 = col_offset_of_k[k] + (rj - 1) * d_right
+                M_G[r0+1 : r0+d_left, c0+1 : c0+d_right] .= blk
+            end
+        end
+
+        F = svd(M_G)
+        U_G  = F.U
+        S_G  = F.S
+        Vt_G = F.Vt
+        r_total  = length(S_G)
+        n_U_cols = size(U_G, 2)
+
+        # Compute full per-column-per-channel norm matrix W[j, ki] = ‖V†[j, col_range(ks_in_g[ki])]‖²
+        n_chans_g = length(ks_in_g)
+        W = zeros(real(T), n_U_cols, n_chans_g)
+        for j in 1:n_U_cols
+            for (ki, k) in enumerate(ks_in_g)
+                nr_k = length(r_list_of_k[k])
+                c_lo = col_offset_of_k[k] + 1
+                c_hi = col_offset_of_k[k] + nr_k * d_right
+                sn = 0.0
+                @inbounds for c in c_lo:c_hi
+                    sn += abs2(Vt_G[j, c])
+                end
+                W[j, ki] = sn
+            end
+        end
+
+        # Partition: argmax over channels (current behavior).
+        # Alternative: round-robin (preserves all template channels even if
+        # V† is concentrated). Env-flag SB_PARTITION_RR=1.
+        rr_mode = (get(ENV, "SB_PARTITION_RR", "0") == "1")
+        col_to_ki = Vector{Int}(undef, n_U_cols)
+        for j in 1:n_U_cols
+            if rr_mode
+                col_to_ki[j] = ((j - 1) % n_chans_g) + 1
+            else
+                best_norm = -1.0
+                best_idx  = 1
+                for ki in 1:n_chans_g
+                    if W[j, ki] > best_norm
+                        best_norm = W[j, ki]
+                        best_idx  = ki
+                    end
+                end
+                col_to_ki[j] = best_idx
+            end
+        end
+
+        if get(ENV, "SB_GROUP_DIAG", "0") == "1"
+            top5 = string([round(Float64(S_G[k]); sigdigits=3) for k in 1:min(5, r_total)])
+            # How concentrated is V† mass per column? Report mean(max_ki W[j,ki] / sum_ki W[j,ki])
+            conc = 0.0; cnt = 0
+            for j in 1:min(r_total, n_U_cols)
+                tot = sum(W[j, :])
+                if tot > 0
+                    conc += maximum(view(W, j, :)) / tot
+                    cnt += 1
+                end
+            end
+            conc_avg = cnt > 0 ? conc / cnt : 0.0
+            # Per-channel: # cols assigned and total SV² assigned
+            per_chan = String[]
+            for (ki, k) in enumerate(ks_in_g)
+                ass = count(==(ki), col_to_ki)
+                sv2 = sum(j -> col_to_ki[j] == ki && j <= r_total ? Float64(S_G[j])^2 : 0.0, 1:n_U_cols)
+                push!(per_chan, "c=$k:cols=$ass,sv²=$(round(sv2; sigdigits=3))")
+            end
+            partition_str = join(per_chan, " | ")
+            println(stdout, "[GROUP_DIAG] ortho=$ortho g=$g ks=$ks_in_g m_g=$(n_Lg * d_left) cols=$total_cols r=$r_total topSV=$top5 V†_conc_max/sum=$(round(conc_avg; digits=2)) partition: $partition_str"); flush(stdout)
+        end
+
+        for (ki, k) in enumerate(ks_in_g)
+            rl    = r_list_of_k[k]
+            nr_k  = length(rl)
+            c_lo  = col_offset_of_k[k] + 1
+            c_hi  = col_offset_of_k[k] + nr_k * d_right
+            assigned = Int[j for j in 1:n_U_cols if col_to_ki[j] == ki]
+            if isempty(assigned)
+                push!(block_svds,
+                      (k,
+                       zeros(T, n_Lg * d_left, 0),
+                       real(T)[],
+                       zeros(T, 0, nr_k * d_right),
+                       l_list_g,
+                       rl))
+                continue
+            end
+            S_k  = real(T)[ (j <= r_total) ? real(S_G[j]) : zero(real(T)) for j in assigned ]
+            U_k  = U_G[:, assigned]
+            Vt_k = Vt_G[assigned, c_lo:c_hi]
+            push!(block_svds, (k, U_k, S_k, Vt_k, l_list_g, rl))
+        end
     end
 
     # ---- Global truncation across all channels ------------------------------
@@ -549,6 +667,14 @@ function blocksparse_svd_channel_aware_fixed(
     # iso_cap = min_i m_i / n_new_sp rule which gave effective bond ≈
     # n_chan × maxdim (too generous — sparse was using ~n_chan× the bond of
     # dense at the same maxdim). With this rule total bond ≤ maxdim.
+    # Active-channel cap: mult ≤ fld(maxdim, n_active) where n_active counts
+    # channels that received ANY data from phi (k_kept > 0). For the (I±C)
+    # projector, phi at overlap bonds populates only 2 of the 4 schema
+    # channels (the others are zero in the input itself, not dropped by SVD).
+    # With n_active=2 and maxdim=40: mult_cap=20, real bond = 2×20 = 40
+    # (matches dense expressive power). Schema bond = n_new_sp × mult_cap
+    # may exceed maxdim due to padded empty channels, but DOWNSTREAM SVDs
+    # see the same active-channel pattern so the padding doesn't compound.
     n_active_chan = count(>(0), k_kept)
     mult_cap = max(1, fld(maxdim, max(1, n_active_chan)))
     n_new_d_natural_only = n_new_d_natural
@@ -851,6 +977,14 @@ function blocksparse_svd_channel_aware(
     # iso_cap = min_i m_i / n_new_sp rule which gave effective bond ≈
     # n_chan × maxdim (too generous — sparse was using ~n_chan× the bond of
     # dense at the same maxdim). With this rule total bond ≤ maxdim.
+    # Active-channel cap: mult ≤ fld(maxdim, n_active) where n_active counts
+    # channels that received ANY data from phi (k_kept > 0). For the (I±C)
+    # projector, phi at overlap bonds populates only 2 of the 4 schema
+    # channels (the others are zero in the input itself, not dropped by SVD).
+    # With n_active=2 and maxdim=40: mult_cap=20, real bond = 2×20 = 40
+    # (matches dense expressive power). Schema bond = n_new_sp × mult_cap
+    # may exceed maxdim due to padded empty channels, but DOWNSTREAM SVDs
+    # see the same active-channel pattern so the padding doesn't compound.
     n_active_chan = count(>(0), k_kept)
     mult_cap = max(1, fld(maxdim, max(1, n_active_chan)))
     n_new_d_natural_only = n_new_d_natural

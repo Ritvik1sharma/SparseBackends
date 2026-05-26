@@ -79,23 +79,34 @@ end
 
 function inspect_storage(psi)
     payload_total = 0
+    keys_total    = 0
+    site_total    = 0
+    full_total    = 0
     rows = String[]
     for (i, T) in enumerate(psi)
         s = try ITensors.get_external_storage(T) catch _ nothing end
+        ss = Base.summarysize(T)
+        site_total += ss
         if s isa SparseBackends.WrappedBlockSparse
             bs = s.blocksparse
-            nblocks = length(bs.keys)
-            payload = nblocks * bs.blksize * sizeof(eltype(bs.data))
-            payload_total += payload
-            push!(rows, "site $i [BS] axis_dims=$(bs.dims)  blksize=$(bs.blksize)  nblocks=$nblocks  payload=$(round(payload/1024,digits=2))KiB")
+            nblocks  = length(bs.keys)
+            data_b   = Base.summarysize(bs.data)
+            keys_b   = Base.summarysize(bs.keys)
+            ids_b    = Base.summarysize(bs.ids)
+            full_sz  = prod(bs.dims)
+            payload_total += data_b
+            keys_total    += keys_b + ids_b
+            full_total    += full_sz * sizeof(eltype(bs.data))
+            push!(rows, "site $i [BS] nblocks=$nblocks blksize=$(bs.blksize)  data=$(round(data_b/1024,digits=2))KiB  keys=$(round(keys_b/1024,digits=2))KiB  ids=$(round(ids_b/1024,digits=2))KiB  total=$(round(ss/1024,digits=2))KiB  overhead/data=$(round((ss-data_b)/max(data_b,1)*100,digits=1))%")
         else
             a = ITensors.array(T)
-            payload = sizeof(a)
-            payload_total += payload
-            push!(rows, "site $i [dense] size=$(size(a))  payload=$(round(payload/1024,digits=2))KiB")
+            data_b = Base.summarysize(a)
+            payload_total += data_b
+            full_total    += data_b
+            push!(rows, "site $i [dense] data=$(round(data_b/1024,digits=2))KiB  total=$(round(ss/1024,digits=2))KiB  overhead/data=$(round((ss-data_b)/max(data_b,1)*100,digits=1))%")
         end
     end
-    return rows, payload_total
+    return rows, payload_total, keys_total, site_total, full_total
 end
 
 function report_state(label, psi, E=nothing; verbose=false)
@@ -109,9 +120,12 @@ function report_state(label, psi, E=nothing; verbose=false)
     println("    linkdims(reported)=$lds")
     println("    linkdims(honest, ∏shared)=$hlds" * (E === nothing ? "" : "  E=$E"))
     if verbose
-        rows, payload = inspect_storage(psi)
+        rows, payload, keys_b, site_total, full = inspect_storage(psi)
         for r in rows; println("    $r"); end
-        println("    payload(numeric only)=$(round(payload/1024,digits=2)) KiB   summarysize=$(round(bytes_total/1024,digits=2)) KiB  overhead_ratio=$(round(bytes_total/payload, digits=2))×")
+        non_data = site_total - payload
+        println("    --- MPS totals ---")
+        println("    data(numeric)=$(round(payload/1024,digits=2)) KiB   keys+ids=$(round(keys_b/1024,digits=2)) KiB   non-data=$(round(non_data/1024,digits=2)) KiB")
+        println("    sum-of-sites=$(round(site_total/1024,digits=2)) KiB   summarysize(psi)=$(round(bytes_total/1024,digits=2)) KiB   overhead/data=$(round(non_data/max(payload,1)*100, digits=1))%")
     end
 end
 

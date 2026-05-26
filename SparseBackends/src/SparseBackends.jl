@@ -42,8 +42,11 @@ include("aliased/conversions.jl")
 include("tensoralgebra/contract_aliased_coo_dense.jl")   # COOTensor × Dense → AliasedBS
 include("tensoralgebra/contract_aliased.jl")              # AliasedBS × Dense / AliasedBS × AliasedBS (single label)
 include("tensoralgebra/contract_aliased_shared.jl")       # AliasedBS × Dense / AliasedBS × AliasedBS (multi-label)
+include("tensoralgebra/contract_coo_aliased.jl")          # COOTensor × AliasedBS → AliasedBS (single label, r in B prefix)
+include("tensoralgebra/contract_aliased_dense_to_dense.jl") # AliasedBS × Dense → Dense (alias-amplified, for matvec)
 
 include("ops_factorize.jl")
+include("ops_factorize_qr.jl")
 include("tensor_wrappers.jl")
 include("tensor_index.jl")
 include("tensor_contraction.jl")
