@@ -109,7 +109,9 @@ function contract_shared!(
     labelsB       :: AbstractVector,
     mapA          :: Dict,
     mapB          :: Dict,
-    shared_labels :: Vector,
+    shared_labels :: Vector;
+    output_inds_hint::Union{Nothing,AbstractSet}=nothing,
+    allowed_keys_C=nothing,
 ) where {TC,NC,N2C,PC,TA,NA,N2A,PA,TB,NB}
 
     # ── 0) Preconditions ──────────────────────────────────────────────────────
@@ -210,9 +212,11 @@ function contract_shared!(
 
     can_blas = (TC == TA == TB) && (TC <: LinearAlgebra.BlasFloat)
 
-    # Combined template deduplication: (tidA, sp_lin) → combined_tid in C.
-    # For n_sp == 0 sp_lin is always 1, so the map is keyed effectively on tidA.
+    # Combined template deduplication: (tidA, sp_lin) → pending_tid (index
+    # into scratch `pending`, NOT into C.templates).
     combined_tid_map = Dict{Tuple{Int,Int}, Int}()
+    pending  = TC[]
+    n_pending = 0
 
     key_to_alias = Dict{NTuple{PC,Int}, Tuple{Int,TC}}()
     key_to_accum = Dict{NTuple{PC,Int}, Vector{TC}}()
@@ -245,25 +249,22 @@ function contract_shared!(
             tidA = A.alias_ids[ii]
             αA   = convert(TC, A.scalars[ii])
 
-            # Get or compute combined template for (tidA, sp_lin)
+            # Get or compute combined template for (tidA, sp_lin) — lazy.
             ct_key       = (tidA, sp_lin)
             combined_tid = get(combined_tid_map, ct_key, 0)
             if combined_tid == 0
-                C.n_templates += 1
-                combined_tid = C.n_templates
+                n_pending += 1
+                combined_tid = n_pending
                 combined_tid_map[ct_key] = combined_tid
 
-                tmpl_A   = _aliased_template_view(A, tidA)    # length M*K
-                Amat     = reshape(tmpl_A, M, K)               # (M, K): keepA then red
+                tmpl_A   = _aliased_template_view(A, tidA)
+                Amat     = reshape(tmpl_A, M, K)
                 new_tmpl = Vector{TC}(undef, C.blksize)
 
                 if mode == :AthenB
-                    # C (M, N) = Amat (M, K) @ Bmat (K, N)
                     Cmat = reshape(new_tmpl, M, N)
                     if can_blas
-                        mul!(Cmat,
-                             convert(Matrix{TC}, Amat),
-                             convert(Matrix{TC}, Bmat))
+                        mul!(Cmat, convert(Matrix{TC}, Amat), convert(Matrix{TC}, Bmat))
                     else
                         fill!(new_tmpl, zero(TC))
                         for k in 1:K
@@ -271,12 +272,11 @@ function contract_shared!(
                                                 @view(Amat[:, k]), @view(Bmat[k, :]))
                         end
                     end
-                else  # :BthenA  →  C (N, M) = Bmat^T (N, K) @ Amat^T (K, M)
+                else
                     Cmat = reshape(new_tmpl, N, M)
                     if can_blas
-                        mul!(Cmat,
-                             convert(Matrix{TC}, transpose(Bmat)),
-                             convert(Matrix{TC}, transpose(Amat)))
+                        mul!(Cmat, convert(Matrix{TC}, transpose(Bmat)),
+                                   convert(Matrix{TC}, transpose(Amat)))
                     else
                         fill!(new_tmpl, zero(TC))
                         for k in 1:K
@@ -286,18 +286,18 @@ function contract_shared!(
                     end
                 end
 
-                append!(C.templates, new_tmpl)
-            end   # combined template
+                append!(pending, new_tmpl)
+            end
 
             ckey = ntuple(j -> akey[c_src_axes[j]], Val(PC))
-            _aliased_contribute!(key_to_alias, key_to_accum, C.templates,
+            _aliased_contribute!(key_to_alias, key_to_accum, pending,
                                  ckey, combined_tid, αA, C.blksize)
         end   # ii loop
 
         iA = iA2
     end   # main while
 
-    _commit_aliased_dicts!(C, key_to_alias, key_to_accum)
+    _commit_aliased_dicts_lazy!(C, key_to_alias, key_to_accum, pending, n_pending)
     return C
 end
 
@@ -331,7 +331,9 @@ function contract_shared!(
     labelsB       :: AbstractVector,
     mapA          :: Dict,
     mapB          :: Dict,
-    shared_labels :: Vector,
+    shared_labels :: Vector;
+    output_inds_hint::Union{Nothing,AbstractSet}=nothing,
+    allowed_keys_C=nothing,
 ) where {TC,NC,N2C,PC,TA,NA,N2A,PA,TB,NB,N2B,PB}
 
     # ── 0) Preconditions ──────────────────────────────────────────────────────
@@ -426,10 +428,10 @@ function contract_shared!(
 
     can_blas = (TC == TA == TB) && (TC <: LinearAlgebra.BlasFloat)
 
-    # Combined template deduplication: (tidA, tidB) → combined_tid in C.
-    # This map is independent of the join group because templates carry only
-    # dense content — the scalar factors (αA, αB) account for the sparse structure.
+    # Combined template deduplication: (tidA, tidB) → pending_tid (scratch).
     combined_tid_map = Dict{Tuple{Int,Int}, Int}()
+    pending   = TC[]
+    n_pending = 0
 
     key_to_alias = Dict{NTuple{PC,Int}, Tuple{Int,TC}}()
     key_to_accum = Dict{NTuple{PC,Int}, Vector{TC}}()
@@ -464,12 +466,12 @@ function contract_shared!(
                 αB   = convert(TC, B.scalars[jj])
                 αC   = αA * αB
 
-                # Get or compute combined template for (tidA, tidB)
+                # Get or compute combined template for (tidA, tidB) — lazy.
                 ct_key       = (tidA, tidB)
                 combined_tid = get(combined_tid_map, ct_key, 0)
                 if combined_tid == 0
-                    C.n_templates += 1
-                    combined_tid = C.n_templates
+                    n_pending += 1
+                    combined_tid = n_pending
                     combined_tid_map[ct_key] = combined_tid
 
                     tmpl_B_mat = reshape(_aliased_template_view(B, tidB), K, N)   # (K, N)
@@ -506,11 +508,11 @@ function contract_shared!(
                         end
                     end
 
-                    append!(C.templates, new_tmpl)
+                    append!(pending, new_tmpl)
                 end   # combined template computed
 
                 ckey = ntuple(j -> (src[j] > 0 ? akey[src[j]] : bkey[-src[j]]), Val(PC))
-                _aliased_contribute!(key_to_alias, key_to_accum, C.templates,
+                _aliased_contribute!(key_to_alias, key_to_accum, pending,
                                      ckey, combined_tid, αC, C.blksize)
             end   # jj loop
         end   # ii loop
@@ -518,7 +520,7 @@ function contract_shared!(
         iA = iA2; iB = iB2
     end   # merge-join
 
-    _commit_aliased_dicts!(C, key_to_alias, key_to_accum)
+    _commit_aliased_dicts_lazy!(C, key_to_alias, key_to_accum, pending, n_pending)
     return C
 end
 
@@ -544,6 +546,39 @@ function contract!(
     rlab,
 ) where {TC,NC,N2C,PC,TA,NA,N2A,PA,TB,NB}
     return contract_aliased!(C, labelsC, A, labelsA, B, labelsB, mapA, mapB, rlab)
+end
+
+# Dense × AliasedBS → AliasedBS  (single shared label) — delegate by swapping args.
+function contract!(
+    C        :: AliasedBlockSparse{TC,NC,N2C,PC},
+    labelsC  :: AbstractVector,
+    A        :: AbstractArray{TA,NA},
+    labelsA  :: AbstractVector,
+    B        :: AliasedBlockSparse{TB,NB,N2B,PB},
+    labelsB  :: AbstractVector,
+    mapA     :: Dict,
+    mapB     :: Dict,
+    rlab,
+) where {TC,NC,N2C,PC,TA,NA,TB,NB,N2B,PB}
+    return contract_aliased!(C, labelsC, B, labelsB, A, labelsA, mapB, mapA, rlab)
+end
+
+# Dense × AliasedBS → AliasedBS  (multi shared label) — delegate by swapping args.
+function contract_shared!(
+    C             :: AliasedBlockSparse{TC,NC,N2C,PC},
+    labelsC       :: AbstractVector,
+    A             :: AbstractArray{TA,NA},
+    labelsA       :: AbstractVector,
+    B             :: AliasedBlockSparse{TB,NB,N2B,PB},
+    labelsB       :: AbstractVector,
+    mapA          :: Dict,
+    mapB          :: Dict,
+    shared_labels :: Vector;
+    output_inds_hint::Union{Nothing,AbstractSet}=nothing,
+    allowed_keys_C=nothing,
+) where {TC,NC,N2C,PC,TA,NA,TB,NB,N2B,PB}
+    return contract_shared!(C, labelsC, B, labelsB, A, labelsA, mapB, mapA, shared_labels;
+                            output_inds_hint=output_inds_hint, allowed_keys_C=allowed_keys_C)
 end
 
 # AliasedBS × AliasedBS → AliasedBS  (single shared label)

@@ -145,6 +145,63 @@ function _commit_aliased_dicts!(
     return C
 end
 
+# Lazy commit: kernels register combined templates into a SCRATCH `pending`
+# array (not C.templates).  At commit time we copy only the *referenced*
+# pending templates into C.templates, rewriting `alias_ids` to match.  This
+# guarantees `n_templates ≤ n_blocks` (every template is referenced by at
+# least one block), eliminating orphan templates from demotion.
+function _commit_aliased_dicts_lazy!(
+    C            :: AliasedBlockSparse{TC,NC,N2,PC},
+    key_to_alias :: Dict{NTuple{PC,Int}, Tuple{Int,TC}},
+    key_to_accum :: Dict{NTuple{PC,Int}, Vector{TC}},
+    pending      :: Vector{TC},
+    n_pending    :: Int,
+) where {TC,NC,N2,PC}
+    blksize = C.blksize
+    # 1) Mark which pending tids are referenced by surviving alias entries.
+    ref = falses(n_pending)
+    for (_, (ptid, _)) in key_to_alias
+        ref[ptid] = true
+    end
+    # 2) Copy referenced templates into C.templates and build remap.
+    remap = zeros(Int, n_pending)
+    final_tid = 0
+    @inbounds for p in 1:n_pending
+        ref[p] || continue
+        final_tid += 1
+        remap[p] = final_tid
+        off = (p - 1) * blksize
+        for j in 1:blksize
+            push!(C.templates, pending[off + j])
+        end
+    end
+    C.n_templates = final_tid
+
+    # 3) Push aliased blocks with remapped tids.
+    for (k, (ptid, α)) in key_to_alias
+        push!(C.keys, k)
+        push!(C.alias_ids, remap[ptid])
+        push!(C.scalars, α)
+    end
+    # 4) Push accumulator blocks as new concrete templates.
+    for (k, acc) in key_to_accum
+        C.n_templates += 1
+        append!(C.templates, acc)
+        push!(C.keys, k)
+        push!(C.alias_ids, C.n_templates)
+        push!(C.scalars, one(TC))
+    end
+    # 5) Sort by prefix col-major.
+    if !isempty(C.keys)
+        pdims = ntuple(i -> C.dims[i], Val(PC))
+        p = sortperm(C.keys; by = k -> _prefix_lin(k, pdims))
+        C.keys      = C.keys[p]
+        C.alias_ids = C.alias_ids[p]
+        C.scalars   = C.scalars[p]
+    end
+    return C
+end
+
 # ─────────────────────────────────────────────────────────────────────────────
 # AliasedBlockSparse × Dense  →  AliasedBlockSparse
 # ─────────────────────────────────────────────────────────────────────────────
@@ -196,8 +253,12 @@ function _contract_aliased_prefix_outer_ad!(
         src[j] = ax
     end
 
-    # Combined template deduplication: (tidA, rv) -> combined_tid in C
+    # Combined template deduplication: (tidA, rv) -> pending_tid (index into
+    # the scratch `pending` array, NOT into C.templates).  Lazy: templates
+    # are only copied to C.templates at commit time if a block references them.
     combined_tid_map = Dict{Tuple{Int,Int}, Int}()
+    pending  = TC[]
+    n_pending = 0
 
     key_to_alias = Dict{NTuple{PC,Int}, Tuple{Int,TC}}()
     key_to_accum = Dict{NTuple{PC,Int}, Vector{TC}}()
@@ -213,26 +274,26 @@ function _contract_aliased_prefix_outer_ad!(
         # Get or compute combined template  outer(template_A[tidA], B[:,rv])
         combined_tid = get(combined_tid_map, (tidA, rv), 0)
         if combined_tid == 0
-            C.n_templates += 1
-            combined_tid = C.n_templates
+            n_pending += 1
+            combined_tid = n_pending
             combined_tid_map[(tidA, rv)] = combined_tid
             new_tmpl = zeros(TC, C.blksize)
             tmpl_A   = _aliased_template_view(A, tidA)   # length A.blksize
             b_off    = (rv - 1) * chunkB
             Bslice   = @view Bvec[b_off+1 : b_off+chunkB]
             if dense_order == :AB
-                _outer_add!(new_tmpl, tmpl_A, Bslice)    # rows=A_dense, cols=B_dense
+                _outer_add!(new_tmpl, tmpl_A, Bslice)
             else
-                _outer_add!(new_tmpl, Bslice, tmpl_A)    # rows=B_dense, cols=A_dense
+                _outer_add!(new_tmpl, Bslice, tmpl_A)
             end
-            append!(C.templates, new_tmpl)
+            append!(pending, new_tmpl)
         end
 
-        _aliased_contribute!(key_to_alias, key_to_accum, C.templates,
+        _aliased_contribute!(key_to_alias, key_to_accum, pending,
                              ckey, combined_tid, α, C.blksize)
     end
 
-    _commit_aliased_dicts!(C, key_to_alias, key_to_accum)
+    _commit_aliased_dicts_lazy!(C, key_to_alias, key_to_accum, pending, n_pending)
     return C
 end
 

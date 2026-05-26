@@ -71,25 +71,75 @@ linkdims(psi) = [ITensors.dim(commonind(psi[i], psi[i+1])) for i in 1:length(psi
 # bs.blksize (scalars per block), length(bs.keys) (number of stored blocks).
 # For dense we read size(array). This is the ground truth — does NOT trust
 # `dim(commonind)`.
+# For a sparse site at position i, find which BS axes correspond to the
+# right-link indices, then count unique values present in stored block keys
+# at those axes. Returns (real_bond_dim_R, possible_bond_dim_R).
+function _real_bond_dim(s::SparseBackends.WrappedBlockSparse, link_inds)
+    bs = s.blocksparse
+    P  = length(bs.keys) > 0 ? length(bs.keys[1]) : 0
+    inds_tuple = s.inds
+    # Map each link index to its axis position in bs.dims.
+    axis_positions = Int[]
+    for li in link_inds
+        for (j, idx) in enumerate(inds_tuple)
+            if idx == li
+                push!(axis_positions, j); break
+            end
+        end
+    end
+    if isempty(axis_positions); return (0, 0); end
+    # Channel axes (j ≤ P) contribute "# unique values across stored blocks".
+    # Dense axes (j > P) contribute their full dim (multiplicity is dense).
+    real_dim = 1
+    poss_dim = 1
+    for j in axis_positions
+        poss_dim *= bs.dims[j]
+        if j <= P
+            vals = Set{Int}()
+            for k in bs.keys
+                push!(vals, k[j])
+            end
+            real_dim *= length(vals)
+        else
+            real_dim *= bs.dims[j]
+        end
+    end
+    return (real_dim, poss_dim)
+end
+
 function inspect_storage(psi)
-    payload_total = 0
+    payload_total = 0   # bytes of pure numeric data (bs.data or dense array)
+    keys_total    = 0   # bytes of bs.keys + bs.ids (block-index metadata)
+    site_total    = 0   # bytes from summarysize per site (incl. wrappers)
+    full_total    = 0   # what dense storage WOULD cost (if all schema slots filled)
     rows = String[]
     for (i, T) in enumerate(psi)
         s = try ITensors.get_external_storage(T) catch _ nothing end
+        ss = Base.summarysize(T)
+        site_total += ss
         if s isa SparseBackends.WrappedBlockSparse
             bs = s.blocksparse
-            nblocks = length(bs.keys)
-            payload = nblocks * bs.blksize * sizeof(eltype(bs.data))
-            payload_total += payload
-            push!(rows, "site $i [BS] axis_dims=$(bs.dims)  blksize=$(bs.blksize)  nblocks=$nblocks  payload=$(round(payload/1024,digits=2))KiB")
+            nblocks  = length(bs.keys)
+            stored_entries = nblocks * bs.blksize
+            full_sz  = prod(bs.dims)
+            data_b   = Base.summarysize(bs.data)
+            keys_b   = Base.summarysize(bs.keys)
+            ids_b    = Base.summarysize(bs.ids)
+            other_b  = ss - data_b - keys_b - ids_b
+            payload_total += data_b
+            keys_total    += keys_b + ids_b
+            full_total    += full_sz * sizeof(eltype(bs.data))
+            push!(rows, "site $i [BS] nblocks=$nblocks blksize=$(bs.blksize)  data=$(round(data_b/1024,digits=2))KiB  keys=$(round(keys_b/1024,digits=2))KiB  ids=$(round(ids_b/1024,digits=2))KiB  other(wrappers/dims)=$(round(other_b/1024,digits=2))KiB  total=$(round(ss/1024,digits=2))KiB  overhead/data=$(round((ss-data_b)/max(data_b,1)*100, digits=1))%")
         else
             a = ITensors.array(T)
-            payload = sizeof(a)
-            payload_total += payload
-            push!(rows, "site $i [dense] size=$(size(a))  payload=$(round(payload/1024,digits=2))KiB")
+            data_b = Base.summarysize(a)
+            other_b = ss - data_b
+            payload_total += data_b
+            full_total    += data_b
+            push!(rows, "site $i [dense] data=$(round(data_b/1024,digits=2))KiB  other(wrappers)=$(round(other_b/1024,digits=2))KiB  total=$(round(ss/1024,digits=2))KiB  overhead/data=$(round((ss-data_b)/max(data_b,1)*100, digits=1))%")
         end
     end
-    return rows, payload_total
+    return rows, payload_total, keys_total, site_total, full_total
 end
 
 # Honest per-bond dim: ALL indices shared between psi[i] and psi[i+1]
@@ -186,9 +236,13 @@ function report_state(label, psi, E=nothing; verbose=false)
     println("    linkdims(reported, single shared idx)=$lds")
     println("    linkdims(honest, ∏all shared)=$hlds" * (E === nothing ? "" : "  E=$E"))
     if verbose
-        rows, payload = inspect_storage(psi)
+        rows, payload, keys_b, site_total, full = inspect_storage(psi)
         for r in rows; println("    $r"); end
-        println("    payload(numeric only)=$(round(payload/1024,digits=2)) KiB   summarysize=$(round(bytes_total/1024,digits=2)) KiB  overhead_ratio=$(round(bytes_total/payload, digits=2))×")
+        occ = payload / max(full, 1)
+        non_data = site_total - payload
+        println("    --- MPS totals ---")
+        println("    data(numeric)=$(round(payload/1024,digits=2)) KiB   keys+ids(BS only)=$(round(keys_b/1024,digits=2)) KiB   non-data(keys+ids+wrappers+dims)=$(round(non_data/1024,digits=2)) KiB")
+        println("    sum-of-sites=$(round(site_total/1024,digits=2)) KiB   if_fully_dense=$(round(full/1024,digits=2)) KiB   summarysize(psi)=$(round(bytes_total/1024,digits=2)) KiB   overhead/data=$(round(non_data/max(payload,1)*100, digits=1))%")
     end
 end
 

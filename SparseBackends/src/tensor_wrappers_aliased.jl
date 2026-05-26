@@ -25,6 +25,10 @@ using LinearAlgebra: norm
 # ─────────────────────────────────────────────────────────────────────────────
 # 1.  Struct + basic traits
 # ─────────────────────────────────────────────────────────────────────────────
+const _ADD_DBG_COUNT1 = Ref(0)
+@inline _add_dbg_enabled1() = get(ENV, "SB_ALIASED_DEBUG", "0") == "1"
+@inline _add_dbg_max1()     = parse(Int, get(ENV, "SB_ALIASED_DEBUG_MAX", "12"))
+
 
 """
     WrappedAliasedBlockSparse{T,N,N2,P}
@@ -283,43 +287,182 @@ end
 
 function wrapped_contract_aliased(
     A :: WrappedTensorTypes{TA,NA},
-    B :: WrappedTensorTypes{TB,NB},
+    B :: WrappedTensorTypes{TB,NB};
+    preserve_bs_output::Bool=false,
 ) where {TA,TB,NA,NB}
-    Arep   = rep(A)
-    Brep   = rep(B)
-    indsA  = A.inds
-    indsB  = B.inds
-    denseA = dense_inds(A)
-    denseB = dense_inds(B)
-
-    indsC, denseC = output_inds(indsA, indsB, denseA, denseB)
-    dimsC  = ntuple(i -> ITensors.dim(indsC[i]), length(indsC))
-    TC     = promote_type(eltype(Arep), eltype(Brep))
-
-    denseLinksC = length(denseC)
-
-    sc       = scratch()
-    labelsA_vec = fill_labels!(sc.labelsA, indsA)
-    labelsB_vec = fill_labels!(sc.labelsB, indsB)
-    labelsC_vec = fill_labels!(sc.labelsC, indsC)
-
-    if denseLinksC == length(indsC)
-        # P_C = 0: all output indices are dense → plain ITensor
-        # For aliased, materialise via BlockSparse path.
-        C_bs = NewBlockSparseSorted{TC, length(indsC), length(indsC)}(dimsC)
-        C_bs = contract!(C_bs, labelsC_vec, Arep, labelsA_vec, Brep, labelsB_vec)
-        C_dense = to_dense(C_bs)
-        return length(indsC) == 0 ?
-            ITensors.ITensor(C_dense[]) :
-            ITensors.ITensor(C_dense, indsC...)
+    @timeit TIMER "get_data_info" begin
+        Arep   = rep(A)
+        Brep   = rep(B)
+        indsA  = A.inds
+        indsB  = B.inds
+        denseA = dense_inds(A)
+        denseB = dense_inds(B)
     end
 
-    C = WrappedAliasedBlockSparse(TC, dimsC, denseLinksC, indsC)
-    C.aliased = contract!(
-        C.aliased, labelsC_vec,
-        Arep, labelsA_vec,
-        Brep, labelsB_vec,
-    )
+    @timeit TIMER "output_inds" begin        
+        indsC, denseC = output_inds(indsA, indsB, denseA, denseB)
+        dimsC  = ntuple(i -> ITensors.dim(indsC[i]), length(indsC))
+        TC     = promote_type(eltype(Arep), eltype(Brep))
+    end
+
+    @timeit TIMER "classify_contraction" begin
+        denseLinksC = length(denseC)
+
+        sc       = scratch()
+        labelsA_vec = fill_labels!(sc.labelsA, indsA)
+        labelsB_vec = fill_labels!(sc.labelsB, indsB)
+        labelsC_vec = fill_labels!(sc.labelsC, indsC)
+    end
+
+    # Default (preserve_bs_output=false) — write dense output directly.
+    # For the Aliased×Dense → Dense path, allocate C in the kernel's CANONICAL
+    # layout (keepA, keepB, c_prefix). The kernel then writes directly into C
+    # with perm_C = identity and skips its `add.permute_back` pass.  The
+    # returned ITensor carries the canonical-order indices; downstream
+    # ITensors operations transparently handle the index reorder.
+    if !preserve_bs_output
+        ali_dense_path = (Arep isa AliasedBlockSparse && Brep isa AbstractArray &&
+                          !(Brep isa AliasedBlockSparse) && !(Brep isa NewBlockSparseSorted) &&
+                          !(Brep isa COOTensor)) ||
+                         (Brep isa AliasedBlockSparse && Arep isa AbstractArray &&
+                          !(Arep isa AliasedBlockSparse) && !(Arep isa NewBlockSparseSorted) &&
+                          !(Arep isa COOTensor))
+
+        if ali_dense_path
+            # Compute canonical (keepA, keepB, c_prefix) layout to allocate C in it.
+            @timeit TIMER "ali_dense_prep" begin
+                swap = !(Arep isa AliasedBlockSparse)
+                Arep_a    = swap ? Brep         : Arep
+                Brep_a    = swap ? Arep         : Brep
+                labelsA_a = swap ? labelsB_vec  : labelsA_vec
+                labelsB_a = swap ? labelsA_vec  : labelsB_vec
+                indsA_a   = swap ? indsB        : indsA
+                indsB_a   = swap ? indsA        : indsB
+                PA        = _abs_head_len(swap ? B : A)
+            end
+
+            mapA_local = Dict(l => i for (i, l) in enumerate(labelsA_a))
+            mapB_local = Dict(l => i for (i, l) in enumerate(labelsB_a))
+            mapC_local = Dict(l => i for (i, l) in enumerate(labelsC_vec))
+
+            keepA_labs    = [l for l in labelsA_a[PA+1:end] if  haskey(mapC_local, l)]
+            red_dense     = [l for l in labelsA_a[PA+1:end] if !haskey(mapC_local, l)]
+            keepB_labs    = [l for l in labelsB_a            if  haskey(mapC_local, l)]
+            c_prefix_labs = [l for l in labelsA_a[1:PA]      if  haskey(mapC_local, l)]
+            shared_prefix = [l for l in labelsA_a[1:PA]      if  haskey(mapB_local, l) && !haskey(mapC_local, l)]
+
+            @timeit TIMER "ali_dense_prep_labels" begin
+                label_to_ind = Dict(l => indsC[mapC_local[l]] for l in labelsC_vec)
+                # Downstream-friendly canonical-C ordering (gated by SB_FUSE_LINKS):
+                #   [keepB ..., keepA_site (no "Link" tag), keepA_link_dense, c_prefix_sparse]
+                # so the NEXT sparse-H × dense kernel sees its B input as
+                # [non-shared..., shared_dense, shared_sparse_prefix] with no permute_B.
+                if get(ENV, "SB_FUSE_LINKS", "0") == "1"
+                    # Step-(k+1)-friendly canonical-C: leverage the fixed H schema
+                    # so the next sparse-H × dense kernel sees its B input as
+                    # [red_dense, keepB, shared_prefix] with permB = identity.
+                    #
+                    # In keepB, the item with tag "Site" and plev==0 is n_{k+1}
+                    # (ket-site from v), which becomes shared_prefix at H[k+1].
+                    # The rest of keepB stays uncontracted past H[k+1].
+                    # c_prefix here is the kept site-bra (n_k') of H[k].
+                    is_b_site_to_next(l) = begin
+                        I = label_to_ind[l]
+                        ts = string(ITensors.tags(I))
+                        !contains(ts, "Link") && ITensors.plev(I) == 0
+                    end
+                    b_to_next = [l for l in keepB_labs if  is_b_site_to_next(l)]
+                    b_other   = [l for l in keepB_labs if !is_b_site_to_next(l)]
+                    canon_labels = vcat(keepA_labs, b_other, c_prefix_labs, b_to_next)
+                else
+                    canon_labels = vcat(keepA_labs, keepB_labs, c_prefix_labs)
+                end
+                canon_inds = ITensors.Index[label_to_ind[l] for l in canon_labels]
+                canon_dims = ntuple(i -> ITensors.dim(canon_inds[i]), length(canon_inds))
+            end
+            @timeit TIMER "ali_dense_alloc" begin
+                C_canon = zeros(TC, canon_dims...)
+            end
+
+            if _add_dbg_enabled1() && _ADD_DBG_COUNT1[] < _add_dbg_max1()
+                _ADD_DBG_COUNT1[] += 1
+                idx = _ADD_DBG_COUNT1[]
+                println("\n[wrapper #", idx, "] Aliased×Dense → Dense path")
+                println("  swap = ", swap)
+                println("  A.inds (aliased) = ", indsA_a)
+                println("  B.inds (env)     = ", indsB_a)
+                println("  canon_labels (C order) → canon_inds = ", canon_inds)
+                println("  keepA = ", keepA_labs)
+                println("  red_dense = ", red_dense)
+                println("  keepB = ", keepB_labs)
+                println("  c_prefix = ", c_prefix_labs)
+                println("  shared_prefix = ", shared_prefix)
+            end
+
+            @timeit TIMER "contract_aliased_dense_to_dense" begin
+                contract_aliased_dense_to_dense!(C_canon, canon_labels, Arep_a, labelsA_a, Brep_a, labelsB_a)
+            end
+
+            @timeit TIMER "wrap_output" begin
+                output = length(canon_inds) == 0 ? ITensors.ITensor(C_canon[]) :
+                                                   ITensors.ITensor(C_canon, canon_inds...)
+            end
+            return output
+        end
+
+        # Fallback: not the aliased×dense path → use BS-based machinery.
+        C_data = zeros(TC, dimsC...)
+        Arep_bs = Arep isa AliasedBlockSparse ? to_blocksparse(Arep) : Arep
+        Brep_bs = Brep isa AliasedBlockSparse ? to_blocksparse(Brep) : Brep
+        if Arep_bs isa NewBlockSparseSorted && Brep_bs isa NewBlockSparseSorted
+            contract_bs_bs_to_dense!(C_data, labelsC_vec, Arep_bs, labelsA_vec, Brep_bs, labelsB_vec)
+        elseif Arep_bs isa NewBlockSparseSorted && Brep_bs isa AbstractArray
+            contract_bs_dense_to_dense!(C_data, labelsC_vec, Arep_bs, labelsA_vec, Brep_bs, labelsB_vec)
+        elseif Arep_bs isa AbstractArray && Brep_bs isa NewBlockSparseSorted
+            contract_bs_dense_to_dense!(C_data, labelsC_vec, Brep_bs, labelsB_vec, Arep_bs, labelsA_vec)
+        else
+            C_bs = NewBlockSparseSorted{TC, length(indsC), length(indsC)}(dimsC)
+            contract!(C_bs, labelsC_vec, Arep_bs, labelsA_vec, Brep_bs, labelsB_vec)
+            C_data .= to_dense(C_bs)
+        end
+        @timeit TIMER "wrap_output" begin
+            output = length(indsC) == 0 ? ITensors.ITensor(C_data[]) :
+                                        ITensors.ITensor(C_data, indsC...)
+        end
+        return output
+    end
+
+    @timeit TIMER "contract_aliased_densify" begin
+        if denseLinksC == length(indsC)
+            # P_C = 0: output has no sparse axes → write directly into a
+            # dense array. Materialise aliased inputs to dense first; this
+            # keeps the path simple and avoids needing a kernel that emits
+            # a NewBlockSparseSorted from aliased+dense (which doesn't exist).
+            A_dense = Arep isa AliasedBlockSparse ? to_dense(Arep) : Arep
+            B_dense = Brep isa AliasedBlockSparse ? to_dense(Brep) : Brep
+            C_data = zeros(TC, dimsC...)
+            if A_dense isa AbstractArray && B_dense isa AbstractArray
+                # Direct dense × dense contraction.  Use the BS path with
+                # synthesised single-block BS as a unified driver: simpler is
+                # to delegate to ITensors.contract via a fresh wrap.
+                tmpA = ITensors.ITensor(A_dense, indsA...)
+                tmpB = ITensors.ITensor(B_dense, indsB...)
+                return ITensors.contract(tmpA, tmpB)
+            end
+            return length(indsC) == 0 ?
+                ITensors.ITensor(C_data[]) :
+                ITensors.ITensor(C_data, indsC...)
+        end
+    end
+
+    @timeit TIMER "contract_aliased" begin
+        C = WrappedAliasedBlockSparse(TC, dimsC, denseLinksC, indsC)
+        C.aliased = contract!(
+            C.aliased, labelsC_vec,
+            Arep, labelsA_vec,
+            Brep, labelsB_vec,
+        )
+    end
     return C
 end
 
@@ -331,16 +474,19 @@ end
 # We add specialised contract() overloads for all input combinations involving
 # WrappedAliasedBlockSparse so they always take the aliased path.
 
-function contract(A::WrappedAliasedBlockSparse, B::WrappedTensorTypes; kwargs...)
-    return wrapped_contract_aliased(A, B)
+function contract(A::WrappedAliasedBlockSparse, B::WrappedTensorTypes;
+                  preserve_bs_output::Bool=false, kwargs...)
+    return wrapped_contract_aliased(A, B; preserve_bs_output)
 end
 
-function contract(A::WrappedTensorTypes, B::WrappedAliasedBlockSparse; kwargs...)
-    return wrapped_contract_aliased(A, B)
+function contract(A::WrappedTensorTypes, B::WrappedAliasedBlockSparse;
+                  preserve_bs_output::Bool=false, kwargs...)
+    return wrapped_contract_aliased(A, B; preserve_bs_output)
 end
 
-function contract(A::WrappedAliasedBlockSparse, B::WrappedAliasedBlockSparse; kwargs...)
-    return wrapped_contract_aliased(A, B)
+function contract(A::WrappedAliasedBlockSparse, B::WrappedAliasedBlockSparse;
+                  preserve_bs_output::Bool=false, kwargs...)
+    return wrapped_contract_aliased(A, B; preserve_bs_output)
 end
 
 """
@@ -365,6 +511,7 @@ function contract_aliased_itensor(
     Bbackend :: Symbol;
     denseLinksA :: Union{Nothing,Int} = nothing,
     denseLinksB :: Union{Nothing,Int} = nothing,
+    preserve_bs_output :: Bool = true,
 )
     if Abackend === :dense && Bbackend === :dense
         return ITensors.contract(A, B)
@@ -382,7 +529,7 @@ function contract_aliased_itensor(
         wrap_itensor(B; backend=Bbackend, denseLinks=denseLinksB)
     end
 
-    Cw = wrapped_contract_aliased(Aw, Bw)
+    Cw = wrapped_contract_aliased(Aw, Bw; preserve_bs_output)
 
     Cw isa ITensors.ITensor && return Cw   # P_C = 0
     if Cw isa WrappedAliasedBlockSparse && _abs_head_len(Cw) == 0

@@ -65,8 +65,8 @@ function build_setup(N::Int, psign::Int, spin::Int)
     H_sparse = replaceprime(contract(P_sparse, H1, :coo, :blocksparse), 3 => 1)
     psi0     = random_mps(sites)
     psi_sp   = replaceprime(contract(P_sparse, copy(psi0), :coo, :dense), 1 => 0)
-    H_dense   = MPO([SparseBackends.to_dense_itensors_unfused(T) for T in H_sparse])
-    psi_dense = MPS([SparseBackends.to_dense_itensors_unfused(T) for T in psi_sp])
+    H_dense   = H_sparse  # KEEP SPARSE (BS-stored)
+    psi_dense = psi_sp  # KEEP SPARSE
     return H_dense, psi_dense
 end
 

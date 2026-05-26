@@ -1419,6 +1419,8 @@ function _to_dense(w::SparseBackends.WrappedTensorTypes)
       # println("  merging axes: ", merged_axes, " with groups: ", ind_groups)
       arr = to_dense(w.blocksparse; merged_axes=merged_axes)
       return arr
+  elseif w isa WrappedAliasedBlockSparse
+      return to_dense(w.aliased)
   else
       throw(ArgumentError("Unknown wrapper type: $(typeof(w))"))
   end
@@ -1902,7 +1904,10 @@ function itensor_blocksparse_svd_channel_aware(
         Int[bond_sp_dim]
     end
 
-    U_bs, SV_bs, svs_kept, spec = blocksparse_svd_channel_aware(bs_p;
+    svd_fn = (get(ENV, "SB_USE_GROUPED_SVD", "0") == "1") ?
+                blocksparse_svd_channel_aware_fixed :
+                blocksparse_svd_channel_aware
+    U_bs, SV_bs, svs_kept, spec = svd_fn(bs_p;
         n_left_sparse = nls,
         n_left_dense  = nld,
         left_template, right_template,
@@ -2060,4 +2065,140 @@ function itensor_blocksparse_svd(
   R_it = permute(R_it, R_spL..., R_spN..., R_d...; allow_alias = true)
 
   return L_it, R_it, spec
+end
+
+
+# Channel-aware QR wrapper. Mirrors `itensor_blocksparse_svd_channel_aware` but
+# calls `blocksparse_qr_channel_aware` to get lossless reconstruction in the
+# "clean" bond cases (max_cMs_per_cL == 1 for ortho="left"). For (2,4,2)-
+# pattern bonds (max_cMs_per_cL > 1) the QR kernel errors out and this
+# wrapper falls back to the existing channel-aware SVD path.
+#
+# Diagnostic (SB_QR_DIAG=1): prints sparse-key structure of phi and the
+# templates derived from M_b, M_b1.
+function itensor_blocksparse_qr_channel_aware(
+    phi::ITensors.ITensor,
+    M_b::ITensors.ITensor,
+    M_b1::ITensors.ITensor;
+    ortho::String   = "left",
+    maxdim::Int     = typemax(Int),
+    mindim::Int     = 1,
+    cutoff::Float64 = 0.0,
+    relax_iso_cap::Bool = false,
+)
+    @assert ITensors.has_external_storage(phi) "phi must be block-sparse"
+    @assert ITensors.has_external_storage(M_b) "M_b must be block-sparse"
+    @assert ITensors.has_external_storage(M_b1) "M_b1 must be block-sparse"
+    w_phi = ITensors.get_external_storage(phi)::WrappedBlockSparse
+    w_b   = ITensors.get_external_storage(M_b)::WrappedBlockSparse
+    w_b1  = ITensors.get_external_storage(M_b1)::WrappedBlockSparse
+
+    shared      = collect(ITensors.commoninds(M_b, M_b1))
+    dense_b     = dense_inds(w_b)
+    bond_sparse = first(I for I in shared if !(I in dense_b))
+    bond_mult   = first(I for I in shared if  (I in dense_b))
+    bond_sp_dim = ITensors.dim(bond_sparse)
+
+    indsMb = [I for I in ITensors.inds(M_b) if !(I in shared)]
+
+    phi_inds_all = collect(w_phi.inds)
+    dense_set    = Set(dense_inds(w_phi))
+    in_U   = Set(filter(i -> i ∈ phi_inds_all, indsMb))
+    U_legs = filter(i ->  i ∈ in_U, phi_inds_all)
+    V_legs = filter(i -> !(i ∈ in_U), phi_inds_all)
+    U_spL, U_spN, U_d = reorder_invariant(U_legs, dense_set)
+    V_spL, V_spN, V_d = reorder_invariant(V_legs, dense_set)
+    nls = length(U_spL) + length(U_spN)
+    nrs = length(V_spL) + length(V_spN)
+    nld = length(U_d)
+    nrd = length(V_d)
+
+    desired = (U_spL..., U_spN..., V_spL..., V_spN..., U_d..., V_d...)
+    phi_p   = permute(phi, desired...; allow_alias = true)
+    bs_p    = ITensors.get_external_storage(phi_p).blocksparse
+
+    L_phi_sparse = (U_spL..., U_spN...)
+    R_phi_sparse = (V_spL..., V_spN...)
+
+    # Templates from M_b, M_b1.
+    M_b_inds        = collect(w_b.inds)
+    M_b1_inds       = collect(w_b1.inds)
+    dense_b1        = dense_inds(w_b1)
+    M_b_sparse_pos  = [i for i in 1:length(M_b_inds)  if !(M_b_inds[i]  in dense_b)]
+    M_b1_sparse_pos = [i for i in 1:length(M_b1_inds) if !(M_b1_inds[i] in dense_b1)]
+
+    bond_pos_in_b  = findfirst(p -> M_b_inds[p]  == bond_sparse, M_b_sparse_pos)
+    bond_pos_in_b1 = findfirst(p -> M_b1_inds[p] == bond_sparse, M_b1_sparse_pos)
+
+    non_bond_b_pos  = [p for (i, p) in enumerate(M_b_sparse_pos)  if i != bond_pos_in_b]
+    non_bond_b1_pos = [p for (i, p) in enumerate(M_b1_sparse_pos) if i != bond_pos_in_b1]
+    perm_b  = [findfirst(I -> I == M_b_inds[p],  L_phi_sparse) for p in non_bond_b_pos]
+    perm_b1 = [findfirst(I -> I == M_b1_inds[p], R_phi_sparse) for p in non_bond_b1_pos]
+    @assert all(!isnothing, perm_b)
+    @assert all(!isnothing, perm_b1)
+
+    Kt = eltype(eltype(w_b.blocksparse.keys))
+    LTupT = NTuple{nls, Kt}
+    RTupT = NTuple{nrs, Kt}
+
+    left_template = Tuple{LTupT, Kt}[]
+    for key in w_b.blocksparse.keys
+        vals     = [key[p] for p in M_b_sparse_pos]
+        ch       = Kt(vals[bond_pos_in_b])
+        non_bond = [vals[i] for i in 1:length(vals) if i != bond_pos_in_b]
+        lk       = Vector{Kt}(undef, nls)
+        for (s, d) in enumerate(perm_b); lk[d] = Kt(non_bond[s]); end
+        push!(left_template, (NTuple{nls,Kt}(lk), ch))
+    end
+    right_template = Tuple{Kt, RTupT}[]
+    for key in w_b1.blocksparse.keys
+        vals     = [key[p] for p in M_b1_sparse_pos]
+        ch       = Kt(vals[bond_pos_in_b1])
+        non_bond = [vals[i] for i in 1:length(vals) if i != bond_pos_in_b1]
+        rk       = Vector{Kt}(undef, nrs)
+        for (s, d) in enumerate(perm_b1); rk[d] = Kt(non_bond[s]); end
+        push!(right_template, (ch, NTuple{nrs,Kt}(rk)))
+    end
+
+    if get(ENV, "SB_QR_DIAG", "0") == "1"
+        phi_keys = collect(bs_p.keys)
+        println(stdout, "[QR_WRAP] phi sparse-keys (n=$(length(phi_keys))): ", phi_keys)
+        println(stdout, "[QR_WRAP] left_template (M_b, n=$(length(left_template))): ", left_template)
+        println(stdout, "[QR_WRAP] right_template (M_b1, n=$(length(right_template))): ", right_template)
+        println(stdout, "[QR_WRAP] bond_sp_dim=$bond_sp_dim ortho=$ortho")
+    end
+
+    # QR + Gram-Schmidt for all cases. No SVD fallback — kernel handles
+    # both clean (max_cMs_per_cL==1) and (2,4,2) cases internally.
+    U_bs, SV_bs, svs_kept, spec = blocksparse_qr_channel_aware(bs_p;
+        n_left_sparse = nls,
+        n_left_dense  = nld,
+        left_template, right_template,
+        bond_sparse_dim = bond_sp_dim,
+        ortho, maxdim, mindim, cutoff, relax_iso_cap,
+        verbose = (get(ENV, "SB_QR_DIAG", "0") == "1"))
+
+    new_sp  = bond_sparse
+    n_new_d = U_bs.dims[nls + 1 + nld + 1]
+    new_d   = ITensors.Index(n_new_d; tags = ITensors.tags(bond_mult))
+
+    U_inds_storage  = (U_spL..., U_spN..., new_sp, U_d..., new_d)
+    SV_inds_storage = (new_sp, V_spL..., V_spN..., new_d, V_d...)
+
+    @assert ntuple(i -> ITensors.dim(U_inds_storage[i]),  length(U_inds_storage)) ==
+            U_bs.dims  "U inds/storage dim mismatch"
+    @assert ntuple(i -> ITensors.dim(SV_inds_storage[i]), length(SV_inds_storage)) ==
+            SV_bs.dims "SV inds/storage dim mismatch"
+
+    L_it = ITensors._itensor_from_external_storage(WrappedBlockSparse(U_bs,  U_inds_storage))
+    R_it = ITensors._itensor_from_external_storage(WrappedBlockSparse(SV_bs, SV_inds_storage))
+
+    U_dense_set  = Set([U_d..., new_d])
+    SV_dense_set = Set([V_d..., new_d])
+    L_spL, L_spN, L_d = reorder_invariant(collect(U_inds_storage),  U_dense_set)
+    R_spL, R_spN, R_d = reorder_invariant(collect(SV_inds_storage), SV_dense_set)
+    L_it = permute(L_it, L_spL..., L_spN..., L_d...; allow_alias = true)
+    R_it = permute(R_it, R_spL..., R_spN..., R_d...; allow_alias = true)
+
+    return L_it, R_it, spec
 end
