@@ -26,7 +26,6 @@ function blocksparse_qr_channel_aware(
     maxdim::Int       = typemax(Int),
     mindim::Int       = 1,
     cutoff::Float64   = 0.0,
-    relax_iso_cap::Bool = false,
     verbose::Bool     = false,
 ) where {T, N, N2, P, K<:Integer}
     nls, nrs = n_left_sparse, P  - n_left_sparse
@@ -128,6 +127,18 @@ function blocksparse_qr_channel_aware(
     # at most per_cM_cap cols, leaving room for later c_M's.
     per_cM_cap = max(1, fld(maxdim, max(1, bond_sparse_dim)))
 
+    # Adaptive per-c_M rank: when SB_ADAPTIVE_RANK=1, the per-c_M SVD drops
+    # singular values below `adaptive_rel * sv_max` (default 1e-8). This lets
+    # `n_new_d` shrink below `per_cM_cap` at low-rank bonds, recovering the
+    # dense-like adaptive truncation we'd otherwise miss because the schema
+    # pins every bond to `bond_sparse_dim × per_cM_cap`.
+    adaptive_rank = get(ENV, "SB_ADAPTIVE_RANK", "0") == "1"
+    adaptive_rel  = let s = get(ENV, "SB_ADAPTIVE_REL", "")
+        isempty(s) ? 1e-8 : parse(Float64, s)
+    end
+    # Threshold used inside per-c_M SVD: relative to that block's sv_max.
+    percM_sv_rel = adaptive_rank ? adaptive_rel : 1e-12
+
     # Pre-build phi block lookup
     phi_lookup = Dict{Tuple{LKey, RKey}, Int}()
     for (key, id) in blocks_sorted(A)
@@ -141,6 +152,7 @@ function blocksparse_qr_channel_aware(
     R_blocks = Dict{Tuple{K, RKey}, Matrix{T}}()
     cM_chi   = Dict{K, Int}()
     cM_S     = Dict{K, Vector{real(T)}}()
+    cM_S_full_max_dropped = Dict{K, real(T)}()  # largest SV dropped by per-cM cap at line 263
 
     # Process each row/col group with sequential Gram-Schmidt.
     for (support_set, cM_list_in_group) in row_groups
@@ -246,12 +258,17 @@ function blocksparse_qr_channel_aware(
                 else
                     Fr = svd(phi_resid)
                     sv_max = isempty(Fr.S) ? 1.0 : Fr.S[1]
-                    sv_tol = max(1e-12, 1e-12 * sv_max)
+                    sv_tol = max(1e-14, percM_sv_rel * sv_max)
                     chi_rank = count(>(sv_tol), Fr.S)
                     chi_cap = min(chi_rank, per_cM_cap)
                     Q_M_new = Fr.U[:, 1:chi_cap]
                     S_r     = Fr.S[1:chi_cap]
                     R_M_new = Diagonal(S_r) * Fr.Vt[1:chi_cap, :]
+                    # Capture the largest SV that the cap dropped (if any) so
+                    # the SB_SV_REPORT diagnostic can compare it to retained SVs.
+                    if chi_cap + 1 <= length(Fr.S)
+                        cM_S_full_max_dropped[cM] = Fr.S[chi_cap + 1]
+                    end
                 end
                 chi_M = size(Q_M_new, 2)
                 cM_chi[cM] = chi_M
@@ -369,7 +386,7 @@ function blocksparse_qr_channel_aware(
                 else
                     Fr = svd(phi_resid)
                     sv_max = isempty(Fr.S) ? 1.0 : Fr.S[1]
-                    sv_tol = max(1e-12, 1e-12 * sv_max)
+                    sv_tol = max(1e-14, percM_sv_rel * sv_max)
                     chi_rank = count(>(sv_tol), Fr.S)
                     chi_cap = min(chi_rank, per_cM_cap)
                     Qt_M_new = Fr.Vt[1:chi_cap, :]
@@ -437,20 +454,24 @@ function blocksparse_qr_channel_aware(
         k_kept[cM] += 1
     end
 
-    # The cross-term R blocks (stored at new keys like (prev_cM, rk_in_cur_M))
-    # need ALL chi_prev cols of Q_prev_M_new to reconstruct phi correctly. If
-    # global SV truncation drops below chi_prev for any prev_cM that has
-    # downstream cross-terms, those cross-terms become unrepresentable. So
-    # n_new_d must be at least the MAX pre-truncation chi across c_M's.
-    chi_pre_max = isempty(cM_chi) ? 0 : maximum(values(cM_chi); init = 0)
+    # Cross-term R blocks (at new keys (prev_cM, rk_in_cur_M)) live in the
+    # first chi_prev rows of the (prev_cM, *) SV slot alongside prev_cM's own
+    # diagonal R (assignment→addition fix sums both into the same slot).
+    # Under SB_ADAPTIVE_RANK=0 we floor each k_kept at its pre-trunc chi so
+    # cross-term cols survive global truncation; SB_ADAPTIVE_RANK=1 lets bond
+    # dims shrink when global SV truncation would drop those cols.
+    chi_pre_max     = isempty(cM_chi) ? 0 : maximum(values(cM_chi); init = 0)
     n_new_d_natural = max(chi_pre_max, isempty(k_kept) ? 0 : maximum(values(k_kept); init = 0))
-    # Ensure each c_M's k_kept >= its pre-trunc chi (don't drop cross-term cols).
-    for cM in keys(cM_chi)
-        k_kept[cM] = max(k_kept[cM], cM_chi[cM])
+    if !adaptive_rank
+        for cM in keys(cM_chi)
+            k_kept[cM] = max(k_kept[cM], cM_chi[cM])
+        end
     end
-    n_active_chan   = count(>(0), values(k_kept))
-    mult_cap        = max(1, fld(maxdim, max(1, bond_sparse_dim)))
-    n_new_d         = relax_iso_cap ? n_new_d_natural : max(chi_pre_max, min(n_new_d_natural, mult_cap))
+    n_active_chan = count(>(0), values(k_kept))
+    mult_cap      = max(1, fld(maxdim, max(1, bond_sparse_dim)))
+    # Per-cM cap at line 263 already enforced chi_M ≤ mult_cap, so
+    # n_new_d_natural ≤ mult_cap. The min() below is a no-op safety net.
+    n_new_d       = min(n_new_d_natural, mult_cap)
 
     if n_new_d < n_new_d_natural
         for (cM, kk) in k_kept
@@ -473,6 +494,18 @@ function blocksparse_qr_channel_aware(
         end
         rg_info_str = join(rg_info, "|")
         println(stdout, "[QR_TRUNC] maxdim=$maxdim keep_count=$keep_count n_active=$n_active_chan mult_cap=$mult_cap n_new_d_natural=$n_new_d_natural n_new_d=$n_new_d  k_kept=$(sort(collect(k_kept)))  pre_trunc_chi_by_row_group=$rg_info_str  bond=$(bond_sparse_dim)x$(n_new_d)=$(bond_sparse_dim*n_new_d)")
+    end
+    if get(ENV, "SB_SV_REPORT", "0") == "1"
+        println(stdout, "[SV_REPORT_QR] ortho=$ortho  maxdim=$maxdim  n_new_d=$n_new_d  mult_cap=$mult_cap  bond_sparse_dim=$bond_sparse_dim")
+        for cM in sort(collect(keys(cM_S)))
+            S = cM_S[cM]
+            k = k_kept[cM]
+            kept_str         = (k > 0 && k <= length(S)) ? string(S[k])   : "-"
+            global_drop_str  = (k+1 <= length(S))         ? string(S[k+1]) : "-"
+            cap_drop_str     = haskey(cM_S_full_max_dropped, cM) ? string(cM_S_full_max_dropped[cM]) : "-"
+            println(stdout, "  cM=$cM: kept $k/$(length(S))  smallest_kept=$kept_str  largest_dropped_global=$global_drop_str  largest_dropped_by_percM_cap=$cap_drop_str")
+        end
+        flush(stdout)
     end
 
     # ---- Build output BS tensors ---------------------------------------------

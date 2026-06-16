@@ -1,5 +1,9 @@
 # tensoralgebra/contract_aliased_shared.jl
 #
+# Multi-label contraction helpers and AliasedBlockSparse × AliasedBlockSparse kernel.
+# The AliasedBlockSparse × Dense kernel lives in contract_aliased_dense_shared.jl.
+
+#
 # Multi-label contraction kernels for AliasedBlockSparse tensors.
 # These are the AliasedBlockSparse analogues of contract_shared! in
 # contract_bs_dense.jl (AD case) and contract_bs_bs.jl (AA case).
@@ -81,223 +85,48 @@ end
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# contract_shared! : AliasedBlockSparse × Dense  →  AliasedBlockSparse
+# Fission fallback helper (used by both Dense and AliasedBS overloads)
 # ─────────────────────────────────────────────────────────────────────────────
 
-"""
-    contract_shared!(C, labelsC, A, labelsA, B, labelsB, mapA, mapB, shared_labels)
-
-Multi-label contraction `C = A ⊗_{shared_labels} B` where `A` is
-`AliasedBlockSparse`, `B` is a dense array, and `C` is `AliasedBlockSparse`.
-
-All labels in `shared_labels` must be reduced (absent from `labelsC`).
-They are partitioned by where they appear in `A`:
-- `shared_prefix` — in A's sparse prefix → these index into B slices
-- `shared_dense`  — in A's dense tail    → GEMM reduction axes
-
-Combined template key: `(tidA, sp_lin)` where `sp_lin` is the 1-based
-column-major linear index into B's shared-prefix dimensions.  When there are
-no shared-prefix labels `sp_lin == 1` always, giving at most `n_A_templates`
-combined templates (perfect aliasing preservation).
-"""
-function contract_shared!(
+# Fission fallback: when output_inds_hint pushes B labels into C's prefix
+# (which the aliased kernel doesn't yet support natively), delegate the
+# contract to the BS path (which DOES implement hint+fission), then
+# trivially re-aliasify the BS result (one template per block).
+#
+# Loses alias compression for this single contract step but preserves C's
+# requested axis classification, so subsequent contracts in the matvec
+# chain don't see cross-region label mismatches.
+function _aliased_shared_via_bs_fission!(
     C             :: AliasedBlockSparse{TC,NC,N2C,PC},
     labelsC       :: AbstractVector,
     A             :: AliasedBlockSparse{TA,NA,N2A,PA},
     labelsA       :: AbstractVector,
-    B             :: AbstractArray{TB,NB},
+    B,
     labelsB       :: AbstractVector,
     mapA          :: Dict,
     mapB          :: Dict,
     shared_labels :: Vector;
-    output_inds_hint::Union{Nothing,AbstractSet}=nothing,
+    output_inds_hint=nothing,
     allowed_keys_C=nothing,
-) where {TC,NC,N2C,PC,TA,NA,N2A,PA,TB,NB}
-
-    # ── 0) Preconditions ──────────────────────────────────────────────────────
-    @inbounds for lab in shared_labels
-        @assert !(lab in labelsC) "shared label $lab must be reduced (not in labelsC)"
-    end
-
-    # Clear output
-    empty!(C.templates); C.n_templates = 0
-    empty!(C.keys); empty!(C.alias_ids); empty!(C.scalars)
-
-    # ── 1) Classify shared labels ─────────────────────────────────────────────
-    shared_prefix = eltype(shared_labels)[]
-    shared_dense  = eltype(shared_labels)[]
-    @inbounds for lab in shared_labels
-        @assert haskey(mapA, lab) "shared label $lab must exist in A"
-        @assert haskey(mapB, lab) "shared label $lab must exist in B"
-        if mapA[lab] <= PA
-            push!(shared_prefix, lab)
-        else
-            push!(shared_dense, lab)
-        end
-    end
-
-    # ── 2) Keep / reduction sets ──────────────────────────────────────────────
-    Adense0 = labelsA[PA+1:NA]
-    Bdense0 = labelsB
-    redset  = Set(shared_dense)
-
-    red_dense = [lab for lab in Adense0 if lab in redset]
-    keepA0    = [lab for lab in Adense0 if !(lab in redset)]
-    keepB0    = [lab for lab in Bdense0 if !(lab in Set(shared_labels))]
-
-    Cdense = labelsC[PC+1:NC]
-    mode, desired_keepA, desired_keepB = _cdense_grouping_and_orders(Cdense, keepA0, keepB0)
-    mode == :interleaved &&
-        error("Cdense interleaves A/B kept dims; unsupported — reorder C labels so A-kept and B-kept form contiguous groups")
-
-    @assert length(desired_keepA) == length(keepA0) && Set(desired_keepA) == Set(keepA0)
-    @assert length(desired_keepB) == length(keepB0) && Set(desired_keepB) == Set(keepB0)
-
-    # ── 3) Permute A: prefix=[keep_pref..., shared_pref...], dense=[keepA..., red...] ──
-    permA = _find_perm_for_A_join_and_dense_order(A, labelsA, mapA, shared_prefix, desired_keepA, red_dense)
-    if permA != collect(1:NA)
-        A       = permutedims(A, permA)
-        labelsA = labelsA[permA]
-        mapA    = Dict(l => i for (i, l) in enumerate(labelsA))
-    end
-
-    # ── 4) Permute B to layout (shared_prefix..., red_dense..., keepB...) ─────
-    sp_axes_B = Int[mapB[lab] for lab in shared_prefix]
-    rd_axes_B = Int[mapB[lab] for lab in red_dense]
-    kb_axes_B = Int[mapB[lab] for lab in desired_keepB]
-    permB     = vcat(sp_axes_B, rd_axes_B, kb_axes_B)
-    @assert length(permB) == NB "B perm length mismatch; labelsB must match B ndims"
-    Bp = (permB == collect(1:NB)) ? B : permutedims(B, permB)
-
-    n_sp    = length(shared_prefix)
-    n_red   = length(red_dense)
-    n_keepA = length(desired_keepA)
-    n_keepB = length(desired_keepB)
-
-    # ── 5) Dense contraction shapes ───────────────────────────────────────────
-    dimsA_dense = ntuple(i -> A.dims[PA+i], Val(N2A))    # [keepA..., red...]  after permA
-    dimsB_p     = size(Bp)                               # (sp..., red..., keepB...)
-
-    M = (n_keepA == 0) ? 1 : prod(dimsA_dense[1:n_keepA])
-    K = (n_red   == 0) ? 1 : prod(dimsA_dense[n_keepA+1:end])
-    N = (n_keepB == 0) ? 1 : prod(dimsB_p[(n_sp + n_red + 1):end])
-
-    if n_red > 0
-        @assert K == prod(dimsB_p[(n_sp + 1):(n_sp + n_red)]) "Reduction extent mismatch between A dense tail and B"
-    end
-    @assert C.blksize == M * N "C.blksize must equal M*N (M=$M, N=$N, got C.blksize=$(C.blksize))"
-
-    # ── 6) C prefix sourcing (from A sparse prefix, excluding shared_prefix) ──
-    c_src_axes   = Vector{Int}(undef, PC)
-    shared_p_set = Set(shared_prefix)
-    @inbounds for j in 1:PC
-        lab = labelsC[j]
-        @assert haskey(mapA, lab) "C prefix label $lab must exist in A"
-        apos = mapA[lab]
-        @assert apos <= PA "C prefix label $lab must come from A sparse prefix"
-        @assert !(lab in shared_p_set) "C prefix label $lab cannot be a reduced shared-prefix label"
-        c_src_axes[j] = apos
-    end
-    join_posA = Int[mapA[lab] for lab in shared_prefix]   # positions of shared_prefix in A.key
-
-    # Precompute strides into B's shared-prefix dimensions for sp_lin computation.
-    # sp_lin is the 1-based col-major linear index in (dimsB_p[1], ..., dimsB_p[n_sp]).
-    sp_strides = Vector{Int}(undef, max(n_sp, 1))
-    if n_sp > 0
-        sp_strides[1] = 1
-        for t in 2:n_sp
-            sp_strides[t] = sp_strides[t-1] * dimsB_p[t-1]
-        end
-    end
-
-    can_blas = (TC == TA == TB) && (TC <: LinearAlgebra.BlasFloat)
-
-    # Combined template deduplication: (tidA, sp_lin) → pending_tid (index
-    # into scratch `pending`, NOT into C.templates).
-    combined_tid_map = Dict{Tuple{Int,Int}, Int}()
-    pending  = TC[]
-    n_pending = 0
-
-    key_to_alias = Dict{NTuple{PC,Int}, Tuple{Int,TC}}()
-    key_to_accum = Dict{NTuple{PC,Int}, Vector{TC}}()
-
-    # ── 7) Main loop: runs of A sharing the same shared-prefix values ─────────
-    iA = firstindex(A.keys); nA = lastindex(A.keys)
-
-    @inbounds while iA <= nA
-        iA2   = _advance_run(A.keys, iA, nA, join_posA)   # end-of-run (exclusive)
-        akey0 = A.keys[iA]
-
-        # Column-major linear index of this run's shared-prefix values in B
-        sp_lin = 1
-        for t in 1:n_sp
-            sp_lin += (akey0[join_posA[t]] - 1) * sp_strides[t]
-        end
-
-        # Slice Bp along its leading n_sp dimensions
-        if n_sp == 0
-            Bsub = Bp
-        else
-            sp_vals = ntuple(t -> akey0[join_posA[t]], n_sp)
-            idx     = (sp_vals..., ntuple(_ -> Colon(), NB - n_sp)...)
-            @views Bsub = Bp[idx...]
-        end
-        Bmat = reshape(Bsub, K, N)    # (K, N): red then keepB
-
-        for ii in iA:(iA2-1)
-            akey = A.keys[ii]
-            tidA = A.alias_ids[ii]
-            αA   = convert(TC, A.scalars[ii])
-
-            # Get or compute combined template for (tidA, sp_lin) — lazy.
-            ct_key       = (tidA, sp_lin)
-            combined_tid = get(combined_tid_map, ct_key, 0)
-            if combined_tid == 0
-                n_pending += 1
-                combined_tid = n_pending
-                combined_tid_map[ct_key] = combined_tid
-
-                tmpl_A   = _aliased_template_view(A, tidA)
-                Amat     = reshape(tmpl_A, M, K)
-                new_tmpl = Vector{TC}(undef, C.blksize)
-
-                if mode == :AthenB
-                    Cmat = reshape(new_tmpl, M, N)
-                    if can_blas
-                        mul!(Cmat, convert(Matrix{TC}, Amat), convert(Matrix{TC}, Bmat))
-                    else
-                        fill!(new_tmpl, zero(TC))
-                        for k in 1:K
-                            _rank1_add_generic!(new_tmpl, one(TC),
-                                                @view(Amat[:, k]), @view(Bmat[k, :]))
-                        end
-                    end
-                else
-                    Cmat = reshape(new_tmpl, N, M)
-                    if can_blas
-                        mul!(Cmat, convert(Matrix{TC}, transpose(Bmat)),
-                                   convert(Matrix{TC}, transpose(Amat)))
-                    else
-                        fill!(new_tmpl, zero(TC))
-                        for k in 1:K
-                            _rank1_add_generic!(new_tmpl, one(TC),
-                                                @view(Bmat[k, :]), @view(Amat[:, k]))
-                        end
-                    end
-                end
-
-                append!(pending, new_tmpl)
-            end
-
-            ckey = ntuple(j -> akey[c_src_axes[j]], Val(PC))
-            _aliased_contribute!(key_to_alias, key_to_accum, pending,
-                                 ckey, combined_tid, αA, C.blksize)
-        end   # ii loop
-
-        iA = iA2
-    end   # main while
-
-    _commit_aliased_dicts_lazy!(C, key_to_alias, key_to_accum, pending, n_pending)
+) where {TC,NC,N2C,PC,TA,NA,N2A,PA}
+    A_bs = to_blocksparse(A)
+    # If B is also aliased, demote it too.
+    B_bs = (B isa AliasedBlockSparse) ? to_blocksparse(B) : B
+    Kt = eltype(eltype(A_bs.keys))
+    C_bs = NewBlockSparseSorted{TC,NC,N2C,PC,Kt}(C.dims, C.blksize,
+        NTuple{PC,Kt}[], Int[], TC[])
+    contract!(C_bs, labelsC, A_bs, labelsA, B_bs, labelsB;
+        output_inds_hint=output_inds_hint, allowed_keys_C=allowed_keys_C)
+    # Re-aliasify: one template per non-empty block (trivial alias, no
+    # compression). Compression can be recovered by a later optimization.
+    nb = length(C_bs.keys)
+    C.dims    = C_bs.dims
+    C.blksize = C_bs.blksize
+    empty!(C.templates); append!(C.templates, C_bs.data)
+    C.n_templates = nb
+    empty!(C.keys);      append!(C.keys, C_bs.keys)
+    empty!(C.alias_ids); append!(C.alias_ids, collect(1:nb))
+    empty!(C.scalars);   append!(C.scalars, ones(TC, nb))
     return C
 end
 
@@ -375,6 +204,19 @@ function contract_shared!(
     mode, desired_keepA, desired_keepB = _cdense_grouping_and_orders(Cdense, keepA0, keepB0)
     mode == :interleaved &&
         error("Cdense interleaves A/B kept dims; unsupported — reorder C labels so A-kept and B-kept form contiguous groups")
+
+    # Fission fallback (same as Aliased × Dense branch above) — delegate to
+    # BS contract when hint moves labels into C's prefix.
+    has_hint = output_inds_hint !== nothing || allowed_keys_C !== nothing
+    actually_needs_fission = has_hint &&
+        (length(desired_keepA) != length(keepA0) ||
+         length(desired_keepB) != length(keepB0) ||
+         allowed_keys_C !== nothing)
+    if actually_needs_fission
+        return _aliased_shared_via_bs_fission!(C, labelsC, A, labelsA, B, labelsB,
+            mapA, mapB, shared_labels;
+            output_inds_hint=output_inds_hint, allowed_keys_C=allowed_keys_C)
+    end
 
     @assert length(desired_keepA) == length(keepA0) && Set(desired_keepA) == Set(keepA0)
     @assert length(desired_keepB) == length(keepB0) && Set(desired_keepB) == Set(keepB0)
@@ -508,7 +350,7 @@ function contract_shared!(
                         end
                     end
 
-                    append!(pending, new_tmpl)
+                    @timeit TIMER "cas.append_pending" append!(pending, new_tmpl)
                 end   # combined template computed
 
                 ckey = ntuple(j -> (src[j] > 0 ? akey[src[j]] : bkey[-src[j]]), Val(PC))

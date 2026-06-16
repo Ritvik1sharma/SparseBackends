@@ -56,6 +56,10 @@ end
   return _map_inds(inds, I -> (I in targets ? _prime_index(I, 1) : I))
 end
 
+@inline function _prime_inds(inds::NTuple{N,ITensors.Index}, tag::String) where {N}
+  return _map_inds(inds, I -> (ITensors.hastags(I, tag) ? _prime_index(I, 1) : I))
+end
+
 @inline function _noprime_inds(inds::NTuple{N,ITensors.Index}) where {N}
   return _map_inds(inds, I -> _noprime_index(I, ITensors.plev(I)))
 end
@@ -85,6 +89,11 @@ end
 function setprime(w::SparseBackends.WrappedCOOTensor{T,N}, args...) where {T,N}
   new_inds = _setprime_inds(w.inds, args...)
   return SparseBackends.WrappedCOOTensor{T,N}(w.coo, new_inds)
+end
+
+function prime(w::SparseBackends.WrappedBlockSparse{T,N,N2,P}, tag::String) where {T,N,N2,P}
+    new_inds = _prime_inds(w.inds, tag)
+    return SparseBackends.WrappedBlockSparse{T,N,N2,P}(w.blocksparse, new_inds)
 end
 
 # BlockSparse wrapper
@@ -193,45 +202,3 @@ function ITensors.external_dag(es::ITensors.ExternalStorage{S}; kwargs...) where
   return ITensors._itensor_from_external_storage(newdata)
 end
 
-# # COO wrapper
-# function ITensors.replaceprime(w::SparseBackends.WrappedCOOTensor{T,N}, ps::Pair{Int,Int}...) where {T,N}
-#   new_inds = _replaceprime_inds(w.inds, ps...)
-#   return SparseBackends.WrappedCOOTensor{T,N}(w.coo, new_inds)
-# end
-
-# function ITensors.prime(w::SparseBackends.WrappedCOOTensor{T,N}, plevs::Int...) where {T,N}
-#   new_inds = _prime_inds(w.inds, plevs...)
-#   return SparseBackends.WrappedCOOTensor{T,N}(w.coo, new_inds)
-# end
-
-# function ITensors.noprime(w::SparseBackends.WrappedCOOTensor{T,N}, plevs::Int...) where {T,N}
-#   new_inds = _noprime_inds(w.inds, plevs...)
-#   return SparseBackends.WrappedCOOTensor{T,N}(w.coo, new_inds)
-# end
-
-# function ITensors.setprime(w::SparseBackends.WrappedCOOTensor{T,N}, p::Int) where {T,N}
-#   new_inds = _setprime_inds(w.inds, p)
-#   return SparseBackends.WrappedCOOTensor{T,N}(w.coo, new_inds)
-# end
-
-
-# # BlockSparse wrapper
-# function ITensors.replaceprime(w::SparseBackends.WrappedBlockSparse{T,N,N2,P}, ps::Pair{Int,Int}...) where {T,N,N2,P}
-#   new_inds = _replaceprime_inds(w.inds, ps...)
-#   return SparseBackends.WrappedBlockSparse{T,N,N2,P}(w.blocksparse, new_inds)
-# end
-
-# function ITensors.prime(w::SparseBackends.WrappedBlockSparse{T,N,N2,P}, plevs::Int...) where {T,N,N2,P}
-#   new_inds = _prime_inds(w.inds, plevs...)
-#   return SparseBackends.WrappedBlockSparse{T,N,N2,P}(w.blocksparse, new_inds)
-# end
-
-# function ITensors.noprime(w::SparseBackends.WrappedBlockSparse{T,N,N2,P}, plevs::Int...) where {T,N,N2,P}
-#   new_inds = _noprime_inds(w.inds, plevs...)
-#   return SparseBackends.WrappedBlockSparse{T,N,N2,P}(w.blocksparse, new_inds)
-# end
-
-# function ITensors.setprime(w::SparseBackends.WrappedBlockSparse{T,N,N2,P}, p::Int) where {T,N,N2,P}
-#   new_inds = _setprime_inds(w.inds, p)
-#   return SparseBackends.WrappedBlockSparse{T,N,N2,P}(w.blocksparse, new_inds)
-# end

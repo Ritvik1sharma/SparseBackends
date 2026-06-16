@@ -26,8 +26,120 @@ using LinearAlgebra: mul!, BLAS
 # position 3 in a fresh sweep), then goes silent.  Inspect what index
 # orders the kernel sees vs the canonical layout it permutes to.
 const _ADD_DBG_COUNT = Ref(0)
+
+# Cumulative alias-structure counters for the aliased×dense kernel. Updated
+# once per call (cheap, no per-block work). Reset via _reset_alias_stats!().
+mutable struct _AliasStats
+    calls         :: Int
+    total_blocks  :: Int
+    total_tmpls   :: Int  # sum of A.n_templates seen
+    unique_tidA   :: Int  # sum of len(unique A.alias_ids per call)
+    total_MKN     :: Int
+end
+const _ALIAS_STATS = _AliasStats(0, 0, 0, 0, 0)
+function _reset_alias_stats!()
+    s = _ALIAS_STATS
+    s.calls = 0; s.total_blocks = 0; s.total_tmpls = 0
+    s.unique_tidA = 0; s.total_MKN = 0
+end
+function _report_alias_stats()
+    s = _ALIAS_STATS
+    s.calls == 0 && return
+    avg_blocks  = s.total_blocks / s.calls
+    avg_tmpls   = s.total_tmpls / s.calls
+    avg_unique  = s.unique_tidA / s.calls
+    println("\n========== aliased×dense per-call alias structure ==========")
+    println("  calls            = ", s.calls)
+    println("  Σ blocks         = ", s.total_blocks,
+            "    avg/call = ", round(avg_blocks; digits=2))
+    println("  Σ A.n_templates  = ", s.total_tmpls,
+            "    avg/call = ", round(avg_tmpls; digits=2))
+    println("  Σ unique tidA    = ", s.unique_tidA,
+            "    avg/call = ", round(avg_unique; digits=2))
+    println("  block/template ratio (avg) = ",
+            round(avg_blocks / max(avg_tmpls, 1e-9); digits=3),
+            "  ← how many blocks per unique template per call")
+    println("  block/unique-tidA   (avg) = ",
+            round(avg_blocks / max(avg_unique, 1e-9); digits=3),
+            "  ← reuse achievable by batching same-tidA blocks")
+    println("  Σ MKN work       = ", s.total_MKN)
+end
+@inline function _record_alias_call!(A::AliasedBlockSparse, M, K, N)
+    s = _ALIAS_STATS
+    s.calls += 1
+    nb = length(A.keys)
+    s.total_blocks += nb
+    s.total_tmpls  += A.n_templates
+    # Count unique tidA actually referenced in this call (could be < n_templates
+    # if some templates are dead, or = if all referenced).
+    seen = Set{Int}()
+    @inbounds for i in 1:nb
+        push!(seen, A.alias_ids[i])
+    end
+    s.unique_tidA += length(seen)
+    s.total_MKN   += nb * M * K * N
+end
 @inline _add_dbg_enabled() = get(ENV, "SB_ALIASED_DEBUG", "0") == "1"
 @inline _add_dbg_max()     = parse(Int, get(ENV, "SB_ALIASED_DEBUG_MAX", "12"))
+
+# Linear-search position lookup. For N ≤ 8 labels this beats Dict-build +
+# hash lookup. Returns 0 if not found (caller checks via `!= 0`).
+@inline function _posin(l, labels)
+    @inbounds for i in eachindex(labels)
+        labels[i] == l && return i
+    end
+    return 0
+end
+@inline _has(l, labels) = _posin(l, labels) != 0
+
+# Diagnostic: when SB_PERMB_DBG=1, print the first N kernel calls in which
+# permute_B fires (i.e. env layout != [red_dense, keepB, shared_prefix]).
+const _PERMB_DBG_COUNT = Ref(0)
+
+# Pattern profiler: when SB_PERM_PROFILE=1, accumulate (permB, perm_C, dims)
+# tuples and their occurrence counts so we can see which orderings dominate.
+# Print a sorted-by-count report on demand via `_report_perm_profile()`.
+mutable struct _PermSig
+    permB    :: Vector{Int}
+    perm_C   :: Vector{Int}
+    n_sp     :: Int
+    n_rd     :: Int
+    n_keepA  :: Int
+    n_keepB  :: Int
+    n_cpfx   :: Int
+end
+Base.hash(s::_PermSig, h::UInt) =
+    hash(s.permB, hash(s.perm_C, hash(s.n_sp, hash(s.n_rd, hash(s.n_keepA,
+        hash(s.n_keepB, hash(s.n_cpfx, h)))))))
+Base.:(==)(a::_PermSig, b::_PermSig) =
+    a.permB == b.permB && a.perm_C == b.perm_C &&
+    a.n_sp == b.n_sp && a.n_rd == b.n_rd && a.n_keepA == b.n_keepA &&
+    a.n_keepB == b.n_keepB && a.n_cpfx == b.n_cpfx
+const _PERM_PROFILE = Dict{_PermSig, Int}()
+function _reset_perm_profile!()
+    empty!(_PERM_PROFILE)
+end
+function _report_perm_profile()
+    isempty(_PERM_PROFILE) && (println("[perm_profile] (empty)"); return)
+    total = sum(values(_PERM_PROFILE))
+    items = sort(collect(_PERM_PROFILE); by = x -> -x[2])
+    println("\n========== perm_profile (", length(items), " unique patterns, ",
+            total, " calls) ==========")
+    println(rpad("count", 8), rpad("frac", 8),
+            rpad("(nkA,nkB,ncp,nsp,nrd)", 22),
+            rpad("permB", 30), "perm_C")
+    @inbounds for (s, c) in items[1:min(end, 20)]
+        sig = string("(", s.n_keepA, ",", s.n_keepB, ",", s.n_cpfx, ",", s.n_sp, ",", s.n_rd, ")")
+        permB_is_id = s.permB == collect(1:length(s.permB))
+        perm_C_is_id = s.perm_C == collect(1:length(s.perm_C))
+        permB_str = string(s.permB, permB_is_id ? " ✓id" : "")
+        perm_C_str = string(s.perm_C, perm_C_is_id ? " ✓id" : "")
+        println(rpad(c, 8), rpad(string(round(c/total*100; digits=2), "%"), 8),
+                rpad(sig, 22), rpad(permB_str, 30), perm_C_str)
+    end
+    println("==========")
+end
+@inline _perm_profile_enabled() = get(ENV, "SB_PERM_PROFILE", "0") == "1"
 
 function contract_aliased_dense_to_dense!(
     C        :: AbstractArray{TC},
@@ -44,15 +156,11 @@ function contract_aliased_dense_to_dense!(
     end
 
     @timeit TIMER "add.classify" begin
-        mapA = Dict(l => i for (i, l) in enumerate(labelsA))
-        mapB = Dict(l => i for (i, l) in enumerate(labelsB))
-        mapC = Dict(l => i for (i, l) in enumerate(labelsC))
-
-        shared_prefix = [l for l in labelsA[1:PA]     if  haskey(mapB, l) && !haskey(mapC, l)]
-        c_prefix      = [l for l in labelsA[1:PA]     if  haskey(mapC, l)]
-        keepA         = [l for l in labelsA[PA+1:end] if  haskey(mapC, l)]
-        red_dense     = [l for l in labelsA[PA+1:end] if !haskey(mapC, l)]
-        keepB         = [l for l in labelsB           if  haskey(mapC, l)]
+        shared_prefix = [l for l in labelsA[1:PA]     if  _has(l, labelsB) && !_has(l, labelsC)]
+        c_prefix      = [l for l in labelsA[1:PA]     if  _has(l, labelsC)]
+        keepA         = [l for l in labelsA[PA+1:end] if  _has(l, labelsC)]
+        red_dense     = [l for l in labelsA[PA+1:end] if !_has(l, labelsC)]
+        keepB         = [l for l in labelsB           if  _has(l, labelsC)]
 
         n_sp    = length(shared_prefix)
         n_rd    = length(red_dense)
@@ -62,26 +170,39 @@ function contract_aliased_dense_to_dense!(
     end
 
     @timeit TIMER "add.permute_A" begin
-        dense_perm = vcat([mapA[l] - PA for l in keepA],
-                          [mapA[l] - PA for l in red_dense])
+        dense_perm = vcat([_posin(l, labelsA) - PA for l in keepA],
+                          [_posin(l, labelsA) - PA for l in red_dense])
         if dense_perm != collect(1:NA-PA)
             full_perm = vcat(collect(1:PA), dense_perm .+ PA)
             A       = permutedims(A, full_perm)
             labelsA = labelsA[full_perm]
-            mapA    = Dict(l => i for (i, l) in enumerate(labelsA))
         end
     end
 
     @timeit TIMER "add.permute_B" begin
         permB = Vector{Int}(undef, NB)
         let i = 1
-            @inbounds for l in red_dense;     permB[i] = mapB[l]; i += 1; end
-            @inbounds for l in keepB;         permB[i] = mapB[l]; i += 1; end
-            @inbounds for l in shared_prefix; permB[i] = mapB[l]; i += 1; end
+            @inbounds for l in red_dense;     permB[i] = _posin(l, labelsB); i += 1; end
+            @inbounds for l in keepB;         permB[i] = _posin(l, labelsB); i += 1; end
+            @inbounds for l in shared_prefix; permB[i] = _posin(l, labelsB); i += 1; end
         end
         if permB == collect(1:NB)
             Bp = B
         else
+            if get(ENV, "SB_PERMB_DBG", "0") == "1" &&
+               _PERMB_DBG_COUNT[] < parse(Int, get(ENV, "SB_PERMB_DBG_MAX", "12"))
+                _PERMB_DBG_COUNT[] += 1
+                println("\n[SB_PERMB_DBG #", _PERMB_DBG_COUNT[], "] permute_B firing")
+                println("  labelsA = ", labelsA, "  (PA = ", PA, ")")
+                println("  labelsB = ", labelsB)
+                println("  labelsC = ", labelsC)
+                println("  red_dense     = ", red_dense)
+                println("  keepB         = ", keepB)
+                println("  shared_prefix = ", shared_prefix)
+                println("  desired B order = ", vcat(red_dense, keepB, shared_prefix),
+                        "  (red_dense first, shared_prefix last)")
+                println("  actual permB    = ", permB)
+            end
             # Bp = PermutedDimsArray(B, permB)
             dimsBp     = ntuple(i -> size(B, permB[i]), Val(NB))
             nB_total   = length(B)
@@ -95,30 +216,104 @@ function contract_aliased_dense_to_dense!(
     @timeit TIMER "add.setup" begin
         dimsA_d = A.dims[PA+1:end]
         M = n_keepA == 0 ? 1 : prod(dimsA_d[1:n_keepA])
-        K = n_rd    == 0 ? 1 : prod(size(B, mapB[l]) for l in red_dense)
-        N = n_keepB == 0 ? 1 : prod(size(B, mapB[l]) for l in keepB)
+        K = n_rd    == 0 ? 1 : prod(size(B, _posin(l, labelsB)) for l in red_dense)
+        N = n_keepB == 0 ? 1 : prod(size(B, _posin(l, labelsB)) for l in keepB)
 
-        join_posA         = [mapA[l] for l in shared_prefix]
-        c_prefix_pos_in_A = [mapA[l] for l in c_prefix]
+        join_posA         = [_posin(l, labelsA) for l in shared_prefix]
+        c_prefix_pos_in_A = [_posin(l, labelsA) for l in c_prefix]
 
         # Column-major strides into sp dims for linearising sp_vals → Int.
-        sp_dims = ntuple(t -> size(B, mapB[shared_prefix[t]]), n_sp)
         sp_stride = Vector{Int}(undef, n_sp)
         let s = 1
             @inbounds for t in 1:n_sp
                 sp_stride[t] = s
-                s *= sp_dims[t]
+                s *= size(B, _posin(shared_prefix[t], labelsB))
+            end
+        end
+
+        # Column-major strides into c-prefix dims for linearising cpfx_idx → Int.
+        cpfx_stride = Vector{Int}(undef, n_cpfx)
+        let s = 1
+            @inbounds for j in 1:n_cpfx
+                cpfx_stride[j] = s
+                s *= A.dims[c_prefix_pos_in_A[j]]
             end
         end
 
         # Canonical C layout: keepA, keepB first then c_prefix last (contiguous M*N slice).
         canon_labels = vcat(keepA, keepB, c_prefix)
-        perm_C       = [mapC[l] for l in canon_labels]
-        if perm_C == collect(1:NC)
+        perm_C       = [_posin(l, labelsC) for l in canon_labels]
+        if _flop_count_enabled()
+            add_reshuffle!(permB != collect(1:NB), perm_C != collect(1:NC))
+        end
+        if _perm_profile_enabled()
+            sig = _PermSig(copy(permB), copy(perm_C), n_sp, n_rd, n_keepA, n_keepB, n_cpfx)
+            _PERM_PROFILE[sig] = get(_PERM_PROFILE, sig, 0) + 1
+        end
+
+        # ── Direct-write detection (skips permute_back) ──────────────────────
+        # Goal: write each block's GEMM result straight into the (pre-zeroed) C
+        # with NO permute_back. This is possible as a single BLAS GEMM whenever
+        # one kept group (keepA or keepB) is the unit-stride LEADING run [1..r]
+        # of labelsC (kernel order) and the OTHER kept group is a contiguous run
+        # [p..p+c-1] (kernel order) with p > r — then every remaining axis is a
+        # c_prefix selector and labelsC factorizes as
+        #     C ≅ reshape(C, reshR, reshGAP, reshCcols, reshTAIL)
+        # (reshR = leading row block, stride 1; reshGAP/reshTAIL = c_prefix axes
+        # before/after the column run; reshCcols = the column run). For a block we
+        # fix (GAP=g, TAIL=t) and mul! into the reshR×reshCcols slice
+        # view(C4,:,g,:,t), whose column stride is reshR·reshGAP — a *uniform*
+        # stride, so BLAS handles it directly:
+        #   • GAP == 1  → stride == reshR → CONTIGUOUS block (the fast common
+        #                 case; written via a flat reshape with no SubArray);
+        #   • GAP  > 1  → strided (a c_prefix axis sits between the kept groups);
+        #                 still one GEMM, just ldc = reshR·reshGAP > reshR.
+        # keepB-leading is served by the transposed GEMM Cᵀ = Bᵀ·Aᵀ (BLAS flag,
+        # no data motion). Per-block ii accumulation order is unchanged ⇒
+        # bit-identical to the permute_back path.
+        # Only layouts where a kept group is INTERNALLY PERMUTED (column run not
+        # contiguous in kernel order ⇒ non-uniform column stride ⇒ no single GEMM
+        # can scatter it) fall back to canonical Ctgt + permute_back below.
+        direct_rows   = :none           # :keepA | :keepB | :none
+        direct_strided = false          # true ⇒ GAP>1 (strided slice); false ⇒ contiguous
+        cpfx_strideC  = Int[]           # column-major stride of each c_prefix axis in C
+        reshR = 1; reshGAP = 1; reshCcols = 1; reshTAIL = 1
+        if perm_C != collect(1:NC)
+            kApos = [_posin(l, labelsC) for l in keepA]
+            kBpos = [_posin(l, labelsC) for l in keepB]
+            row_kind = :none; r = 0; colpos = Int[]
+            if n_keepA > 0 && kApos == collect(1:n_keepA)
+                row_kind = :keepA; r = n_keepA; colpos = kBpos
+            elseif n_keepB > 0 && kBpos == collect(1:n_keepB)
+                row_kind = :keepB; r = n_keepB; colpos = kApos
+            end
+            # The other kept group must be empty, or a contiguous run (kernel
+            # order) starting after the row group. Contiguity in kernel order is
+            # what guarantees a single uniform column stride.
+            if row_kind != :none
+                p = isempty(colpos) ? r + 1 : colpos[1]
+                c = length(colpos)
+                if isempty(colpos) || (p > r && colpos == collect(p : p+c-1))
+                    _dpos(lo, hi) = (lo > hi) ? 1 : prod(size(C, i) for i in lo:hi)
+                    reshR      = _dpos(1, r)
+                    reshGAP    = _dpos(r+1, p-1)
+                    reshCcols  = _dpos(p, p+c-1)
+                    reshTAIL   = _dpos(p+c, NC)
+                    direct_rows    = row_kind
+                    direct_strided = reshGAP != 1
+                    sC = Vector{Int}(undef, NC); sC[1] = 1
+                    @inbounds for i in 2:NC; sC[i] = sC[i-1] * size(C, i-1); end
+                    cpfx_strideC = [sC[_posin(l, labelsC)] for l in c_prefix]
+                end
+            end
+        end
+
+        if perm_C == collect(1:NC) || direct_rows != :none
+            # Identity layout OR strided-writable layout → write straight into
+            # the caller's C (already zeroed by wrapped_contract_aliased's
+            # `zeros(TC, dimsC...)`); no scratch, no permute_back.
             Ctgt = C
             canon_owns_buffer = false
-            # C is freshly zeroed by the caller (wrapped_contract_aliased's
-            # `zeros(TC, dimsC...)`), so no re-fill needed here.
         else
             canon_dims = ntuple(i -> size(C, perm_C[i]), Val(NC))
             n_canon    = prod(canon_dims)
@@ -163,63 +358,101 @@ function contract_aliased_dense_to_dense!(
     end
 
     nA = length(A.keys)
+    if get(ENV, "SB_ALIAS_STATS", "0") == "1"
+        _record_alias_call!(A, M, K, N)
+    end
+    if _flop_count_enabled()
+        # Actual per-block GEMM work the aliased kernel performs.
+        actual_macs = nA * M * K * N
+        # MACs a fully-dense contraction of this same step would cost: the
+        # sparse channel (shared_prefix contracted, c_prefix kept) un-factored.
+        SP   = n_sp   == 0 ? 1 : prod(size(B, _posin(l, labelsB)) for l in shared_prefix)
+        Cpfx = n_cpfx == 0 ? 1 : prod(A.dims[c_prefix_pos_in_A[j]] for j in 1:n_cpfx)
+        denseequiv_macs = M * K * N * SP * Cpfx
+        add_aliased_macs!(actual_macs, denseequiv_macs)
+    end
 
-    # BS-mirror path: one fused mul!(C_slice, A_mat, B_mat, α, 1) per block.
-    # The alias-amplified cache path was removed — it provided 0 reuse on
-    # PHP-style workloads (each block has unique (tidA, sp_lin), compression
-    # ≈ 1.0×) and was pure overhead. See git history if needed.
+    # Lean per-block path: one fused mul!(C_slice, A_mat, B_mat, α, 1) per
+    # block, with the slice metadata derived inline from integer offsets into
+    # the flat Bp / C / Ctgt buffers. No ntuple, no Colon() splat, no multi-axis
+    # SubArray construction in the hot loop.
     #
-    # SB_GEMM_FINE_TIMERS=1 splits per-block work into fetch / Bsub view /
-    # tmpl view / C_slice view / reshape / mul!. Off by default to keep the
-    # tight loop overhead-free.
+    # Three paths share the same per-block sp_lin / base arithmetic:
+    #   contiguous direct — flat reshape of C at offset `base` (GAP==1); leanest;
+    #   strided direct    — view(C4,:,g,:,t) into the 4-region reshape (GAP>1);
+    #   :none             — accumulate into scratch Ctgt, permute_back after.
+    # Both direct paths skip permute_back/scratch/zero_C and use the transposed
+    # GEMM Cᵀ=Bᵀ·Aᵀ for keepB-leading.
+    Bp_vec = vec(Bp)
+    KN = K * N
+    MN = M * N
     @timeit TIMER "add.main_loop" begin
-      if get(ENV, "SB_GEMM_FINE_TIMERS", "0") == "1"
+      if direct_rows != :none && !direct_strided
+        # Contiguous fast path: the reshR×reshCcols slice is a contiguous MN
+        # block at flat offset `base` (c_prefix trails the kept groups).
+        row_is_B = direct_rows == :keepB
+        C_vec = vec(C)
         @inbounds for ii in 1:nA
-            @timeit TIMER "add.fetch" begin
-                akey     = A.keys[ii]
-                tidA     = A.alias_ids[ii]
-                α        = convert(TC, A.scalars[ii])
-                sp_vals  = ntuple(t -> akey[join_posA[t]], n_sp)
-                cpfx_idx = ntuple(j -> akey[c_prefix_pos_in_A[j]], n_cpfx)
-            end
-            @timeit TIMER "add.bsub_view" begin
-                Bsub = (n_sp == 0) ? Bp :
-                       @view Bp[ntuple(_ -> Colon(), NB - n_sp)..., sp_vals...]
-            end
-            @timeit TIMER "add.tmpl_view" begin
-                tmpl = _aliased_template_view(A, tidA)
-            end
-            @timeit TIMER "add.c_slice_view" begin
-                C_slice = @view Ctgt[ntuple(_ -> Colon(), n_keepA + n_keepB)..., cpfx_idx...]
-            end
-            @timeit TIMER "add.reshape" begin
-                Bmat = reshape(Bsub, K, N)
-                Amat = reshape(tmpl, M, K)
-                Cmat = reshape(C_slice, M, N)
-            end
-            @timeit TIMER "add.mul!" begin
-                mul!(Cmat, Amat, Bmat, α, one(TC))
-            end
+          akey = A.keys[ii]
+          α    = convert(TC, A.scalars[ii])
+          sp_lin = 0
+          for t in 1:n_sp; sp_lin += (akey[join_posA[t]] - 1) * sp_stride[t]; end
+          base = 0
+          for j in 1:n_cpfx; base += (akey[c_prefix_pos_in_A[j]] - 1) * cpfx_strideC[j]; end
+          Boff = sp_lin * KN
+          Bmat = reshape(view(Bp_vec, Boff + 1 : Boff + KN), K, N)
+          Amat = reshape(_aliased_template_view(A, A.alias_ids[ii]), M, K)
+          Cmat = reshape(view(C_vec, base + 1 : base + MN), reshR, reshCcols)
+          if row_is_B
+            mul!(Cmat, transpose(Bmat), transpose(Amat), α, one(TC))   # N×M = Bᵀ·Aᵀ
+          else
+            mul!(Cmat, Amat, Bmat, α, one(TC))                         # M×N
+          end
+        end
+      elseif direct_rows != :none
+        # Strided direct path: a c_prefix axis sits between the kept groups, so
+        # the slice has a uniform column stride reshR·reshGAP > reshR. Still one
+        # GEMM per block — into the strided view(C4,:,g,:,t) of the pre-zeroed C.
+        row_is_B = direct_rows == :keepB
+        C4  = reshape(C, reshR, reshGAP, reshCcols, reshTAIL)
+        RGC = reshR * reshGAP * reshCcols
+        @inbounds for ii in 1:nA
+          akey = A.keys[ii]
+          α    = convert(TC, A.scalars[ii])
+          sp_lin = 0
+          for t in 1:n_sp; sp_lin += (akey[join_posA[t]] - 1) * sp_stride[t]; end
+          base = 0
+          for j in 1:n_cpfx; base += (akey[c_prefix_pos_in_A[j]] - 1) * cpfx_strideC[j]; end
+          g = (base ÷ reshR) % reshGAP
+          t = base ÷ RGC
+          Boff = sp_lin * KN
+          Bmat = reshape(view(Bp_vec, Boff + 1 : Boff + KN), K, N)
+          Amat = reshape(_aliased_template_view(A, A.alias_ids[ii]), M, K)
+          Cmat = view(C4, :, g + 1, :, t + 1)   # reshR×reshCcols, col stride reshR·reshGAP
+          if row_is_B
+            mul!(Cmat, transpose(Bmat), transpose(Amat), α, one(TC))
+          else
+            mul!(Cmat, Amat, Bmat, α, one(TC))
+          end
         end
       else
+        Ctgt_vec = vec(Ctgt)
         @inbounds for ii in 1:nA
-            akey     = A.keys[ii]
-            tidA     = A.alias_ids[ii]
-            α        = convert(TC, A.scalars[ii])
-            sp_vals  = ntuple(t -> akey[join_posA[t]], n_sp)
-            cpfx_idx = ntuple(j -> akey[c_prefix_pos_in_A[j]], n_cpfx)
-            Bsub  = (n_sp == 0) ? Bp :
-                    @view Bp[ntuple(_ -> Colon(), NB - n_sp)..., sp_vals...]
-            tmpl  = _aliased_template_view(A, tidA)
-            C_slice = @view Ctgt[ntuple(_ -> Colon(), n_keepA + n_keepB)..., cpfx_idx...]
-            @timeit TIMER "add.gemm" begin
-                mul!(reshape(C_slice, M, N), reshape(tmpl, M, K), reshape(Bsub, K, N), α, one(TC))
-            end
+          akey = A.keys[ii]
+          α    = convert(TC, A.scalars[ii])
+          sp_lin = 0
+          for t in 1:n_sp; sp_lin += (akey[join_posA[t]] - 1) * sp_stride[t]; end
+          cp_lin = 0
+          for j in 1:n_cpfx; cp_lin += (akey[c_prefix_pos_in_A[j]] - 1) * cpfx_stride[j]; end
+          Boff = sp_lin * KN
+          Coff = cp_lin * MN
+          Bmat = reshape(view(Bp_vec,   Boff + 1 : Boff + KN), K, N)
+          Cmat = reshape(view(Ctgt_vec, Coff + 1 : Coff + MN), M, N)
+          Amat = reshape(_aliased_template_view(A, A.alias_ids[ii]), M, K)
+          mul!(Cmat, Amat, Bmat, α, one(TC))
         end
       end
     end
-
-
 
     if canon_owns_buffer
         @timeit TIMER "add.permute_back" begin

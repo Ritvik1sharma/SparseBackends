@@ -363,6 +363,14 @@ function contract_and_fuse_links(
   if Abackend === :dense && Bbackend === :dense
     return ITensors.contract(A, B), bondmap
   end
+  # When either side requests :aliased storage, route through the aliased
+  # per-site kernel. This is the only entry point that handles the :aliased
+  # backend; other paths remain unchanged.
+  if Abackend === :aliased || Bbackend === :aliased
+    return contract_and_fuse_links_aliased(A, B, Abackend, Bbackend, bondmap;
+      denseLinksA=denseLinksA, denseLinksB=denseLinksB,
+      aLeft=aLeft, aRight=aRight, bLeft=bLeft, bRight=bRight)
+  end
   Aw = wrap_itensor(A; backend=Abackend, denseLinks=denseLinksA)
   Bw = wrap_itensor(B; backend=Bbackend, denseLinks=denseLinksB)
   return contract_and_fuse_links(Aw, Bw, bondmap; aLeft=aLeft, aRight=aRight, bLeft=bLeft, bRight=bRight)

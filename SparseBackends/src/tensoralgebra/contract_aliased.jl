@@ -222,7 +222,7 @@ function _contract_aliased_prefix_outer_ad!(
     @assert mapA[rlab] == PA "rlab must be the last prefix axis of A (call _aliased_r_to_last_prefix first)"
     @assert !(rlab in labelsC)
 
-    # Permute B so rlab is last, then lay out as (chunkB, R)
+    # Permute B so rlab is last
     axisBr = mapB[rlab]
     dimsB  = size(B)
     R      = dimsB[axisBr]
@@ -232,65 +232,131 @@ function _contract_aliased_prefix_outer_ad!(
         labelsB = labelsB[permB]
         mapB    = Dict(lab => i for (i, lab) in enumerate(labelsB))
     end
-    chunkB = Int(prod(size(B)[1:end-1]; init=1))
-    @assert C.blksize == A.blksize * chunkB "C.blksize must equal A.blksize * chunkB"
-    Bvec = vec(B)   # B[:,rv] is at Bvec[(rv-1)*chunkB+1 : rv*chunkB]
 
-    # Dense-order check
-    Adense = labelsA[PA+1:NA]
-    Bwo    = labelsB[1:end-1]
-    Cdense = labelsC[PC+1:NC]
-    dense_order = Cdense == vcat(Adense, Bwo) ? :AB :
-                  Cdense == vcat(Bwo, Adense) ? :BA :
-                  error("C dense tail must be [A_dense...,B_wo_r...] or [B_wo_r...,A_dense...]")
+    # ── FISSION DETECTION ─────────────────────────────────────────────────────
+    # C's prefix may include axes that came from B (when the caller passed an
+    # output_inds_hint forcing them into the sparse prefix). Partition B's
+    # non-r dims into:
+    #   - fission_pos_in_B : B dims that land in C's prefix (→ fissioned)
+    #   - remaining_pos_in_B : B dims that stay in C's dense tail
+    n_A_prefix_in_C = PA - 1  # A's prefix axes excluding rlab
+    n_fission       = PC - n_A_prefix_in_C
+    @assert n_fission >= 0 "PC=$PC less than A's non-r prefix count $n_A_prefix_in_C"
+    Cpref_labels    = labelsC[1:PC]
+    fission_labels  = Set(Cpref_labels[i] for i in (n_A_prefix_in_C+1):PC)
+    fission_pos_in_B   = Int[]
+    remaining_pos_in_B = Int[]
+    @inbounds for i in 1:NB-1   # iterate over B's non-r axes (after permutation)
+        if labelsB[i] in fission_labels
+            push!(fission_pos_in_B, i)
+        else
+            push!(remaining_pos_in_B, i)
+        end
+    end
+    @assert length(fission_pos_in_B) == n_fission "fission axes count mismatch ($(length(fission_pos_in_B)) vs $n_fission)"
 
-    # C prefix sourcing from A's non-r prefix axes
-    src = Vector{Int}(undef, PC)
-    @inbounds for j in 1:PC
-        lab = labelsC[j]
-        ax  = mapA[lab]
-        @assert ax <= PA && lab != rlab "C prefix label must come from A sparse prefix excluding rlab"
-        src[j] = ax
+    # If fission dims aren't already at the front of B, permute them there so
+    # B is laid out as (fission_prod, chunkB_remaining, R).
+    if !isempty(fission_pos_in_B) &&
+       (fission_pos_in_B != collect(1:n_fission) || remaining_pos_in_B != collect(n_fission+1:NB-1))
+        permB2 = vcat(fission_pos_in_B, remaining_pos_in_B, [NB])
+        B = permutedims(B, permB2)
+        labelsB = labelsB[permB2]
+        mapB = Dict(lab => i for (i, lab) in enumerate(labelsB))
     end
 
-    # Combined template deduplication: (tidA, rv) -> pending_tid (index into
-    # the scratch `pending` array, NOT into C.templates).  Lazy: templates
-    # are only copied to C.templates at commit time if a block references them.
-    combined_tid_map = Dict{Tuple{Int,Int}, Int}()
+    fission_dims     = ntuple(i -> size(B, i), n_fission)
+    fission_prod     = Int(prod(fission_dims; init=1))
+    chunkB_remaining = Int(prod(size(B, p) for p in (n_fission+1):(NB-1); init=1))
+    @assert C.blksize == A.blksize * chunkB_remaining "C.blksize must equal A.blksize * chunkB_remaining (got $(C.blksize) vs $(A.blksize)*$(chunkB_remaining))"
+    Bvec = vec(B)   # column-major: B[fkey, chunk, rv] at fkey + (chunk-1)*fission_prod + (rv-1)*fission_prod*chunkB_remaining
+
+    # Dense-order check (C's tail)
+    Adense = labelsA[PA+1:NA]
+    Bwo_remaining = labelsB[n_fission+1 : NB-1]  # B's non-fission, non-r labels
+    Cdense = labelsC[PC+1:NC]
+    dense_order = Cdense == vcat(Adense, Bwo_remaining) ? :AB :
+                  Cdense == vcat(Bwo_remaining, Adense) ? :BA :
+                  error("C dense tail must be [A_dense..., B_remaining...] or [B_remaining..., A_dense...]; got Cdense=$Cdense, Adense=$Adense, Bwo_remaining=$Bwo_remaining")
+
+    # C prefix sourcing: first n_A_prefix_in_C entries come from A's prefix;
+    # the remaining n_fission entries come from B's fission dims.
+    src_A = Vector{Int}(undef, n_A_prefix_in_C)
+    @inbounds for j in 1:n_A_prefix_in_C
+        lab = Cpref_labels[j]
+        ax  = mapA[lab]
+        @assert ax <= PA && lab != rlab "C prefix label $lab (pos $j) must come from A sparse prefix excluding rlab"
+        src_A[j] = ax
+    end
+    src_B_fission_pos = Vector{Int}(undef, n_fission)  # which fission axis (1..n_fission) each Cpref slot at PC+1-n_fission..PC maps to
+    @inbounds for j in 1:n_fission
+        lab = Cpref_labels[n_A_prefix_in_C + j]
+        ax  = mapB[lab]   # after permutation, fission labels are at 1..n_fission
+        @assert 1 <= ax <= n_fission
+        src_B_fission_pos[j] = ax
+    end
+
+    # Combined-template dedup: (tidA, rv, fkey_lin) → pending tid.
+    combined_tid_map = Dict{Tuple{Int,Int,Int}, Int}()
     pending  = TC[]
     n_pending = 0
 
     key_to_alias = Dict{NTuple{PC,Int}, Tuple{Int,TC}}()
     key_to_accum = Dict{NTuple{PC,Int}, Vector{TC}}()
 
+    # Strides for decoding fission key linear index → per-axis coords.
+    fission_strides = ones(Int, max(n_fission, 1))
+    @inbounds for d in 2:n_fission
+        fission_strides[d] = fission_strides[d-1] * fission_dims[d-1]
+    end
+
     @inbounds for i in eachindex(A.keys)
         akey = A.keys[i]
-        rv   = akey[PA]          # r is last prefix axis
+        rv   = akey[PA]
         (1 <= rv <= R) || continue
         tidA = A.alias_ids[i]
         α    = convert(TC, A.scalars[i])
-        ckey = ntuple(j -> akey[src[j]], Val(PC))
 
-        # Get or compute combined template  outer(template_A[tidA], B[:,rv])
-        combined_tid = get(combined_tid_map, (tidA, rv), 0)
-        if combined_tid == 0
-            n_pending += 1
-            combined_tid = n_pending
-            combined_tid_map[(tidA, rv)] = combined_tid
-            new_tmpl = zeros(TC, C.blksize)
-            tmpl_A   = _aliased_template_view(A, tidA)   # length A.blksize
-            b_off    = (rv - 1) * chunkB
-            Bslice   = @view Bvec[b_off+1 : b_off+chunkB]
-            if dense_order == :AB
-                _outer_add!(new_tmpl, tmpl_A, Bslice)
-            else
-                _outer_add!(new_tmpl, Bslice, tmpl_A)
+        # Iterate fission keys (1..fission_prod). For n_fission==0, fission_prod=1
+        # and the loop runs once with no fission contribution to ckey.
+        for fkey_lin in 1:fission_prod
+            # Decode fkey_lin → per-axis coords (1-based).
+            # fkey_coords[d] = ((fkey_lin-1) ÷ fission_strides[d]) mod fission_dims[d] + 1
+            ckey = ntuple(j -> begin
+                if j <= n_A_prefix_in_C
+                    akey[src_A[j]]
+                else
+                    fax = src_B_fission_pos[j - n_A_prefix_in_C]
+                    Int(((fkey_lin - 1) ÷ fission_strides[fax]) % fission_dims[fax]) + 1
+                end
+            end, Val(PC))
+
+            # Get / compute combined sub-template at (tidA, rv, fkey_lin).
+            combined_tid = get(combined_tid_map, (tidA, rv, fkey_lin), 0)
+            if combined_tid == 0
+                n_pending += 1
+                combined_tid = n_pending
+                combined_tid_map[(tidA, rv, fkey_lin)] = combined_tid
+                new_tmpl = zeros(TC, C.blksize)
+                tmpl_A   = _aliased_template_view(A, tidA)
+                # B slice at (fkey, :, rv) of length chunkB_remaining.
+                # Linear positions: base + (chunk-1)*fission_prod + fkey_lin, for chunk = 1..chunkB_remaining.
+                base = (rv - 1) * chunkB_remaining * fission_prod
+                Bslice = Vector{TC}(undef, chunkB_remaining)
+                for chunk in 1:chunkB_remaining
+                    Bslice[chunk] = Bvec[base + (chunk - 1) * fission_prod + fkey_lin]
+                end
+                if dense_order == :AB
+                    _outer_add!(new_tmpl, tmpl_A, Bslice)
+                else
+                    _outer_add!(new_tmpl, Bslice, tmpl_A)
+                end
+                append!(pending, new_tmpl)
             end
-            append!(pending, new_tmpl)
-        end
 
-        _aliased_contribute!(key_to_alias, key_to_accum, pending,
-                             ckey, combined_tid, α, C.blksize)
+            _aliased_contribute!(key_to_alias, key_to_accum, pending,
+                                 ckey, combined_tid, α, C.blksize)
+        end
     end
 
     _commit_aliased_dicts_lazy!(C, key_to_alias, key_to_accum, pending, n_pending)

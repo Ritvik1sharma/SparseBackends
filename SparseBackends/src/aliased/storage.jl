@@ -121,9 +121,12 @@ Allocate an empty AliasedBlockSparse tensor with the given shape and no blocks.
 """
 function AliasedBlockSparse{T,N,N2}(dims::NTuple{N,Int}) where {T,N,N2}
     P = N - N2
-    @assert 0 < N2 <= N
+    # N2=0 is allowed: every axis lives in the sparse prefix and each block
+    # is a single scalar (blksize=1). Needed for aliased outputs where the
+    # contraction reduces away every dense-tail axis.
+    @assert 0 <= N2 <= N
     @assert all(dims .>= 1)
-    blksize = prod(ntuple(i -> dims[P+i], Val(N2)))
+    blksize = N2 == 0 ? 1 : prod(ntuple(i -> dims[P+i], Val(N2)))
     return AliasedBlockSparse{T,N,N2,P,Int}(
         dims, blksize,
         Vector{T}(), 0,
