@@ -1,6 +1,10 @@
 # Verify post-DMRG sparse ψ has the expected physical properties:
-#   (1) Memory: count BlockSparse data cells vs dense tensor cells.
-#   (2) ⟨ψ|C_j|ψ⟩ / ⟨ψ|ψ⟩ = 1 for every constraint j (true +1 eigenvector of every C_j).
+#   (1a) Memory cells:  BlockSparse data length vs dense prod(dims)
+#   (1b) Memory bytes:  Base.summarysize on sparse ψ vs densified ψ
+#        (cells understate compression because they ignore metadata; bytes is
+#         the deployable number.)
+#   (2)  ⟨ψ|C_j|ψ⟩ / ⟨ψ|ψ⟩ = 1 for every constraint j (true +1 eigenvector of every C_j).
+# Usage: julia test_psi_properties.jl <N_plaq>
 
 using SparseBackends, ITensors, ITensorMPS
 using Random
@@ -68,8 +72,8 @@ let
     E, psi = dmrg(H_sp, psi_sp, sweeps; outputlevel=0)
     println("DMRG E = $E")
 
-    # ---- (1) Memory: per-site stored cells vs dense tensor size ----
-    println("\n--- Memory comparison (per-site, sparse stored / dense cells = compression ratio) ---")
+    # ---- (1a) Memory cells: stored data length vs dense prod(dims) ----
+    println("\n--- (1a) Memory CELLS (sparse stored / dense cells) ---")
     total_sp = 0; total_de = 0
     for i in 1:length(psi)
         sp, de = tensor_cells(psi[i])
@@ -78,9 +82,23 @@ let
     end
     println("  TOTAL    stored=$total_sp  dense_cells=$total_de  overall_ratio=$(round(total_sp/total_de; digits=4))")
 
-    # ---- (2) +1 eigenvector check: ⟨ψ|C_j|ψ⟩ / ⟨ψ|ψ⟩ for each j ----
-    println("\n--- +1 eigenvector check: ⟨ψ|C_j|ψ⟩ / ⟨ψ|ψ⟩ should be 1.0 for ψ ∈ image(P) ---")
+    # ---- (1b) Memory BYTES: Base.summarysize (includes metadata) ----
+    println("\n--- (1b) Memory BYTES via Base.summarysize ---")
     psi_d = densify_mps(psi)
+    human(n) = n < 1024 ? "$(n) B" :
+              n < 1024^2 ? "$(round(n/1024; digits=1)) KiB" :
+              "$(round(n/1024^2; digits=2)) MiB"
+    tot_sp_b = 0; tot_d_b = 0
+    for i in 1:length(psi)
+        bs = Base.summarysize(psi[i])
+        bd = Base.summarysize(psi_d[i])
+        tot_sp_b += bs; tot_d_b += bd
+        println("  site $i:  sparse=$(human(bs))  dense=$(human(bd))  ratio=$(round(bs/bd; digits=4))")
+    end
+    println("  TOTAL    sparse=$(human(tot_sp_b))  dense=$(human(tot_d_b))  overall_ratio=$(round(tot_sp_b/tot_d_b; digits=4))  fold=$(round(tot_d_b/tot_sp_b; digits=2))x")
+
+    # ---- (2) +1 eigenvector check: ⟨ψ|C_j|ψ⟩ / ⟨ψ|ψ⟩ for each j ----
+    println("\n--- (2) +1 eigenvector: ⟨ψ|C_j|ψ⟩ / ⟨ψ|ψ⟩ should be 1.0 for ψ ∈ image(P) ---")
     nrm2 = real(inner(psi_d, psi_d))
     println("  ||ψ||² = $nrm2")
     for j in 1:length(Cj_MPOs)

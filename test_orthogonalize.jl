@@ -1,9 +1,10 @@
 # Tests whether orthogonalize! preserves ψ ∈ image(P).
 # Usage: julia test_orthogonalize.jl <N>
-# Three checks on the same ψ before/after orthogonalize:
+# Four checks on the same ψ before/after orthogonalize:
 #   (1) Fidelity |⟨ψ_before|ψ_after⟩| / (‖ψ_before‖·‖ψ_after‖)  — should be ≈ 1
 #   (2) ‖ψ‖² and ‖Pψ‖² before/after                               — should be invariant
 #   (3) Image leakage ‖ψ − Pψ‖/‖ψ‖                               — should be ≈ 0
+#   (4) Energy ⟨ψ|H|ψ⟩ at each orthocenter position               — should be invariant
 using SparseBackends, ITensors, ITensorMPS
 using Random, LinearAlgebra
 include("utils.jl")
@@ -14,6 +15,9 @@ const N_PLAQ = parse(Int, ARGS[1])
 function build_setup(N::Int)
     Random.seed!(42)
     sites = siteinds("S=1", 2*N+2)
+    os = OpSum()
+    for j in 1:N+1; os += "Sz", 2*j-1, "Sz", 2*j; end
+    for j in 1:N; os += "Sx", 2*j-1, "Sx", 2*j+2; os += "Sy", 2*j, "Sy", 2*j+1; end
     os2 = OpSum[]
     for j in 1:N
         t = OpSum()
@@ -25,9 +29,12 @@ function build_setup(N::Int)
     ConsOps1 = [clean!(MPO(os2[j], sites, [2*j-1, 2*j, 2*j+1, 2*j+2])) for j in 1:N]
     mulMPO(A, B) = (Bp = prime(B, "Site"); replaceprime(contract(A, Bp, :coo, :coo), 2 => 1))
     P_sparse = ConsOps1[1]; for j in 2:length(ConsOps1); P_sparse = mulMPO(P_sparse, ConsOps1[j]); end
+    H        = MPO(os, sites)
+    H1       = contract(P_sparse'', H', :coo, :dense)
+    H_sparse = replaceprime(contract(P_sparse, H1, :coo, :blocksparse), 3 => 1)
     psi0   = random_mps(sites)
     psi_sp = replaceprime(contract(P_sparse, copy(psi0), :coo, :dense), 1 => 0)
-    return psi_sp, P_sparse
+    return psi_sp, P_sparse, H_sparse
 end
 
 densify_mps(M) = MPS([SparseBackends.to_dense_itensors_unfused(T) for T in M])
@@ -51,7 +58,7 @@ end
 
 let
     println("=== N=$N_PLAQ plaquettes ($(2*N_PLAQ+2) sites) ===\n")
-    psi_sp, P_sparse = build_setup(N_PLAQ)
+    psi_sp, P_sparse, H_sparse = build_setup(N_PLAQ)
     P_dense = densify_mpo(P_sparse)
 
     psi_d_before = densify_mps(psi_sp)
@@ -84,5 +91,22 @@ let
     println("--- Check 3: Image leakage ‖ψ − Pψ‖/‖ψ‖ ---")
     image_leakage(psi_d_before, P_dense; label="before orthogonalize")
     image_leakage(psi_d_after,  P_dense; label="after  orthogonalize")
+
+    # --- Check 4: Energy invariance ⟨ψ|H|ψ⟩ at each orthocenter position ---
+    # Absorbed from test_gauge.jl. Energy ⟨psi|H|psi⟩ must be unchanged when
+    # the orthocenter is moved, regardless of which SVD kernel is used internally.
+    println("\n--- Check 4: Energy invariance across orthocenter positions ---")
+    E_ref = real(inner(psi_sp', H_sparse, psi_sp))
+    println("  Initial ⟨H⟩ (no orthogonalize) = $E_ref")
+    all_ok = true
+    for j in 1:length(psi_sp)
+        psi_j = ITensorMPS.orthogonalize(psi_sp, j)
+        E_j   = real(inner(psi_j', H_sparse, psi_j))
+        dev   = abs(E_j - E_ref) / abs(E_ref)
+        ok    = dev < 1e-8
+        all_ok &= ok
+        println("  orth_to=$j  ⟨H⟩=$(round(E_j; sigdigits=10))  rel_dev=$(round(dev; sigdigits=3))  $(ok ? "✓" : "✗")")
+    end
+    println("Check 4: ", all_ok ? "PASS ✓" : "FAIL ✗ — energy changed on orthogonalize")
 end
 nothing

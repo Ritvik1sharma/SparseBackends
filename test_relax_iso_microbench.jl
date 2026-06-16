@@ -1,8 +1,11 @@
-# Microbenchmark: verify channel-aware SVD with relax_iso_cap=true
+# Microbenchmark: probe channel-aware SVD at every bond, both with and without
+# relax_iso_cap.  Checks:
 #   (1) Exact factorization:  ||phi - L*R||  ≈ 0
 #   (2) Block-key preservation: L's keys ⊆ M_b's keys, R's keys ⊆ M_b1's keys
-#   (3) Mult capacity: n_new_d (relax) ≥ n_new_d (strict)  — relax lets it grow
-#   (4) Iso behavior: strict path is iso; relax path may not be (expected)
+#   (3) Mult capacity: n_new_d (relax) ≥ n_new_d (strict) — relax lets it grow
+#   (4) Iso behavior: strict path may still be non-iso at factor-overlap bonds
+#   (5) Dense-SVD reference: ||phi - Ld*Rd|| and Rd iso err for cross-check
+# Usage: julia test_relax_iso_microbench.jl <N_plaq>
 using SparseBackends, ITensors, ITensorMPS
 using Random, LinearAlgebra
 include("utils.jl")
@@ -73,6 +76,18 @@ function probe_bond(psi, b)
         # (3) iso check (only meaningful for R since ortho="right")
         check_right_iso(R, nb, tag)
     end
+
+    # (5) Dense-SVD reference at this same bond, for cross-check on factorization
+    # error and iso. Uses ITensors.svd on the densified phi.
+    phi_d = densify(phi)
+    indsMb = [I for I in inds(phi) if I in inds(psi[b]) && !(I in inds(psi[b+1]))]
+    Ud, Sd, Vd, _, _, _ = ITensors.svd(phi_d, indsMb;
+        lefttags=TagSet("Link,l=$b"), righttags=TagSet("Link,l=$b"))
+    Ld = Ud * Sd; Rd = Vd
+    err_d = norm(densify(phi) - densify(Ld * Rd))
+    nb_d = collect(commoninds(Ld, Rd))
+    println("  DENSE_REF  ||phi - Ld*Rd||=$(round(err_d; sigdigits=4))  bond_dim=$(prod(ITensors.dim(I) for I in nb_d; init=1))")
+    check_right_iso(Rd, nb_d, "DENSE_REF")
 end
 
 length(ARGS) < 1 && error("Usage: julia test_relax_iso_microbench.jl <N_plaq>")
