@@ -5,8 +5,13 @@
 #   maxdim      — max bond dimension (default 40)
 #   sparse_only — "true" to skip dense DMRG (default "false")
 # Reports: timing, real bond dims, energy gap, fidelity vs dense.
+#
+# Verbose pre-DMRG diagnostics (absorbed from test_projection_correctness.jl):
+#   BPHASE_VERBOSE=1 — runs before DMRG:
+#     Section 1: inner products + ProjMPO matvec + iso check (sparse vs dense)
+#     Section 2: site-by-site |H_sparse[j] - H_dense[j]| + energy comparisons
 using SparseBackends, ITensors, ITensorMPS
-using Random
+using Random, LinearAlgebra
 include("utils.jl")
 
 length(ARGS) < 1 && error("Usage: julia test_b_phase.jl <N> [nsweeps] [maxdim] [sparse_only]")
@@ -63,6 +68,64 @@ let
     println("############################################################")
 
     t_setup = @elapsed (H_sp, H_d, psi_sp, psi_d) = build_setup(N_PLAQ)
+
+    # --- BPHASE_VERBOSE=1: pre-DMRG sanity checks (from test_projection_correctness) ---
+    if get(ENV, "BPHASE_VERBOSE", "0") == "1"
+        println("\n" * "="^70)
+        println("VERBOSE Section 1: Inner product sanity (no DMRG)")
+        println("="^70)
+
+        psi_sp_o = ITensorMPS.orthogonalize(psi_sp, 1)
+        psi_d_o  = ITensorMPS.orthogonalize(psi_d,  1)
+
+        norm_sp = inner(psi_sp, psi_sp);  norm_d = inner(psi_d, psi_d)
+        println("  <psi|psi> sparse=$norm_sp  dense=$norm_d  |diff|=$(abs(norm_sp-norm_d))")
+
+        eh_sp = inner(psi_sp', H_sp, psi_sp);  eh_d = inner(psi_d', H_d, psi_d)
+        println("  <psi|H|psi> sparse=$eh_sp  dense=$eh_d  |diff|=$(abs(eh_sp-eh_d))")
+
+        println("  <psi|psi> after orth: sparse=$(inner(psi_sp_o,psi_sp_o))  dense=$(inner(psi_d_o,psi_d_o))")
+        println("  E after orth: sparse=$(real(inner(psi_sp_o',H_sp,psi_sp_o)/inner(psi_sp_o,psi_sp_o)))  dense=$(real(inner(psi_d_o',H_d,psi_d_o)/inner(psi_d_o,psi_d_o)))")
+
+        println("\n  ProjMPO matvec <phi|H_eff|phi>/<phi|phi> at bond 1:")
+        PH_sp = position!(ProjMPO(H_sp), psi_sp_o, 1)
+        PH_d  = position!(ProjMPO(H_d),  psi_d_o,  1)
+        phi_sp = psi_sp_o[1] * psi_sp_o[2];  phi_d = psi_d_o[1] * psi_d_o[2]
+        Hphi_sp = product(PH_sp, phi_sp);     Hphi_d = product(PH_d, phi_d)
+        r_sp = scalar(dag(phi_sp)*Hphi_sp)/scalar(dag(phi_sp)*phi_sp)
+        r_d  = scalar(dag(phi_d) *Hphi_d) /scalar(dag(phi_d) *phi_d)
+        println("    sparse=$(real(r_sp))  dense=$(real(r_d))  |diff|=$(abs(r_sp-r_d))")
+
+        println("\n  Right-isometry check (densified tensors, all bonds):")
+        for (lbl, psi_x) in (("sparse_o", psi_sp_o), ("dense_o", psi_d_o))
+            for i in 2:length(psi_x)
+                lb = commoninds(psi_x[i-1], psi_x[i])
+                T_d = SparseBackends.to_dense_itensors_unfused(psi_x[i])
+                Td  = prime(dag(T_d), lb...)
+                E   = T_d * Td
+                Cl = combiner(lb...; tags="bL");  Cr = combiner(prime.(lb)...; tags="bR")
+                Em = Array(E*Cl*Cr, combinedind(Cl), combinedind(Cr))
+                D  = ITensors.dim(combinedind(Cl))
+                println("    $lbl psi[$i] iso_err=$(round(norm(Em - Matrix{ComplexF64}(I,D,D)); sigdigits=4))  D=$D")
+            end
+        end
+
+        println("\n" * "="^70)
+        println("VERBOSE Section 2: Site-by-site H comparison")
+        println("="^70)
+        for j in 1:length(H_sp)
+            hs = ITensors.has_external_storage(H_sp[j]) ? SparseBackends.to_dense_itensors(H_sp[j]) : H_sp[j]
+            hd = H_d[j]
+            if issetequal(inds(hs), inds(hd))
+                println("  Site $j: |H_sp - H_d| = $(norm(hs - hd))")
+            else
+                println("  Site $j: index mismatch")
+            end
+        end
+        println("  <psi0|H_sparse|psi0> = $(inner(psi_sp', H_sp, psi_sp))")
+        println("  <psi0|H_dense|psi0>  = $(inner(psi_d',  H_d,  psi_d))")
+        println("="^70 * "\n")
+    end
     println("Setup time: $(round(t_setup, digits=1))s")
     println("psi_sp initial REAL linkdims = ", real_linkdims(psi_sp))
     println("psi_d  initial linkdims      = ", real_linkdims(psi_d))

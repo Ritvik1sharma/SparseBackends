@@ -260,5 +260,26 @@ let
     println("  eigsolve(M⁻¹ H_eff) E         = ", E_k)
     println("  |E_k - E_dense|               = ", abs(E_k - E_dense))
     println("  info: ", info_k)
+
+    # --- Section: contraction-kernel cross-check (absorbed from test_eigsolve_kernel.jl) ---
+    # Compute ⟨psi|H|psi⟩ in four storage combinations to isolate any BS×BS or BS×dense bug.
+    println("\n" * "="^60)
+    println("Section: ⟨psi|H|psi⟩ cross-check (sparse/dense H × sparse/dense ψ)")
+    println("="^60)
+    densify_T(T::ITensor) = ITensors.has_external_storage(T) ? SparseBackends.to_dense_itensors_unfused(T) : T
+    densify_M(M) = typeof(M)(length(M); [densify_T(M[i]) for i in 1:length(M)]...)
+    psi_sp_ref = orthogonalize(psi_sp, 1)
+    H_sp_ref   = H_sparse
+    H_dn_ref   = densify_M(H_sparse)
+    psi_dn_ref = densify_M(psi_sp_ref)
+    E_sp_sp = real(inner(psi_sp_ref', H_sp_ref, psi_sp_ref))
+    E_sp_dn = real(inner(psi_sp_ref', H_dn_ref, psi_sp_ref))
+    E_dn_sp = real(inner(psi_dn_ref', H_sp_ref, psi_dn_ref))
+    E_dn_dn = real(inner(psi_dn_ref', H_dn_ref, psi_dn_ref))
+    println("  sparse H × sparse ψ : E = $E_sp_sp")
+    println("  dense  H × sparse ψ : E = $E_sp_dn   diff = $(abs(E_sp_sp - E_sp_dn))")
+    println("  sparse H × dense  ψ : E = $E_dn_sp   diff = $(abs(E_sp_sp - E_dn_sp))")
+    println("  dense  H × dense  ψ : E = $E_dn_dn   diff = $(abs(E_sp_sp - E_dn_dn))")
+    println("All four should agree within rounding. Any large discrepancy localises a BS contraction bug.")
 end
 nothing

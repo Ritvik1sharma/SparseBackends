@@ -3,6 +3,11 @@
 # Warmup: 2 sweeps ramping to maxdim=40 (JIT compile + bond growth).
 # Profile: n_prof_sweeps sweeps at maxdim=40 with reset timers, per-sweep GC stats.
 # Reports ITensorMPS.PROJMPO_TIMER and SparseBackends.TIMER.
+#
+# Verbose flag (head-to-head timing with dense):
+#   BENCH_TIMERS=1  — after the sparse profile, also run dense DMRG with the same
+#                     warmup+timer machinery and print a JIT-excluded sparse/dense
+#                     wall-time ratio.  Set DMRG_NO_WARMUP=1 to skip the JIT warmup.
 using SparseBackends, ITensors, ITensorMPS
 using TimerOutputs: reset_timer!, print_timer
 using Random
@@ -82,5 +87,35 @@ let
     print_timer(ITensorMPS.PROJMPO_TIMER)
     println("\n========== SparseBackends.TIMER (cumulative over $n_prof sweeps) ==========")
     print_timer(SparseBackends.TIMER)
+
+    # --- BENCH_TIMERS=1: head-to-head dense comparison with JIT-excluded timing ---
+    if get(ENV, "BENCH_TIMERS", "0") == "1"
+        println("\n========== BENCH_TIMERS: head-to-head sparse vs dense (JIT excluded) ==========")
+        H_dense = MPO([SparseBackends.to_dense_itensors_unfused(T) for T in H_sp])
+        psi_dense0 = MPS([SparseBackends.to_dense_itensors_unfused(T) for T in psi_warm])
+
+        do_warmup = get(ENV, "DMRG_NO_WARMUP", "0") != "1"
+
+        function timed_run(label, H, psi)
+            if do_warmup
+                println("  [$label] JIT warmup (1 sweep, results discarded)...")
+                sw0 = Sweeps(1); setmaxdim!(sw0, 40); setcutoff!(sw0, 1e-10)
+                try dmrg(H, deepcopy(psi); nsweeps=1, maxdim=[40], cutoff=1e-10,
+                         outputlevel=0, use_early_exit=false)
+                catch; end
+            end
+            reset_timer!(ITensorMPS.PROJMPO_TIMER)
+            reset_timer!(SparseBackends.TIMER)
+            GC.gc(); GC.gc()
+            sw = Sweeps(n_prof); setmaxdim!(sw, 40); setmindim!(sw, 1); setcutoff!(sw, 1e-10)
+            wall = @elapsed dmrg(H, psi, sw; outputlevel=0, use_early_exit=false)
+            println("  [$label] JIT-excluded wall = $(round(wall; digits=3))s")
+            return wall
+        end
+
+        t_sp = timed_run("SPARSE", H_sp, psi_warm)
+        t_d  = timed_run("DENSE",  H_dense, psi_dense0)
+        println("  ratio sparse/dense = $(round(t_sp/t_d; digits=3))  (want < 1)")
+    end
 end
 nothing
