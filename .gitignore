@@ -1,0 +1,6 @@
+*.txt
+results/*
+test_archive/*
+auto_archived/
+logs/
+*/logs/

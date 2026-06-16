@@ -407,13 +407,6 @@ function blocksparse_svd_channel_aware_fixed(
     maxdim::Int   = typemax(Int),
     mindim::Int   = 1,
     cutoff::Float64 = 0.0,
-    relax_iso_cap::Bool = false,   # If true, skip the cross-channel iso cap and
-                                    # let n_new_d = n_new_d_natural. Caller is
-                                    # responsible for absorbing the non-iso slack
-                                    # (e.g. via Path B's M correction). Used by
-                                    # the DMRG sweep path where eigsolve handles
-                                    # the gauge. Default false keeps strict iso
-                                    # for orthogonalize! callers.
 ) where {T, N, N2, P, K<:Integer}
     @assert prod(bond_factor_dims; init=1) == bond_sparse_dim ||
             (length(bond_factor_dims) == 1 && bond_factor_dims[1] == bond_sparse_dim) ||
@@ -678,7 +671,7 @@ function blocksparse_svd_channel_aware_fixed(
     n_active_chan = count(>(0), k_kept)
     mult_cap = max(1, fld(maxdim, max(1, n_active_chan)))
     n_new_d_natural_only = n_new_d_natural
-    n_new_d = relax_iso_cap ? n_new_d_natural : min(n_new_d_natural, mult_cap)
+    n_new_d = min(n_new_d_natural, mult_cap)
     # Diagnostic accumulators (read by callers via TIMER/env). dropped_by_cap:
     # SVs that the global top-maxdim selection kept but the per-channel cap
     # then dropped. dropped_truncerr_cap: their squared-SV sum (already added
@@ -733,6 +726,19 @@ function blocksparse_svd_channel_aware_fixed(
                 k_kept[bi] = n_new_d
             end
         end
+    end
+
+    if get(ENV, "SB_SV_REPORT", "0") == "1"
+        println(stdout, "[SV_REPORT_GROUPED] ortho=$ortho  maxdim=$maxdim  n_new_d=$n_new_d  mult_cap=$mult_cap  bond_sparse_dim=$bond_sparse_dim  n_active_chan=$n_active_chan")
+        for bi in eachindex(block_svds)
+            c_new = block_svds[bi][1]
+            S_i   = block_svds[bi][3]
+            k     = k_kept[bi]
+            kept_str    = (k > 0 && k <= length(S_i)) ? string(S_i[k])   : "-"
+            dropped_str = (k+1 <= length(S_i))        ? string(S_i[k+1]) : "-"
+            println(stdout, "  cM=$c_new: kept $k/$(length(S_i))  smallest_kept=$kept_str  largest_dropped=$dropped_str")
+        end
+        flush(stdout)
     end
 
     NU  = (nls + 1) + (nld + 1)
@@ -836,13 +842,6 @@ function blocksparse_svd_channel_aware(
     maxdim::Int   = typemax(Int),
     mindim::Int   = 1,
     cutoff::Float64 = 0.0,
-    relax_iso_cap::Bool = false,   # If true, skip the cross-channel iso cap and
-                                    # let n_new_d = n_new_d_natural. Caller is
-                                    # responsible for absorbing the non-iso slack
-                                    # (e.g. via Path B's M correction). Used by
-                                    # the DMRG sweep path where eigsolve handles
-                                    # the gauge. Default false keeps strict iso
-                                    # for orthogonalize! callers.
 ) where {T, N, N2, P, K<:Integer}
     @assert prod(bond_factor_dims; init=1) == bond_sparse_dim ||
             (length(bond_factor_dims) == 1 && bond_factor_dims[1] == bond_sparse_dim) ||
@@ -988,7 +987,7 @@ function blocksparse_svd_channel_aware(
     n_active_chan = count(>(0), k_kept)
     mult_cap = max(1, fld(maxdim, max(1, n_active_chan)))
     n_new_d_natural_only = n_new_d_natural
-    n_new_d = relax_iso_cap ? n_new_d_natural : min(n_new_d_natural, mult_cap)
+    n_new_d = min(n_new_d_natural, mult_cap)
     # Diagnostic accumulators (read by callers via TIMER/env). dropped_by_cap:
     # SVs that the global top-maxdim selection kept but the per-channel cap
     # then dropped. dropped_truncerr_cap: their squared-SV sum (already added
@@ -1043,6 +1042,19 @@ function blocksparse_svd_channel_aware(
                 k_kept[bi] = n_new_d
             end
         end
+    end
+
+    if get(ENV, "SB_SV_REPORT", "0") == "1"
+        println(stdout, "[SV_REPORT_GROUPED] ortho=$ortho  maxdim=$maxdim  n_new_d=$n_new_d  mult_cap=$mult_cap  bond_sparse_dim=$bond_sparse_dim  n_active_chan=$n_active_chan")
+        for bi in eachindex(block_svds)
+            c_new = block_svds[bi][1]
+            S_i   = block_svds[bi][3]
+            k     = k_kept[bi]
+            kept_str    = (k > 0 && k <= length(S_i)) ? string(S_i[k])   : "-"
+            dropped_str = (k+1 <= length(S_i))        ? string(S_i[k+1]) : "-"
+            println(stdout, "  cM=$c_new: kept $k/$(length(S_i))  smallest_kept=$kept_str  largest_dropped=$dropped_str")
+        end
+        flush(stdout)
     end
 
     NU  = (nls + 1) + (nld + 1)

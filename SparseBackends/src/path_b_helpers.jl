@@ -83,7 +83,8 @@ function is_sparse_mps(psi)::Bool
   length(psi) == 0 && return false
   T = psi[1]
   ITensors.has_external_storage(T) || return false
-  return ITensors.get_external_storage(T) isa WrappedBlockSparse
+  s = ITensors.get_external_storage(T)
+  return s isa WrappedBlockSparse || s isa WrappedAliasedBlockSparse
 end
 
 # Single-side gram → Mhalf, Linv as BS ITensors restricted to phi's allowed
@@ -293,6 +294,33 @@ end
 # instead of the combined (bond_dim²)² matrix (~25600²) — ~2,000,000× fewer
 # eigen ops AND avoids the multi-GB densification of the combined M.
 function build_half_pair_single(G::ITensors.ITensor; rtol::Real=1e-10)
+  # Env override for the pseudo-inverse cutoff. The aliased gram M is
+  # structurally rank-deficient (dedup + channel structure → near-linearly-
+  # dependent directions), so the default rtol=1e-10 retains near-null
+  # eigenvalues whose 1/√λ blows up M⁻¹ and destabilises the Path-B eigsolve at
+  # large bond dim (cond(M) ~ 1e8–1e10 observed at md=40). A larger cutoff drops
+  # those null directions (textbook null-space-projected M^{-1/2}).
+  # Hardened default 1e-1 (2026-06): the aliased gram M is structurally
+  # rank-deficient. The dense-DMRG default (1e-10) keeps near-null eigenvalues
+  # whose 1/√λ blows up M⁻¹ and destabilises the Path-B eigsolve. An rtol of r
+  # is equivalent to capping the condition number of the KEPT block of M at 1/r
+  # (we drop every eigenvalue below r·maxλ, so cond(M_kept) ≤ 1/r and the worst
+  # amplification is 1/√λ_min ≤ √(1/r)/√maxλ). The N=12 md=40 KL scan shows the
+  # stable, converged band is rtol ∈ [~1e-3, ~7e-1] (cond_kept 1.4–1000); below
+  # ~1e-3 the eigsolve OSCILLATES and diverges (E rises from -17.16 to -5..-7),
+  # and rtol≥9e-1 begins over-truncating genuine DOF on marginal bonds. Within
+  # the band the energy is flat to the 5th digit, but rtol=1e-1 (cond_kept ≤ 10)
+  # is the empirical optimum: lowest E (-17.16104 vs -17.16046 at 1e-2), lowest
+  # final truncerr, and fastest convergence (plateau by sweep 3 vs sweep 5). The
+  # mechanism is conditioning, not variational-subspace: a tighter cond cap
+  # cleans up the marginal/redundant directions on the GRADED bonds (cond up to
+  # ~98 at md=40 — the spectrum is graded, not cleanly bimodal), so each local
+  # eigsolve is better conditioned and lands in a slightly better minimum.
+  # Harmless for canonical M=I (no eigenvalue is dropped). Overridable via
+  # BMF_MINV_RTOL. NOTE: revisit at larger md/N — if genuine DOF ever extend
+  # below 0.1·maxλ, the cond≤10 cap would over-truncate and rtol must be relaxed
+  # (staying above the ~1e-3 stability cliff).
+  rtol = parse(Float64, get(ENV, "BMF_MINV_RTOL", "1e-1"))
   G_inds = collect(ITensors.inds(G))
   if isempty(G_inds)
     # Scalar gram: pass-through. Both Mhalf and Linv are scalar 1.
@@ -313,6 +341,17 @@ function build_half_pair_single(G::ITensors.ITensor; rtol::Real=1e-10)
   tol  = real(rtol * maxλ)
   sqrt_λ     = [real(l) > tol ? sqrt(real(l))     : zero(real(TC)) for l in λ]
   inv_sqrt_λ = [real(l) > tol ? 1 / sqrt(real(l)) : zero(real(TC)) for l in λ]
+  # M-conditioning diagnostic (BMF_MINV_DIAG=1): the M⁻¹ correction is unstable
+  # when an eigenvalue sits just ABOVE the rtol threshold → huge 1/√λ. Log the
+  # spectrum so we can see if Linv blows up at large bond dim / many sweeps.
+  if get(ENV, "BMF_MINV_DIAG", "0") == "1"
+    kept    = [real(l) for l in λ if real(l) > tol]
+    n_drop  = length(λ) - length(kept)
+    minkept = isempty(kept) ? 0.0 : minimum(kept)
+    cond    = minkept > 0 ? maxλ / minkept : Inf
+    maxinv  = minkept > 0 ? 1 / sqrt(minkept) : Inf
+    println("[BMF_MINV_DIAG] d=$d  rtol=$(round(rtol,sigdigits=3))  maxλ=$(round(maxλ,sigdigits=4))  minkeptλ=$(round(minkept,sigdigits=4))  cond=$(round(cond,sigdigits=4))  n_dropped=$n_drop/$(length(λ))  max(1/√λ)=$(round(maxinv,sigdigits=4))")
+  end
   Ghalf_mat = V * LinearAlgebra.Diagonal(sqrt_λ)     * V'
   Linv_mat  = V * LinearAlgebra.Diagonal(inv_sqrt_λ) * V'
   Ghalf_mat = (Ghalf_mat + Ghalf_mat') / 2
@@ -342,7 +381,8 @@ function build_minv_half_pair_factored(Lgram::ITensors.ITensor,
                                        Rgram::ITensors.ITensor;
                                        rtol::Real=1e-10,
                                        phi_template::Union{Nothing,ITensors.ITensor}=nothing,
-                                       use_bs_restricted::Bool=false)
+                                       use_bs_restricted::Bool=false,
+                                       both_aliased::Bool=false)
   # When use_bs_restricted=true AND phi_template is BS, use equivalence-class
   # restricted BS storage → no recast in apply_minv_preserve_bs.
  @timeit SparseBackends.TIMER "build_minv_half_pair_factored" begin
@@ -369,6 +409,23 @@ function build_minv_half_pair_factored(Lgram::ITensors.ITensor,
         Linv_L  = wrap_dense_as_bs_via_template(Linv_L,  phi_template)
         Mhalf_R = wrap_dense_as_bs_via_template(Mhalf_R, phi_template)
         Linv_R  = wrap_dense_as_bs_via_template(Linv_R,  phi_template)
+      end
+    # ALIASED φ (case 2/4): relayout the dense factors as aliased carrying φ's
+    # {channel→prefix, mult→dense} split, so the M^{−1/2} apply produces a
+    # canonical output natively (channel in prefix) — no output hint, no forced
+    # fission. This removes the case-4 md=16 crossover at its source (the factor
+    # was fully dense ⇒ its channel landed in denseA ⇒ the no-hint fallback
+    # parked the output channel in the dense tail). Pure relayout, values
+    # bit-identical. Gated SB_ALIASED_MINV_WRAP (default ON for aliased φ);
+    # cases 1/3 have dense/BS φ and never enter this branch.
+    elseif both_aliased && get(ENV, "SB_ALIASED_MINV_WRAP", "1") == "1" && phi_template !== nothing &&
+       ITensors.has_external_storage(phi_template) &&
+       ITensors.get_external_storage(phi_template) isa WrappedAliasedBlockSparse
+      @timeit SparseBackends.TIMER "bmf.aliaswrap" begin
+        Mhalf_L = wrap_dense_as_aliased_via_template(Mhalf_L, phi_template)
+        Linv_L  = wrap_dense_as_aliased_via_template(Linv_L,  phi_template)
+        Mhalf_R = wrap_dense_as_aliased_via_template(Mhalf_R, phi_template)
+        Linv_R  = wrap_dense_as_aliased_via_template(Linv_R,  phi_template)
       end
     end
   end
@@ -445,6 +502,61 @@ function wrap_dense_as_bs_via_template(T::ITensors.ITensor,
             "  nkeys=", length(ow.blocksparse.keys))
   end
   return out
+end
+
+# Aliased analogue of wrap_dense_as_bs_via_template: relayout a dense factor
+# (Mhalf/Linv) as a WrappedAliasedBlockSparse carrying φ's {channel→prefix,
+# mult→dense} classification, keyed by Index id (φ's dense_inds). This is a PURE
+# RELAYOUT — every nonzero becomes its own trivial template (one template per
+# block, scalar=1, no dedup), so values are bit-identical to the dense factor;
+# only the prefix/dense split changes. It does NOT assume the metric is
+# block-diagonal in the channel: cross-channel coupling stays inside the dense
+# tail of each prefix block. With the channel axis classified into the prefix,
+# a subsequent aliased×aliased contract produces output with the channel in the
+# prefix WITHOUT needing an output hint — so the deferred-fission (fission=false)
+# pre-H apply stays canonical and no crossover occurs (the case-4 md=16 fix).
+function wrap_dense_as_aliased_via_template(T::ITensors.ITensor,
+                                            phi_template::ITensors.ITensor)
+  # Edge case: scalar / empty factor (boundary bond).
+  if length(ITensors.inds(T)) == 0
+    return T
+  end
+  pw = ITensors.get_external_storage(phi_template)
+  phi_dense_ids = Set(ITensors.id(I) for I in dense_inds(pw))
+  inds_T = collect(ITensors.inds(T))
+  sparse_inds = ITensors.Index[]
+  dense_list  = ITensors.Index[]
+  for I in inds_T
+    if ITensors.id(I) in phi_dense_ids
+      push!(dense_list, I)
+    else
+      push!(sparse_inds, I)
+    end
+  end
+  # No sparse axes ⇒ nothing to enumerate as a prefix; leave dense.
+  if isempty(sparse_inds)
+    return T
+  end
+  inds_reordered = (sparse_inds..., dense_list...)
+  N   = length(inds_reordered)
+  N2  = length(dense_list)
+  arr = Array(T, inds_reordered...)
+  TC  = eltype(arr)
+  dims = ntuple(i -> ITensors.dim(inds_reordered[i]), Val(N))
+  # Build trivially-aliased storage (one template per nonzero block), mirroring
+  # the WrappedAliasedBlockSparse(T, denseLinks) constructor body.
+  ali = AliasedBlockSparse{TC,N,N2}(dims)
+  bs  = blocksparse_from_dense(arr, Val(N2))
+  for (i, key) in enumerate(bs.keys)
+    ali.n_templates += 1
+    blk_off = (bs.ids[i] - 1) * bs.blksize
+    append!(ali.templates, @view bs.data[blk_off+1 : blk_off+bs.blksize])
+    push!(ali.keys,      key)
+    push!(ali.alias_ids, ali.n_templates)
+    push!(ali.scalars,   one(TC))
+  end
+  return ITensors._itensor_from_external_storage(
+      WrappedAliasedBlockSparse(ali, Tuple(inds_reordered)))
 end
 
 # Right Gram environment at bond b: contract psi[b+2..N] · dag(psi[b+2..N])
@@ -925,6 +1037,8 @@ function recast_to_template(z::ITensors.ITensor, template::ITensors.ITensor)
     Cw = ITensors.get_external_storage(z)
     if Cw isa WrappedBlockSparse && Tw isa WrappedBlockSparse
       return ITensors._itensor_from_external_storage(recast_bs_to_template(Cw, Tw))
+    elseif Cw isa WrappedAliasedBlockSparse && Tw isa WrappedAliasedBlockSparse
+      return ITensors._itensor_from_external_storage(recast_aliased_to_template(Cw, Tw))
     end
   end
   return z
@@ -945,7 +1059,14 @@ function apply_minv_no_recast(Minv::ITensors.ITensor, y::ITensors.ITensor)
 end
 
 const _AMP_DBG_BUDGET = Ref(4)
-function apply_minv_preserve_bs(Minv::ITensors.ITensor, y::ITensors.ITensor, template::ITensors.ITensor)
+# `fission` (Lever 2 / SB_ALIASED_MINV_DEFER): when false, contract WITHOUT the φ-template
+# hint (output stays in its natural, big-block classification — no per-channel s'-fission)
+# and skip the schema recast. Used for the INTERMEDIATE apply in apply_half (its result is
+# consumed by the next apply, which re-establishes φ's schema), so the apply_half OUTPUT is
+# unchanged while the costly fission on the first apply is avoided (mirrors the matvec
+# hint-lastonly win for the M⁻¹ path). When true (default): φ-schema fission + recast as before.
+function apply_minv_preserve_bs(Minv::ITensors.ITensor, y::ITensors.ITensor, template::ITensors.ITensor;
+                                fission::Bool=true)
  @timeit SparseBackends.TIMER "apply_minv_preserve_bs" begin
   if length(ITensors.inds(Minv)) == 0
     return y
@@ -970,8 +1091,31 @@ function apply_minv_preserve_bs(Minv::ITensors.ITensor, y::ITensors.ITensor, tem
       end
     end
   end
-  z = @timeit SparseBackends.TIMER "amp.cpb" contract_preserve_bs(Minv, y; template=template)
+  # SB_MINV_DIAG=1: trace the prefix/dense split of the M⁻¹-apply output at each
+  # stage for ALIASED tensors, to localize where φ's canonical split is lost
+  # (channel moved into the dense tail). Prints P / prefix / dense per stage.
+  _minv_diag = get(ENV, "SB_MINV_DIAG", "0") == "1" && _AMP_DBG_BUDGET[] > 0
+  _mdump = function(lbl, T)
+      if ITensors.has_external_storage(T) && T.tensor.data isa WrappedAliasedBlockSparse
+          w = T.tensor.data; P = SparseBackends._abs_head_len(w); N = ndims(w.aliased)
+          _tg(I) = (ITensors.dim(I), string(ITensors.tags(I)), ITensors.plev(I))
+          println("   [MINV_DIAG ", lbl, "] P=$P  prefix=", [_tg(w.inds[i]) for i in 1:P],
+                  "  dense=", [_tg(w.inds[i]) for i in P+1:N])
+      else
+          println("   [MINV_DIAG ", lbl, "] storage=", ITensors.has_external_storage(T) ? string(typeof(T.tensor.data)) : "dense")
+      end
+  end
+  if _minv_diag
+      _AMP_DBG_BUDGET[] -= 1
+      println("[MINV_DIAG apply] Minv inds=", [(ITensors.dim(I), string(ITensors.tags(I)), ITensors.plev(I)) for I in ITensors.inds(Minv)])
+      _mdump("y(in)", y); _mdump("template", template)
+  end
+  schema_dbg("apply_minv INPUT y", y)
+  z = @timeit SparseBackends.TIMER "amp.cpb" contract_preserve_bs(Minv, y; template = (fission ? template : nothing))
+  _minv_diag && _mdump("z after contract_preserve_bs", z)
+  schema_dbg("apply_minv z = Minv·y", z)
   z = @timeit SparseBackends.TIMER "amp.replaceprime" ITensors.replaceprime(z, 1 => 0; tags="Link")
+  _minv_diag && _mdump("z after replaceprime", z)
   if do_dbg
     println("  AFTER contract+replaceprime, z inds: ", ITensors.inds(z))
     if ITensors.has_external_storage(z)
@@ -986,7 +1130,7 @@ function apply_minv_preserve_bs(Minv::ITensors.ITensor, y::ITensors.ITensor, tem
       println("  z has NO external storage (plain ITensor)")
     end
   end
-  if ITensors.has_external_storage(z) && ITensors.has_external_storage(template)
+  if fission && ITensors.has_external_storage(z) && ITensors.has_external_storage(template)
     Tw = ITensors.get_external_storage(template)
     Cw = ITensors.get_external_storage(z)
     if Cw isa WrappedBlockSparse && Tw isa WrappedBlockSparse
@@ -1007,10 +1151,155 @@ function apply_minv_preserve_bs(Minv::ITensors.ITensor, y::ITensors.ITensor, tem
           println("  AFTER recast, z storage: BS P=", length(zw.inds) - length(dense_inds(zw)),
                   " N2=", length(dense_inds(zw)), " blksize=", zw.blocksparse.blksize)
         end
-        _AMP_DBG_BUDGET[] -= 1
       end
+    elseif Cw isa WrappedAliasedBlockSparse && Tw isa WrappedAliasedBlockSparse
+      # Aliased recast: align Hv's inds order to phi-template's inds order
+      # so subsequent Path-B apply_minv calls see consistent classification.
+      z = @timeit SparseBackends.TIMER "amp.recast2_aliased" ITensors._itensor_from_external_storage(recast_aliased_to_template(Cw, Tw))
+      _minv_diag && _mdump("z after recast_aliased_to_template", z)
     end
   end
+  _minv_diag && _mdump("z RETURNED", z)
   return z
+ end
+end
+
+# ------------------------------------------------------------------
+# Generalized Rayleigh-Ritz local eigensolve (BMF_RAYLEIGH_RITZ path).
+#
+# Solves the local generalized problem  H_eff·φ = E·M·φ  WITHOUT ever applying
+# M^{±1/2} to a vector (the operation that discards aliasing in the B_op/A_op
+# paths). It projects onto a small aliased Krylov subspace built only from H·v,
+# forms tiny k×k matrices H_small / M_small via SCALAR inner products (M applied
+# with the RAW Lgram/Rgram — no square root, no BMF_MINV_RTOL pseudoinverse), and
+# solves the k×k generalized eig densely with a per-block null projection. The
+# Ritz vector φ_new = Σ cᵢ vᵢ is an aliased linear combo of φ-schema vectors, so
+# it stays aliased (combos of same-(P,N2)-schema aliased tensors never densify).
+# ------------------------------------------------------------------
+
+# Pick the eigenvalue index matching KrylovKit's `which` selector. DMRG ground
+# state uses :SR (smallest real) → most-negative algebraic eigenvalue.
+function _rr_select_index(vals, which::Symbol)
+    rv = real.(vals)
+    if which in (:LR, :LA, :largest, :LM)
+        return argmax(rv)
+    else                      # :SR, :SA, :smallest, default
+        return argmin(rv)
+    end
+end
+
+# Solve H_small c = λ M_small c, k×k, with M_small symmetric PSD but possibly
+# rank-deficient (M is structurally rank-deficient for aliased ψ). Project out
+# M_small's near-null directions (per-block analog of the per-side pseudoinverse),
+# whiten, solve the reduced standard symmetric eig, and recover c in the original
+# basis (already M-normalized: cᵀ·M_small·c = 1). `rtol` is BMF_RR_RTOL.
+function solve_small_geneig(Hs::AbstractMatrix, Ms::AbstractMatrix, which::Symbol; rtol::Real=1e-8)
+    k = size(Hs, 1)
+    Hsym = LinearAlgebra.Hermitian((Hs + Hs') / 2)
+    Msym = LinearAlgebra.Hermitian((Ms + Ms') / 2)
+    Fm = LinearAlgebra.eigen(Msym)            # ascending eigenvalues
+    mu = Fm.values
+    U  = Fm.vectors
+    mumax = isempty(mu) ? 0.0 : maximum(mu)
+    if mumax <= 0                              # degenerate M_small → plain eig of Hs
+        Fh = LinearAlgebra.eigen(Hsym)
+        sel = _rr_select_index(Fh.values, which)
+        return (real(Fh.values[sel]), Fh.vectors[:, sel])
+    end
+    keep = findall(>(rtol * mumax), mu)
+    UK = U[:, keep]
+    invsqrt = LinearAlgebra.Diagonal(1 ./ sqrt.(mu[keep]))
+    B = invsqrt * (UK' * (Matrix(Hsym) * UK)) * invsqrt
+    B = LinearAlgebra.Hermitian((B + B') / 2)
+    Fb = LinearAlgebra.eigen(B)
+    sel = _rr_select_index(Fb.values, which)
+    lam = real(Fb.values[sel])
+    c = UK * (invsqrt * Fb.vectors[:, sel])
+    return (lam, c)
+end
+
+# Driver. `Hop` is the H_eff apply closure (built in dmrg.jl as
+# v -> recast_to_phi(product(PH, v)) — must NOT be built here: SparseBackends
+# does not depend on ITensorMPS). `phi` is the current local tensor (the schema
+# template + starting vector). Lgram/Rgram are the raw bond grams. Returns
+# (vals, vecs) matching the B_op/A_op contract: vals[1] real, vecs[1] aliased.
+function rayleigh_ritz_local_eigsolve(Hop::Function, phi::ITensors.ITensor,
+        Lgram::ITensors.ITensor, Rgram::ITensors.ITensor;
+        which::Symbol = :SR, tol::Real = 1e-12,
+        krylovdim::Int = 8, maxiter::Int = 100,
+        rtol::Real = 1e-8, b::Int = 0, ha::Int = 0, sw::Int = 0)
+ @timeit SparseBackends.TIMER "rayleigh_ritz" begin
+    # M·v via RAW gram (no M^{1/2}). The result is consumed only by a scalar
+    # `inner`, so any transient densification here does not enter the basis.
+    Mop = v -> apply_minv_preserve_bs(Lgram, apply_minv_preserve_bs(Rgram, v, phi), phi)
+    _ip(a, c) = real(ITensors.inner(a, c))
+    _nrm(a) = sqrt(max(_ip(a, a), 0.0))
+    orth_tol = 1e-12
+    dbg = get(ENV, "SB_RR_DBG", "0") == "1"
+    kdim = max(krylovdim, 2)
+
+    n0 = _nrm(phi)
+    n0 == 0 && return ([0.0], [phi])
+    x = (1.0 / n0) * phi
+    V = ITensors.ITensor[x]
+    lam = 0.0
+    lam_prev = Inf
+
+    for outer_it in 1:maxiter
+        # ── grow block to kdim with DGKS double re-orthogonalization (standard
+        #    inner product — keeps φ-schema combos aliased; M handled in the
+        #    k×k solve) ──
+        while length(V) < kdim
+            w = Hop(V[end])
+            for _pass in 1:2, u in V
+                w = w - _ip(u, w) * u
+            end
+            nw = _nrm(w)
+            nw < orth_tol && break              # breakdown → block complete
+            push!(V, (1.0 / nw) * w)
+        end
+        k = length(V)
+
+        # ── small matrices: H_small / M_small via scalar inner products ──
+        HV = [Hop(V[j]) for j in 1:k]
+        MV = [Mop(V[j]) for j in 1:k]
+        Hs = Array{Float64}(undef, k, k)
+        Ms = Array{Float64}(undef, k, k)
+        for i in 1:k, j in 1:k
+            Hs[i, j] = _ip(V[i], HV[j])
+            Ms[i, j] = _ip(V[i], MV[j])
+        end
+
+        lam, c = solve_small_geneig(Hs, Ms, which; rtol=rtol)
+
+        # ── Ritz vector + its H/M images via the SAME coefficients ──
+        x  = c[1] * V[1]
+        Hx = c[1] * HV[1]
+        Mx = c[1] * MV[1]
+        for j in 2:k
+            x  = x  + c[j] * V[j]
+            Hx = Hx + c[j] * HV[j]
+            Mx = Mx + c[j] * MV[j]
+        end
+
+        # ── generalized residual r = H x - λ M x ──
+        r = Hx - lam * Mx
+        rnorm = _nrm(r)
+        if dbg
+            println("[RR b=$b ha=$ha sw=$sw] it=$outer_it k=$k lam=$lam rnorm=$rnorm")
+            flush(stdout)
+        end
+        if rnorm < tol || abs(lam - lam_prev) < tol
+            return ([lam], [x])
+        end
+        lam_prev = lam
+
+        # ── thick restart: new basis = {Ritz vector, residual direction} ──
+        rr = r - _ip(x, r) * x
+        nrr = _nrm(rr)
+        V = nrr < orth_tol ? ITensors.ITensor[x] :
+                             ITensors.ITensor[x, (1.0 / nrr) * rr]
+    end
+    return ([isfinite(lam_prev) ? lam_prev : lam], [x])
  end
 end

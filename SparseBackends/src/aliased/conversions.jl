@@ -92,3 +92,106 @@ function rekey(A::AliasedBlockSparse{T,N,N2,P,K}, ::Type{K2}; check::Bool=true) 
         new_keys, copy(A.alias_ids), copy(A.scalars),
     )
 end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# fuse_sparse_axes / fuse_dense_axes! — native aliasing-preserving fusion.
+# Mirrors blocksparse/conversions.jl::fuse_sparse_axes / fuse_dense_axes!.
+# Prefix fuse is a pure key rewrite (templates untouched).
+# Dense-tail fuse permutes templates so the two tail axes become adjacent
+# (cost = n_templates, not n_blocks), then collapses their dims.
+# ─────────────────────────────────────────────────────────────────────────────
+
+function fuse_sparse_axes(
+    A::AliasedBlockSparse{T,N,N2,P,K},
+    ax1::Int, ax2::Int,
+) where {T,N,N2,P,K}
+    (1 <= ax1 <= P) || throw(ArgumentError("ax1 must be in sparse head 1:$P"))
+    (1 <= ax2 <= P) || throw(ArgumentError("ax2 must be in sparse head 1:$P"))
+    ax1 == ax2 && throw(ArgumentError("axes must be distinct"))
+    a1, a2 = min(ax1, ax2), max(ax1, ax2)
+    dims = A.dims
+    d1, d2 = dims[a1], dims[a2]
+    newdims = ntuple(i -> begin
+        if i < a2
+            i == a1 ? d1 * d2 : dims[i]
+        else
+            dims[i + 1]
+        end
+    end, Val(N - 1))
+    nblocks = length(A.keys)
+    newkeys = Vector{NTuple{P-1,K}}(undef, nblocks)
+    @inbounds for i in 1:nblocks
+        k = A.keys[i]
+        fused = (k[a2] - 1) * d1 + k[a1]
+        newkeys[i] = ntuple(j -> begin
+            if j < a2
+                j == a1 ? K(fused) : k[j]
+            else
+                k[j + 1]
+            end
+        end, Val(P - 1))
+    end
+    # Templates, alias_ids, scalars, blksize all untouched.
+    return AliasedBlockSparse{T,N-1,N2,P-1,K}(
+        newdims, A.blksize, copy(A.templates), A.n_templates,
+        newkeys, copy(A.alias_ids), copy(A.scalars),
+    )
+end
+
+function fuse_dense_axes!(
+    A::AliasedBlockSparse{T,N,N2,P,K},
+    ax1::Int, ax2::Int,
+) where {T,N,N2,P,K}
+    (P + 1 <= ax1 <= N) || throw(ArgumentError("ax1 must be in dense tail $(P+1):$N"))
+    (P + 1 <= ax2 <= N) || throw(ArgumentError("ax2 must be in dense tail $(P+1):$N"))
+    ax1 == ax2 && throw(ArgumentError("axes must be distinct"))
+    a1, a2 = min(ax1, ax2), max(ax1, ax2)
+    p1, p2 = a1 - P, a2 - P
+    # If the two tail axes are not adjacent, permute templates so they are.
+    # Cost = n_templates template permutations (not n_blocks), via the
+    # template-aware permutedims defined in aliased/storage.jl.
+    if p2 != p1 + 1
+        perm = collect(1:N)
+        # Move global axis a2 to position a1+1 (within tail; no cross of P boundary).
+        target_pos = a1 + 1
+        ax_id = perm[a2]
+        deleteat!(perm, a2)
+        insert!(perm, target_pos, ax_id)
+        A = permutedims(A, perm)
+        a2 = a1 + 1
+    end
+    dims = A.dims
+    newdims = ntuple(i -> begin
+        if i < a2
+            i == a1 ? dims[a1] * dims[a2] : dims[i]
+        else
+            dims[i + 1]
+        end
+    end, Val(N - 1))
+    # blksize and templates layout collapse: the two adjacent tail dims merge,
+    # so the flat template buffer is unchanged in memory (column-major), only
+    # the logical shape changes.
+    return AliasedBlockSparse{T,N-1,N2-1,P,K}(
+        newdims, A.blksize, copy(A.templates), A.n_templates,
+        copy(A.keys), copy(A.alias_ids), copy(A.scalars),
+    )
+end
+
+function fuse_two_axes!(
+    A::AliasedBlockSparse{T,N,N2,P,K},
+    ax1::Int, ax2::Int,
+) where {T,N,N2,P,K}
+    (1 <= ax1 <= N && 1 <= ax2 <= N) || throw(ArgumentError("axes must be in 1:$N"))
+    ax1 == ax2 && throw(ArgumentError("axes must be distinct"))
+    in_sparse1 = ax1 <= P
+    in_sparse2 = ax2 <= P
+    if in_sparse1 && in_sparse2
+        return fuse_sparse_axes(A, ax1, ax2)
+    elseif (!in_sparse1) && (!in_sparse2)
+        return fuse_dense_axes!(A, ax1, ax2)
+    else
+        # Mixed prefix/tail: not handled natively. Caller (fuse_axes! on
+        # WrappedAliasedBlockSparse) demotes to BlockSparse for this case.
+        throw(ArgumentError("Cannot fuse across sparse-head (1:$P) and dense-tail ($(P+1):$N) axes; demote to BlockSparse first"))
+    end
+end
