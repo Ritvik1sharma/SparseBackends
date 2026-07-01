@@ -3,9 +3,7 @@
 # only template numeric data updates). Compared against the bare-H dense
 # baseline run in ../test_sparse_psi/test_profile_bareh.jl.
 #
-# Gated: requires SB_ALIASED_ENABLE=1 to run (matches test_check_working_aliased
-# convention). Other workflows are untouched.
-ENV["BMF_ISO_PATH"] = "1"
+# Other workflows are untouched.
 using SparseBackends, ITensors, ITensorMPS
 using TimerOutputs: reset_timer!, print_timer
 using Random
@@ -13,12 +11,6 @@ using ArgParse
 using Printf
 
 include("../test_sparse_psi/utils.jl")
-
-const _ALIASED_ENABLE = get(ENV, "SB_ALIASED_ENABLE", "0") == "1"
-if !_ALIASED_ENABLE
-    println("[SB_ALIASED_ENABLE != 1] Aliased path is gated off — set SB_ALIASED_ENABLE=1 to run.")
-    exit(0)
-end
 
 function parse_command_line()
     s = ArgParseSettings()
@@ -178,7 +170,7 @@ function dmrg_with_per_sweep_report(H, psi0, maxdim_schedule::Vector{Int};
     for (i, md) in enumerate(maxdim_schedule)
         sw = Sweeps(1)
         setmaxdim!(sw, md); setmindim!(sw, mindim); setcutoff!(sw, cutoff)
-        t = @elapsed (E, psi) = dmrg(H, psi, sw; outputlevel=1, use_early_exit=false)
+        t = @elapsed (E, psi) = dmrg(H, psi, sw; outputlevel=1, use_early_exit=false, run_mode=:iso)
         println("  [$label sweep $i / md=$md] $(round(t, digits=2))s  E=$E")
         report_state("after sweep $i", psi, E; verbose=(i == length(maxdim_schedule)))
         check_aliased_invariant(psi; label="after sweep $i")

@@ -1,5 +1,4 @@
 # Inspect P_sparse structure: bond dims, channel labels, per-channel block norms.
-ENV["BMF_ISO_PATH"] = "1"
 using SparseBackends, ITensors, ITensorMPS
 using LinearAlgebra
 using Random

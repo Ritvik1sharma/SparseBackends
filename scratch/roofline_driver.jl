@@ -4,7 +4,6 @@
 #              in contract_shared! (covers H-matvec AND M⁻¹ apply). Kernel time
 #              comes from SparseBackends.TIMER (printed). achieved GFLOP/s =
 #              FLOPs / kernel_contract_time;  AI = FLOPs / bytes.
-ENV["SB_ALIASED_ENABLE"] = "1"; ENV["BMF_ISO_PATH"] = "0"; ENV["BMF_APPLY_MINV"] = "1"
 ENV["SB_ROOFLINE"]  = "1"   # single timing flag: also reports CAS redundancy stats
 
 using SparseBackends, ITensors, ITensorMPS

@@ -22,11 +22,12 @@
 # ── Path / correctness ────────────────────────────────────────────────────────
 # Aliased ψ is structurally NON-iso (templates shared across bond-channel values
 # ⇒ off-diagonal L†L). So this MUST use Path-B (M-corrected generalized eigsolve),
-# NOT the iso path. The validated aliased-ψ recipe is the 5-gate fix from
-# ../test_aliased_psi/README.md ("RESOLVED"):
-#   BMF_ISO_PATH=0  BMF_APPLY_MINV=1  BMF_BOP_PROJECT=1  BMF_MINV_RTOL=1e-2
-#   SB_ALIASED_MINV_HINT=1  SB_ALIASED_NATIVE_FISSION=1  SB_ALIASED_PERCM_CAP=1
-#   SB_USE_QR=1  SB_BALANCED_OWNERSHIP=1  SB_ADAPTIVE_RANK=1
+# NOT the iso path — Path-B is dmrg()'s default run_mode=:bop_aliased, so no
+# explicit run_mode is needed here. The validated aliased-ψ recipe is the 5-gate
+# fix from ../test_aliased_psi/README.md ("RESOLVED"):
+#   BMF_BOP_PROJECT=1  BMF_MINV_RTOL=1e-2  SB_ALIASED_NATIVE_FISSION=1
+#   SB_ALIASED_PERCM_CAP=1  SB_USE_QR=1  SB_BALANCED_OWNERSHIP=1  SB_ADAPTIVE_RANK=1
+# (SB_ALIASED_MINV_HINT dropped 2026-06: now hardcoded on unconditionally.)
 # These are defaulted ON below (overridable from the environment).
 #
 # ⚠ STATUS: this aliased-ψ × aliased-PHP combination is NEW and was NOT validated
@@ -37,19 +38,12 @@
 # in-script dense-PHP reference |ΔE| check passes at N=2 and again at a larger N.
 # Keep the `--dense-ref` correctness check ON.
 #
-# Gated: requires SB_ALIASED_ENABLE=1.
-#
 # Example (full validated-aliased-ψ gate set; small smoke test):
-#   SB_ALIASED_ENABLE=1 \
-#     julia --project=.. test_sparse_ham_psi_kl.jl --N-plaq 2 --maxdim 4 --n-sweeps 3
+#   julia --project=.. test_sparse_ham_psi_kl.jl --N-plaq 2 --maxdim 4 --n-sweeps 3
 
 # ── Default the aliased-ψ Path-B gate set ON (all overridable). ────────────────
-ENV["SB_ALIASED_ENABLE"]        = get(ENV, "SB_ALIASED_ENABLE", "1")
-ENV["BMF_ISO_PATH"]             = "0"                                   # Path-B — required for aliased ψ.
-ENV["BMF_APPLY_MINV"]           = get(ENV, "BMF_APPLY_MINV", "1")       # A = M⁻¹·H_eff.
 ENV["BMF_BOP_PROJECT"]          = get(ENV, "BMF_BOP_PROJECT", "1")      # B = M⁻¹ᐟ²·H_eff·M⁻¹ᐟ², range(M) projection.
 ENV["BMF_MINV_RTOL"]            = get(ENV, "BMF_MINV_RTOL", "1e-2")     # aggressive pseudo-inverse cutoff.
-ENV["SB_ALIASED_MINV_HINT"]     = get(ENV, "SB_ALIASED_MINV_HINT", "1")     # classification-preserving M⁻¹ apply.
 ENV["SB_ALIASED_NATIVE_FISSION"]= get(ENV, "SB_ALIASED_NATIVE_FISSION", "1")# dedup-preserving fission.
 ENV["SB_ALIASED_PERCM_CAP"]     = get(ENV, "SB_ALIASED_PERCM_CAP", "1")     # honest BD ≤ maxdim.
 ENV["SB_USE_QR"]                = get(ENV, "SB_USE_QR", "1")
@@ -82,12 +76,6 @@ BLAS.set_num_threads(1)
 
 include("../test_sparse_psi/utils.jl")          # clean!, mpo_memory_bytes
 include("../test_sparse_ham/aliased_helpers.jl")# fuse_sparse_links!, prepermute_aliased_mpo!, report_aliased_footprint
-
-const _ALIASED_ENABLE = get(ENV, "SB_ALIASED_ENABLE", "0") == "1"
-if !_ALIASED_ENABLE
-    println("[SB_ALIASED_ENABLE != 1] Aliased path is gated off — set SB_ALIASED_ENABLE=1 to run.")
-    exit(0)
-end
 
 function parse_command_line()
     s = ArgParseSettings()
@@ -274,9 +262,8 @@ let
     do_dense = args["dense-ref"]
 
     println("=== KL benchmark — ALIASED ψ × ALIASED PHP (Path-B) ===")
-    println("BMF_ISO_PATH=", ENV["BMF_ISO_PATH"], "  BMF_APPLY_MINV=", ENV["BMF_APPLY_MINV"],
-            "  BMF_BOP_PROJECT=", ENV["BMF_BOP_PROJECT"], "  BMF_MINV_RTOL=", ENV["BMF_MINV_RTOL"])
-    println("SB_ALIASED_MINV_HINT=", ENV["SB_ALIASED_MINV_HINT"], "  SB_ALIASED_NATIVE_FISSION=", ENV["SB_ALIASED_NATIVE_FISSION"],
+    println("BMF_BOP_PROJECT=", ENV["BMF_BOP_PROJECT"], "  BMF_MINV_RTOL=", ENV["BMF_MINV_RTOL"])
+    println("SB_ALIASED_NATIVE_FISSION=", ENV["SB_ALIASED_NATIVE_FISSION"],
             "  SB_ALIASED_PERCM_CAP=", ENV["SB_ALIASED_PERCM_CAP"])
     println("Projector sign = $psign  (P = ∏(I", psign > 0 ? "+" : "-", "C)/2)")
     println("N_plaq=$N_plaq  spin=$spin  n_sweeps=$n_sweeps  maxdim=$maxdim  target_E=$(isnan(target_E) ? "—" : target_E)  dense_ref=$do_dense")

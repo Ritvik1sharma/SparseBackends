@@ -521,9 +521,8 @@ function contract_preserve_bs(A::ITensors.ITensor, B::ITensors.ITensor;
   # a dense Minv reclassify a channel axis into the dense tail (the Path-B
   # alias-collapse bug). Requires SB_ALIASED_NATIVE_FISSION=1 for the native
   # (dedup-preserving) fission path; without it the kernel BS-delegates (trivial
-  # dedup). Gated SB_ALIASED_MINV_HINT (default off).
-  if get(ENV, "SB_ALIASED_MINV_HINT", "1") == "1" &&   # default ON (hardened 2026-06)
-     output_inds_hint === nothing && template !== nothing &&
+  # dedup). Hardened 2026-06 — always on (was SB_ALIASED_MINV_HINT, default-on knob).
+  if output_inds_hint === nothing && template !== nothing &&
      ITensors.has_external_storage(template) &&
      ITensors.get_external_storage(template) isa WrappedAliasedBlockSparse
     output_inds_hint = dense_inds(ITensors.get_external_storage(template))

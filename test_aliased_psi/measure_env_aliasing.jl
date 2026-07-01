@@ -8,7 +8,6 @@
 # n_blocks/n_unique_slices = achievable aliased dedup under that
 # classification.
 
-ENV["SB_ALIASED_ENABLE"] = "1"
 using SparseBackends, ITensors, ITensorMPS
 using Random
 using Printf

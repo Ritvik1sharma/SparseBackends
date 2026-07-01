@@ -12,13 +12,10 @@
 #   (Path-A BS runner) and this test (Path-B aliased runner).
 #
 # Path: aliased ψ is structurally NON-iso (template sharing ⇒ off-diagonal L†L).
-#   Path-B (BMF_ISO_PATH=0, BMF_APPLY_MINV=1) is required for correct energies.
+#   Path-B is required for correct energies — dmrg()'s default run_mode=:bop_aliased.
 #
 # Example:
-#   SB_ALIASED_ENABLE=1 julia --project=.. test_aliased_pxp.jl --N 12 --maxdim 40 --n-sweeps 10
-ENV["SB_ALIASED_ENABLE"] = get(ENV, "SB_ALIASED_ENABLE", "1")
-ENV["BMF_ISO_PATH"]      = "0"
-ENV["BMF_APPLY_MINV"]    = get(ENV, "BMF_APPLY_MINV", "1")
+#   julia --project=.. test_aliased_pxp.jl --N 12 --maxdim 40 --n-sweeps 10
 
 using SparseBackends, ITensors, ITensorMPS
 using TimerOutputs: reset_timer!, print_timer
@@ -35,11 +32,6 @@ println("[KrylovKit threads = ", KrylovKit.get_num_threads(),
 include("../test_sparse_psi/utils.jl")
 include("../test_aliased_psi/setup.jl")
 
-const _ALIASED_ENABLE = get(ENV, "SB_ALIASED_ENABLE", "0") == "1"
-if !_ALIASED_ENABLE
-    println("[SB_ALIASED_ENABLE != 1] Aliased path is gated off — set SB_ALIASED_ENABLE=1 to run.")
-    exit(0)
-end
 # Schema for the initial aliased ψ (frozen across sweeps; only template numeric data updates). Used for invariance tracking.
 const _INIT_SCHEMA = Ref{Any}(nothing)
 
@@ -169,8 +161,7 @@ let
     no_excited = parsed_args["no-excited"]
 
     println("=== PXP benchmark — ALIASED ψ (Path-B) ===")
-    println("BMF_ISO_PATH=", ENV["BMF_ISO_PATH"], "  BMF_APPLY_MINV=", ENV["BMF_APPLY_MINV"],
-            "  (Path-B: A = M⁻¹·H_eff — required for non-iso aliased ψ)")
+    println("run_mode=:bop_aliased (default) — required for non-iso aliased ψ")
     println("N=$N  n_sweeps=$n_sweeps  maxdim=$maxdim  mindim=$mindim  target_E=$(isnan(target_E) ? "—" : target_E)")
     println("UNCAPPED (honest_bd=channel×maxdim) [DEFAULT]")
     println("ψ = ALIASED (P·ψ₀ via NotEqlsLoop_R1); DMRG on BARE H (constraint enforced structurally).")

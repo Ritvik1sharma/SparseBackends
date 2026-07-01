@@ -15,17 +15,14 @@
 #
 # Pathway: aliased ψ is structurally NON-iso (templates shared across
 # bond-channel values ⇒ off-diagonal L†L coupling). The reliable path is
-# Path-B (M-corrected generalized eigsolve): BMF_ISO_PATH=0 with the M⁻¹
-# operator fix BMF_APPLY_MINV=1. The iso path (BMF_ISO_PATH=1, used by the
-# sister sparse KL runner where strict-cap SVD keeps ψ iso) is NOT valid for
-# aliased ψ and gives unphysical energies — do not use it here.
-#
-# Gated: requires SB_ALIASED_ENABLE=1.
+# Path-B (M-corrected generalized eigsolve): run_mode=:bop_aliased (the
+# dmrg() default). run_mode=:iso (used by the sister sparse KL runner where
+# strict-cap SVD keeps ψ iso) is NOT valid for aliased ψ and gives unphysical
+# energies — do not use it here.
 #
 # Example:
-#   SB_ALIASED_ENABLE=1 SB_USE_QR=1 SB_BALANCED_OWNERSHIP=1 SB_ADAPTIVE_RANK=1 \
+#   SB_USE_QR=1 SB_BALANCED_OWNERSHIP=1 SB_ADAPTIVE_RANK=1 \
 #     julia --project=.. test_aliased_kl.jl --N-plaq 12 --maxdim 40 --n-sweeps 10
-ENV["SB_ALIASED_ENABLE"] = get(ENV, "SB_ALIASED_ENABLE", "1")
 # Eigensolve pathway is selected by the dmrg(...) run_mode kwarg (see dmrg call below),
 # not env flags. Aliased ψ uses run_mode=:bop_aliased (Path-B B=M^{-1/2}HM^{-1/2}, no densify).
 
@@ -48,12 +45,6 @@ println("[KrylovKit threads = ", KrylovKit.get_num_threads(),
 
 include("../test_sparse_psi/utils.jl")
 include("../test_aliased_psi/setup.jl")
-
-const _ALIASED_ENABLE = get(ENV, "SB_ALIASED_ENABLE", "0") == "1"
-if !_ALIASED_ENABLE
-    println("[SB_ALIASED_ENABLE != 1] Aliased path is gated off — set SB_ALIASED_ENABLE=1 to run.")
-    exit(0)
-end
 
 # Schema for the initial aliased ψ (frozen across sweeps; only template numeric data updates). Used for invariance tracking.
 const _INIT_SCHEMA = Ref{Any}(nothing)

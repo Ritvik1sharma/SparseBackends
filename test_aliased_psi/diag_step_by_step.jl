@@ -1,7 +1,5 @@
 # Step-by-step diagnostic: compare aliased vs dense pipeline at each stage
 # of one DMRG step. Reports norm differences and iso check on factorize.
-ENV["BMF_ISO_PATH"] = "1"
-ENV["SB_ALIASED_ENABLE"] = "1"
 
 using SparseBackends, ITensors, ITensorMPS
 using Random

@@ -17,7 +17,7 @@
 # and compare energies + per-site MPO footprint.
 #
 # Usage:
-#   SB_ALIASED_ENABLE=1 SB_FUSE_LINKS=1 SB_PLAN_B=1 \
+#   SB_FUSE_LINKS=1 SB_PLAN_B=1 \
 #     BENCH_MAXDIM=40 BENCH_NSWEEPS=6 \
 #     julia --project=. test_sparse_ham/test_pxp_aliased.jl <N>
 
@@ -27,12 +27,6 @@ using TimerOutputs: reset_timer!, print_timer
 using LinearAlgebra: BLAS
 BLAS.set_num_threads(parse(Int, get(ENV, "BENCH_BLAS_THREADS", "1")))
 println("[BLAS threads pinned to ", BLAS.get_num_threads(), "]")
-
-const _ALIASED_ENABLE = get(ENV, "SB_ALIASED_ENABLE", "0") == "1"
-if !_ALIASED_ENABLE
-    println("[SB_ALIASED_ENABLE != 1] gated off — set SB_ALIASED_ENABLE=1 to run.")
-    exit(0)
-end
 
 include("aliased_helpers.jl")
 

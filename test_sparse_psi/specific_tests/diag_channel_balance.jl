@@ -5,7 +5,6 @@
 #   Test 4: same, of L, R from QR factorization
 #
 # Channel-imbalance source detected as the first test where norms differ.
-ENV["BMF_ISO_PATH"] = "1"
 using SparseBackends, ITensors, ITensorMPS
 using LinearAlgebra: norm
 using Random

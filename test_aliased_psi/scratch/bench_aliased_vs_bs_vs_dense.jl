@@ -1,12 +1,9 @@
 # Head-to-head benchmark: dense / BlockSparse / Aliased psi DMRG.
 # Same H, same maxdim schedule, same number of sweeps. Reports per-sweep
 # wall time (excluding sweep 1 for JIT) and final MPS memory footprint.
-ENV["SB_ALIASED_ENABLE"] = "1"
-# BMF_ISO_PATH=1 forces standard eigsolve (assumes L iso). With aliased psi,
-# L is not exactly iso (templates shared across bond-channel values create
-# off-diagonal coupling in L'L). Use BMF_ISO_PATH=0 to enable the M-corrected
-# Path-B eigsolve via the gram cache.
-ENV["BMF_ISO_PATH"] = "0"
+# With aliased psi, L is not exactly iso (templates shared across bond-channel
+# values create off-diagonal coupling in L'L), so this needs Path-B (the
+# M-corrected eigsolve via the gram cache) — dmrg()'s default run_mode=:bop_aliased.
 
 using SparseBackends, ITensors, ITensorMPS
 using Random
