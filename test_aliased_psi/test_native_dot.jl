@@ -9,10 +9,9 @@
 #   cd /home/ritvik/temp/temp/edited_packages
 #   taskset -c 0,2,4,6,8,10 env OPENBLAS_NUM_THREADS=6 OMP_NUM_THREADS=6 \
 #     VN=12 VMD=40 VSW=4 julia --project=. --threads=1 test_aliased_psi/test_native_dot.jl
-ENV["SB_ALIASED_ENABLE"] = "1"; ENV["BMF_ISO_PATH"] = "0"; ENV["BMF_APPLY_MINV"] = "1"
 # standard aliased gates (match the benchmarked regime)
 for (k, v) in ("SB_ALIASED_PERCM_CAP"=>"0", "SB_USE_QR"=>"1", "SB_BALANCED_OWNERSHIP"=>"1",
-               "SB_ADAPTIVE_RANK"=>"1", "SB_ALIASED_MINV_HINT"=>"1",
+               "SB_ADAPTIVE_RANK"=>"1",
                "SB_ALIASED_NATIVE_FISSION"=>"1", "BMF_BOP_PROJECT"=>"1", "BMF_MINV_RTOL"=>"1e-2")
     ENV[k] = v
 end

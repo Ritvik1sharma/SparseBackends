@@ -5,9 +5,6 @@
 #   (c) how rank compares to φ's n_keys / dedup (the "rank ≈ n_c/dedup" hypothesis)
 #
 # Run:  DIAG_N_PLAQ=1 DIAG_MAXDIM=10 julia --project=.. diag_gram_structure.jl
-ENV["SB_ALIASED_ENABLE"] = "1"
-ENV["BMF_ISO_PATH"]      = "0"
-ENV["BMF_APPLY_MINV"]    = "1"
 using SparseBackends, ITensors, ITensorMPS, LinearAlgebra, Printf, Random
 include("../test_sparse_psi/utils.jl")
 

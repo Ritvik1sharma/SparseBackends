@@ -12,8 +12,6 @@
 #
 # Defaults reproduce the requested run: N_plaq=12, maxdim=40, 10 sweeps (flat).
 #   BENCH_N_PLAQ=12  BENCH_MD=40  BENCH_NSWEEPS=10
-ENV["SB_ALIASED_ENABLE"] = "1"
-ENV["BMF_ISO_PATH"]      = "0"   # Path-B (M-corrected eigsolve) — the correct path for aliased ψ.
 
 using SparseBackends, ITensors, ITensorMPS
 using Random

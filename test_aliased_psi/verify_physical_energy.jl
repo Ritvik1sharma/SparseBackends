@@ -9,9 +9,6 @@
 #   - E_chk == E_reported  => reported energy is a genuine expectation value
 #                              => physical (>= E_exact), just a better variational state.
 #   - E_chk  > E_reported  => reported energy is a Path-B/M^{-1} artifact (unphysical).
-ENV["SB_ALIASED_ENABLE"] = get(ENV, "SB_ALIASED_ENABLE", "1")
-ENV["BMF_ISO_PATH"]      = "0"
-ENV["BMF_APPLY_MINV"]    = get(ENV, "BMF_APPLY_MINV", "1")
 
 using SparseBackends, ITensors, ITensorMPS
 using LinearAlgebra: norm

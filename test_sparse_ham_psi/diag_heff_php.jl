@@ -17,15 +17,11 @@
 #                       still wrong, the bug is in the Path-B M⁻¹/eigsolve layer.
 #
 # Run (machine must be free — see SKILLS contention rule):
-#   SB_ALIASED_ENABLE=1 julia --project=.. diag_heff_php.jl            # N_plaq=2
-#   DIAG_N_PLAQ=2 SB_ALIASED_ENABLE=1 julia --project=.. diag_heff_php.jl
+#   julia --project=.. diag_heff_php.jl            # N_plaq=2
+#   DIAG_N_PLAQ=2 julia --project=.. diag_heff_php.jl
 
-ENV["SB_ALIASED_ENABLE"]         = get(ENV, "SB_ALIASED_ENABLE", "1")
-ENV["BMF_ISO_PATH"]              = "0"
-ENV["BMF_APPLY_MINV"]            = get(ENV, "BMF_APPLY_MINV", "1")
 ENV["BMF_BOP_PROJECT"]           = get(ENV, "BMF_BOP_PROJECT", "1")
 ENV["BMF_MINV_RTOL"]             = get(ENV, "BMF_MINV_RTOL", "1e-2")
-ENV["SB_ALIASED_MINV_HINT"]      = get(ENV, "SB_ALIASED_MINV_HINT", "1")
 ENV["SB_ALIASED_NATIVE_FISSION"] = get(ENV, "SB_ALIASED_NATIVE_FISSION", "1")
 ENV["SB_ALIASED_PERCM_CAP"]      = get(ENV, "SB_ALIASED_PERCM_CAP", "1")
 ENV["SB_USE_QR"]                 = get(ENV, "SB_USE_QR", "1")

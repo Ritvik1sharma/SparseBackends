@@ -15,9 +15,8 @@
 #       must be identical (principal-subspace distance ≈ 0) ⇒ M is P-determined.
 #
 # Run (matches the N=12 b=12 converged-bulk case):
-#   OPENBLAS_NUM_THREADS=1 SB_ALIASED_ENABLE=1 \
+#   OPENBLAS_NUM_THREADS=1 \
 #     julia --project=.. derive_m_from_p.jl --N-plaq 12 --maxdim 40 --n-sweeps 4
-ENV["SB_ALIASED_ENABLE"] = get(ENV, "SB_ALIASED_ENABLE", "1")
 using SparseBackends, ITensors, ITensorMPS, LinearAlgebra, Printf, Random, ArgParse
 include("../test_sparse_psi/utils.jl")
 
@@ -135,7 +134,7 @@ s = ArgParseSettings()
     "--n-sweeps"; arg_type=Int; default=4
     "--seed"; arg_type=Int; default=42
     "--seed2"; arg_type=Int; default=7    # cross-seed check
-    "--bond"; arg_type=Int; default=12    # match the SB_GRAM_DUMP converged-bulk bond
+    "--bond"; arg_type=Int; default=12    # converged-bulk mid bond (N=12)
     "--psign"; arg_type=Int; default=+1   # +1 = reference sector (E≈-17.18); -1 = other sector
 end
 args = parse_args(s)

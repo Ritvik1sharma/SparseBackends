@@ -190,5 +190,6 @@ include("aliased/factorize.jl")         # Aliased-aware factorize (Tier 1: dense
 
 # Path-B (generalized eigsolve) helpers for sparse DMRG. Must be after
 # tensor_wrappers.jl so contract_preserve_bs / recast_bs_to_template are in scope.
+include("path_b_utils.jl")
 include("path_b_helpers.jl")
 end

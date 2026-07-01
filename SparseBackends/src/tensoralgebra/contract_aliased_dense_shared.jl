@@ -936,34 +936,35 @@ function _contract_dense_serial!(
     # ── BLAS fast path: fused per-(template, m_a) GEMM + β=1 direct output ────
     ck_to_cid = Dict{NTuple{PC,Int}, Int}()
 
-    # Two-pass: dedup output keys up front, assign cids in prefix-sorted order (so
-    # finalize needs no sort) and zero the output slab. Single-pass (default,
-    # SB_ALIASED_SINGLE_PASS) skips this — cids are assigned inline in _blas_run!.
-    if !_sp
-        @timeit TIMER "prepass" begin
-            _pt0  = _RF_ON[] ? time_ns() : UInt64(0)
-            ckeys = NTuple{PC,Int}[]
-            iAp = firstindex(A.keys); nAp = lastindex(A.keys)
-            @inbounds while iAp <= nAp
-                iAp2 = _advance_run(A.keys, iAp, nAp, join_posA)
-                for ii in iAp:(iAp2 - 1)
-                    akey = A.keys[ii]
-                    for m_a_lin in 1:Mmov_total, m_b_lin in 1:Nm
-                        ck = _ckey(akey, m_a_lin, m_b_lin)
-                        haskey(ck_to_cid, ck) || (ck_to_cid[ck] = 0; push!(ckeys, ck))
-                    end
-                end
-                iAp = iAp2
-            end
-            pdims = ntuple(i -> C.dims[i], Val(PC))
-            sort!(ckeys; by = k -> _prefix_lin(k, pdims))
-            for (i, ck) in enumerate(ckeys); ck_to_cid[ck] = i; end
-            _cas_stats && (_CAS_NWORK[] += length(A.keys) * Mmov_total * Nm;
-                           _CAS_NPEND[] += length(ckeys))
-            resize!(pending, length(ckeys) * blksize); fill!(pending, zero(TC))
-            _RF_ON[] && (_RF_PRE_NS[] += Float64(time_ns() - _pt0))
-        end
-    end
+    # Two-pass prepass (superseded by single-pass above; _sp is now unconditionally true
+    # here since can_blas is guaranteed at this point). Kept commented out for reference,
+    # not deleted: dedup output keys up front, assign cids in prefix-sorted order (so
+    # finalize needs no sort) and zero the output slab.
+    # if !_sp
+    #     @timeit TIMER "prepass" begin
+    #         _pt0  = _RF_ON[] ? time_ns() : UInt64(0)
+    #         ckeys = NTuple{PC,Int}[]
+    #         iAp = firstindex(A.keys); nAp = lastindex(A.keys)
+    #         @inbounds while iAp <= nAp
+    #             iAp2 = _advance_run(A.keys, iAp, nAp, join_posA)
+    #             for ii in iAp:(iAp2 - 1)
+    #                 akey = A.keys[ii]
+    #                 for m_a_lin in 1:Mmov_total, m_b_lin in 1:Nm
+    #                     ck = _ckey(akey, m_a_lin, m_b_lin)
+    #                     haskey(ck_to_cid, ck) || (ck_to_cid[ck] = 0; push!(ckeys, ck))
+    #                 end
+    #             end
+    #             iAp = iAp2
+    #         end
+    #         pdims = ntuple(i -> C.dims[i], Val(PC))
+    #         sort!(ckeys; by = k -> _prefix_lin(k, pdims))
+    #         for (i, ck) in enumerate(ckeys); ck_to_cid[ck] = i; end
+    #         _cas_stats && (_CAS_NWORK[] += length(A.keys) * Mmov_total * Nm;
+    #                        _CAS_NPEND[] += length(ckeys))
+    #         resize!(pending, length(ckeys) * blksize); fill!(pending, zero(TC))
+    #         _RF_ON[] && (_RF_PRE_NS[] += Float64(time_ns() - _pt0))
+    #     end
+    # end
 
     _at0  = _RF_ON[] ? time_ns() : UInt64(0)
     Ffull = _alloc_ffull(TC, M, N, Nm, mode)
@@ -1238,18 +1239,17 @@ function contract_shared!(
     # below now serves ONLY as the non-BLAS (generic rank-1) fallback.
     _fuse   = can_blas
     _direct = can_blas
-    # SB_ALIASED_SINGLE_PASS (default ON): merge the _direct cid-assignment prepass
-    # INTO the main loop. The two-pass _direct walks every (akey,m_a,m_b) work item twice
-    # (prepass builds ck_to_cid + zeroes the slab; main loop recomputes _ckey to look the
-    # cid up). Single-pass assigns cids on first sight and zeroes each new block as it is
-    # first touched — one walk, one _ckey per item, no extra memory. Bit-identical: cids
-    # are still first-seen order (identical iteration order), output is sorted at finalize.
-    # Default flipped 2026-06-22 (N=12 md=40 4-sweep, SB_ROOFLINE): single-pass removes the
-    # prepass (measured 1.29s) at the cost of one finalize sortperm (+0.63s) → net ~0.66s/run,
-    # BIT-IDENTICAL energy (validated all 4 sweeps). A modest win, NOT the ~14s originally
-    # hypothesized — the prepass was never the bottleneck (finalize ~7.8s and accum ~4.2s are).
-    # Set SB_ALIASED_SINGLE_PASS=0 to restore the old two-pass.
-    _sp = can_blas && get(ENV, "SB_ALIASED_SINGLE_PASS", "1") == "1"
+    # Single-pass cid assignment (always on when BLAS applies): merge the old two-pass
+    # _direct cid-assignment prepass INTO the main loop. The two-pass version walked every
+    # (akey,m_a,m_b) work item twice (prepass builds ck_to_cid + zeroes the slab; main loop
+    # recomputes _ckey to look the cid up). Single-pass assigns cids on first sight and
+    # zeroes each new block as it is first touched — one walk, one _ckey per item, no extra
+    # memory. Bit-identical: cids are still first-seen order (identical iteration order),
+    # output is sorted at finalize. Hardened 2026-06-22 (N=12 md=40 4-sweep, SB_ROOFLINE):
+    # net ~0.66s/run win, BIT-IDENTICAL energy (validated all 4 sweeps). Was
+    # SB_ALIASED_SINGLE_PASS, a default-on knob, now unconditional; the two-pass prepass
+    # block below is commented out (kept for reference, not deleted).
+    _sp = can_blas
     # SB_ALIASED_NTHREADS=N (default 1 ⇒ serial): a KERNEL-ONLY scheduling knob for the aliased matvec's
     # outer-loop parallelism over A-key runs. It is deliberately SEPARATE from
     # JULIA_NUM_THREADS / OPENBLAS_NUM_THREADS — it controls only how many tasks THIS
@@ -1322,10 +1322,9 @@ function contract_shared!(
         # ── SB_OUTSTAT_SCHED=1: output-stationary OWNS every can_blas aliased×dense call ──
         # (any requested order, realized by the kernel's permute phase via out_dense_perm).
         # Additive + default OFF ⇒ runs that don't set it are byte-identical to before.
-        # Mutually exclusive with the legacy A/B hook so we never accidentally run legacy.
+        # (Mutual-exclusion check against the legacy A/B hook removed 2026-06 along with the
+        # hook itself — SB_ALIASED_LEGACY is retired, see below.)
         _sched_on = get(ENV, "SB_OUTSTAT_SCHED", "0") == "1"
-        (_sched_on && get(ENV, "SB_ALIASED_LEGACY", "0") == "1") &&
-            error("SB_ALIASED_LEGACY and SB_OUTSTAT_SCHED are mutually exclusive — set only one")
         if _sched_on && can_blas
             return @timeit TIMER "kbd.serial_outstat" _contract_dense_serial_outstat!(C, A, Bp, blksize, M, N, K, Nm, Mmov_total, Nmov_total,
                 n_sp, NB, join_posA, sp_strides, _bconv, _noconv, mode, can_blas,
@@ -1333,32 +1332,24 @@ function contract_shared!(
                 _fuse, _direct, _sp, _prealloc_buf, _cas_stats, _fusion_diag,
                 pending, key_to_alias, key_to_accum, combined_tid_map, Cscratch, _fgroups, nothing, out_dense_perm)
         end
-        # A/B HOOK (SB_ALIASED_LEGACY=1): route to the pre-session legacy reduction-
-        # stationary kernel (append!-copy finalize, from git HEAD) for back-to-back
-        # finalize-cost comparison. Takes precedence over outstat. Pair with
-        # SB_ALIASED_OUTSTAT=0 so the "current" side is the swap-finalize
-        # _contract_dense_serial!, NOT the output-stationary kernel.
-        # GATED on lmap === nothing: the legacy kernel predates interleaved-Cdense
-        # support and ignores lmap, so interleaved contractions MUST fall through to
-        # the current _contract_dense_serial! (else wrong energy). The A/B then
-        # isolates the finalize change on the non-interleaved contractions.
-        if lmap === nothing && get(ENV, "SB_ALIASED_LEGACY", "0") == "1"
-            return @timeit TIMER "kbd.serial_legacy" _contract_dense_serial_legacy!(C, A, Bp, blksize, M, N, K, Nm, Mmov_total, Nmov_total,
-                n_sp, NB, join_posA, sp_strides, _bconv, _noconv, mode, can_blas,
-                c_src_kind, c_src_idx, movA_dims_vec, movB_dims_vec, movA_strides, movB_strides,
-                _fuse, _direct, _sp, _prealloc_buf, _cas_stats, _fusion_diag,
-                pending, key_to_alias, key_to_accum, combined_tid_map, Cscratch, _fgroups, lmap)
-        end
-        # OUTPUT-STATIONARY kernel (default): keep-grouped, GEMM-direct, no scatter/hash.
-        # Handles the BLAS non-interleaved case; interleaved (lmap) and non-BLAS fall
-        # through to the legacy reduction-stationary _contract_dense_serial!.
-        # Toggle off with SB_ALIASED_OUTSTAT=0 to A/B against the legacy kernel.
-        # OUTPUT-STATIONARY kernel (default ON). Bit-identical (to ~1e-12); back-to-back
-        # under matched throttle it runs on par with the legacy kernel (~46 vs ~45 s/sweep,
-        # within noise) — the earlier "regression" was a throttle artifact. Profiled below
-        # to find where its time goes (redundant per-member B-convert, fill, β-RMW, per-call
-        # sort are the suspects). Toggle SB_ALIASED_OUTSTAT=0 for the legacy kernel.
-        _outstat = can_blas && lmap === nothing && get(ENV, "SB_ALIASED_OUTSTAT", "1") == "1"
+        # A/B HOOK (retired 2026-06, was SB_ALIASED_LEGACY=1): routed to the pre-session
+        # legacy reduction-stationary kernel (append!-copy finalize, from git HEAD) for
+        # back-to-back finalize-cost comparison against outstat. Settled — commented out
+        # in place, not deleted; contract_aliased_dense_legacy.jl stays included as
+        # reference code.
+        # if lmap === nothing && get(ENV, "SB_ALIASED_LEGACY", "0") == "1"
+        #     return @timeit TIMER "kbd.serial_legacy" _contract_dense_serial_legacy!(C, A, Bp, blksize, M, N, K, Nm, Mmov_total, Nmov_total,
+        #         n_sp, NB, join_posA, sp_strides, _bconv, _noconv, mode, can_blas,
+        #         c_src_kind, c_src_idx, movA_dims_vec, movB_dims_vec, movA_strides, movB_strides,
+        #         _fuse, _direct, _sp, _prealloc_buf, _cas_stats, _fusion_diag,
+        #         pending, key_to_alias, key_to_accum, combined_tid_map, Cscratch, _fgroups, lmap)
+        # end
+        # OUTPUT-STATIONARY kernel (always on when eligible): keep-grouped, GEMM-direct,
+        # no scatter/hash. Handles the BLAS non-interleaved case; interleaved (lmap) and
+        # non-BLAS fall through to the legacy reduction-stationary _contract_dense_serial!.
+        # Hardened 2026-06 — bit-identical (to ~1e-12) vs the legacy kernel; was
+        # SB_ALIASED_OUTSTAT, a default-on knob, now unconditional.
+        _outstat = can_blas && lmap === nothing
         if _outstat
             return @timeit TIMER "kbd.serial_outstat" _contract_dense_serial_outstat!(C, A, Bp, blksize, M, N, K, Nm, Mmov_total, Nmov_total,
                 n_sp, NB, join_posA, sp_strides, _bconv, _noconv, mode, can_blas,

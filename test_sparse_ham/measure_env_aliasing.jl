@@ -13,12 +13,6 @@ using ITensors, ITensorMPS
 
 length(ARGS) < 1 && error("Usage: julia measure_env_aliasing.jl <N_plaq>")
 
-const _ALIASED_ENABLE = get(ENV, "SB_ALIASED_ENABLE", "0") == "1"
-if !_ALIASED_ENABLE
-    println("[SB_ALIASED_ENABLE != 1] Aliased path is gated off — set SB_ALIASED_ENABLE=1 to run.")
-    exit(0)
-end
-
 function clean!(op::MPO; tol=1e-12)
     for j in 1:length(op)
         T = op[j]

@@ -11,9 +11,8 @@
 #   cd /home/ritvik/temp/temp/edited_packages
 #   taskset -c 0,2,4,6,8,10 env OPENBLAS_NUM_THREADS=6 OMP_NUM_THREADS=6 \
 #     SB_ALIASED_PERCM_CAP=0 SB_USE_QR=1 SB_BALANCED_OWNERSHIP=1 SB_ADAPTIVE_RANK=1 \
-#     SB_ALIASED_MINV_HINT=1 SB_ALIASED_NATIVE_FISSION=1 BMF_BOP_PROJECT=1 BMF_MINV_RTOL=1e-2 \
+#     SB_ALIASED_NATIVE_FISSION=1 BMF_BOP_PROJECT=1 BMF_MINV_RTOL=1e-2 \
 #     VN=12 VMD=40 julia --project=. --threads=1 test_aliased_psi/diag_alloc_provenance.jl
-ENV["SB_ALIASED_ENABLE"] = "1"; ENV["BMF_ISO_PATH"] = "0"; ENV["BMF_APPLY_MINV"] = "1"
 
 using SparseBackends, ITensors, ITensorMPS
 using LinearAlgebra, Random, Printf

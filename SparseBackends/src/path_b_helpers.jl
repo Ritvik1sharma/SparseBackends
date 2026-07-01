@@ -320,7 +320,7 @@ function build_half_pair_single(G::ITensors.ITensor; rtol::Real=1e-10)
   # BMF_MINV_RTOL. NOTE: revisit at larger md/N — if genuine DOF ever extend
   # below 0.1·maxλ, the cond≤10 cap would over-truncate and rtol must be relaxed
   # (staying above the ~1e-3 stability cliff).
-  rtol = parse(Float64, get(ENV, "BMF_MINV_RTOL", "1e-1"))
+  rtol = 1e-1  # knob for rtol
   G_inds = collect(ITensors.inds(G))
   if isempty(G_inds)
     # Scalar gram: pass-through. Both Mhalf and Linv are scalar 1.
@@ -341,28 +341,19 @@ function build_half_pair_single(G::ITensors.ITensor; rtol::Real=1e-10)
   tol  = real(rtol * maxλ)
   sqrt_λ     = [real(l) > tol ? sqrt(real(l))     : zero(real(TC)) for l in λ]
   inv_sqrt_λ = [real(l) > tol ? 1 / sqrt(real(l)) : zero(real(TC)) for l in λ]
-  # STEP 2a — flat-c override (BMF_MINV_FLATC=1, default off): force the kept spectrum
-  # flat to c = mean(kept λ), i.e. use M^{±1/2} = c^{±1/2}·Π (the ideal scaled-projector
-  # form) instead of the actual graded spectrum. Uses the REAL range (V) but discards the
-  # graded tail. At convergence the spectrum is ALREADY flat (=2^⌈env/2⌉) so this is a
-  # no-op / byte-identical; during the ramp it flattens the tail. Tests whether the ideal
-  # c·Π form still converges. Byte-identical for canonical M=I (single kept eigenvalue).
-  if get(ENV, "BMF_MINV_FLATC", "0") == "1"
-    _kept = [real(l) for l in λ if real(l) > tol]
-    _cflat = isempty(_kept) ? one(real(TC)) : sum(_kept) / length(_kept)
-    sqrt_λ     = [real(l) > tol ? sqrt(_cflat)     : zero(real(TC)) for l in λ]
-    inv_sqrt_λ = [real(l) > tol ? 1 / sqrt(_cflat) : zero(real(TC)) for l in λ]
-  end
-  # M-conditioning diagnostic (BMF_MINV_DIAG=1): the M⁻¹ correction is unstable
-  # when an eigenvalue sits just ABOVE the rtol threshold → huge 1/√λ. Log the
-  # spectrum so we can see if Linv blows up at large bond dim / many sweeps.
-  if get(ENV, "BMF_MINV_DIAG", "0") == "1"
-    kept    = [real(l) for l in λ if real(l) > tol]
-    n_drop  = length(λ) - length(kept)
-    minkept = isempty(kept) ? 0.0 : minimum(kept)
-    cond    = minkept > 0 ? maxλ / minkept : Inf
-    maxinv  = minkept > 0 ? 1 / sqrt(minkept) : Inf
-    println("[BMF_MINV_DIAG] d=$d  rtol=$(round(rtol,sigdigits=3))  maxλ=$(round(maxλ,sigdigits=4))  minkeptλ=$(round(minkept,sigdigits=4))  cond=$(round(cond,sigdigits=4))  n_dropped=$n_drop/$(length(λ))  max(1/√λ)=$(round(maxinv,sigdigits=4))")
+  # (The flat-c / ideal scaled-projector form M^{±1/2}=c^{±1/2}·Π is now the
+  #  from-P path: build_half_pair_single_fromP, selected via dmrg's minv_from_p kwarg.)
+  # M-conditioning diagnostic: the M⁻¹ correction is unstable when an eigenvalue
+  # sits just ABOVE the rtol threshold → huge 1/√λ. Log the spectrum so we can
+  # see if Linv blows up at large bond dim / many sweeps. Debug-only, disabled;
+  # flip to `if true` (and uncomment the body) to re-enable.
+  if false
+    # kept    = [real(l) for l in λ if real(l) > tol]
+    # n_drop  = length(λ) - length(kept)
+    # minkept = isempty(kept) ? 0.0 : minimum(kept)
+    # cond    = minkept > 0 ? maxλ / minkept : Inf
+    # maxinv  = minkept > 0 ? 1 / sqrt(minkept) : Inf
+    # println("[BMF_MINV_DIAG] d=$d  rtol=$(round(rtol,sigdigits=3))  maxλ=$(round(maxλ,sigdigits=4))  minkeptλ=$(round(minkept,sigdigits=4))  cond=$(round(cond,sigdigits=4))  n_dropped=$n_drop/$(length(λ))  max(1/√λ)=$(round(maxinv,sigdigits=4))")
   end
   Ghalf_mat = V * LinearAlgebra.Diagonal(sqrt_λ)     * V'
   Linv_mat  = V * LinearAlgebra.Diagonal(inv_sqrt_λ) * V'
@@ -376,6 +367,24 @@ function build_half_pair_single(G::ITensors.ITensor; rtol::Real=1e-10)
   Ghalf_it  = ITensors.itensor(Ghalf_arr, unp..., prm...)
   Linv_it   = ITensors.itensor(Linv_arr,  unp..., prm...)
   return Ghalf_it, Linv_it
+end
+
+# From-P (Step 2b): construct M^{±1/2} directly from the gram G and the geometric
+# constant c = 2^⌈env/2⌉ — NO eigendecomposition. Exact when the gram is the
+# converged scaled projector M = c·Π (Π a projector, Π²=Π), because then
+#   M^{1/2}  = c^{-1/2}·M      ((c^{-1/2}M)² = c^{-1}M² = c^{-1}(cΠ)² = cΠ = M)
+#   M^{-1/2} = c^{-3/2}·M      ((c^{-3/2}M)² = c^{-3}M² = c^{-1}Π = M^{-1}|range)
+# Both are just SCALED copies of G, so G's storage (aliased/BS, dedup) is preserved
+# — no densify, no permute, no eigen. During the ramp (M ≠ c·Π) this is an
+# approximation (weights ∝ λ instead of 1/√λ), exact only at convergence.
+# c is P-derived (environment plaquette multiplicity), passed in by the caller.
+function build_half_pair_single_fromP(G::ITensors.ITensor, c::Real)
+  if isempty(ITensors.inds(G)) || c <= 0
+    return ITensors.ITensor(1.0), ITensors.ITensor(1.0)
+  end
+  Ghalf = (1 / sqrt(c))      * G      # c^{-1/2}·M
+  Linv  = (1 / (c * sqrt(c))) * G     # c^{-3/2}·M
+  return Ghalf, Linv
 end
 
 # Factored Mhalf, Linv via per-side eigen of Lgram and Rgram separately.
@@ -394,10 +403,17 @@ function build_minv_half_pair_factored(Lgram::ITensors.ITensor,
                                        rtol::Real=1e-10,
                                        phi_template::Union{Nothing,ITensors.ITensor}=nothing,
                                        use_bs_restricted::Bool=false,
-                                       both_aliased::Bool=false)
-  # When use_bs_restricted=true AND phi_template is BS, use equivalence-class
-  # restricted BS storage → no recast in apply_minv_preserve_bs.
+                                       both_aliased::Bool=false,
+                                       p_c::Union{Nothing,Tuple{<:Real,<:Real}}=nothing)
+  # p_c = (cL, cR): Step 2b from-P path. When provided, build M^{±1/2} = c^{∓...}·G
+  # directly from the geometric constant (no eigen). Default nothing → eigen path.
  @timeit SparseBackends.TIMER "build_minv_half_pair_factored" begin
+  if p_c !== nothing
+    cL, cR = p_c
+    Mhalf_L, Linv_L = build_half_pair_single_fromP(Lgram, cL)
+    Mhalf_R, Linv_R = build_half_pair_single_fromP(Rgram, cR)
+    return Mhalf_L, Linv_L, Mhalf_R, Linv_R
+  end
   if use_bs_restricted && phi_template !== nothing &&
      ITensors.has_external_storage(phi_template) &&
      ITensors.get_external_storage(phi_template) isa WrappedBlockSparse
@@ -1103,31 +1119,23 @@ function apply_minv_preserve_bs(Minv::ITensors.ITensor, y::ITensors.ITensor, tem
       end
     end
   end
-  # SB_MINV_DIAG=1: trace the prefix/dense split of the M⁻¹-apply output at each
-  # stage for ALIASED tensors, to localize where φ's canonical split is lost
-  # (channel moved into the dense tail). Prints P / prefix / dense per stage.
-  _minv_diag = get(ENV, "SB_MINV_DIAG", "0") == "1" && _AMP_DBG_BUDGET[] > 0
-  _mdump = function(lbl, T)
-      if ITensors.has_external_storage(T) && T.tensor.data isa WrappedAliasedBlockSparse
-          w = T.tensor.data; P = SparseBackends._abs_head_len(w); N = ndims(w.aliased)
-          _tg(I) = (ITensors.dim(I), string(ITensors.tags(I)), ITensors.plev(I))
-          println("   [MINV_DIAG ", lbl, "] P=$P  prefix=", [_tg(w.inds[i]) for i in 1:P],
-                  "  dense=", [_tg(w.inds[i]) for i in P+1:N])
-      else
-          println("   [MINV_DIAG ", lbl, "] storage=", ITensors.has_external_storage(T) ? string(typeof(T.tensor.data)) : "dense")
-      end
-  end
+  # Trace the prefix/dense split of the M⁻¹-apply output at each stage for
+  # ALIASED tensors, to localize where φ's canonical split is lost (channel
+  # moved into the dense tail). Prints P / prefix / dense per stage, via
+  # minv_diag_dump (path_b_utils.jl). Debug-only, disabled; flip to `true`
+  # to re-enable.
+  _minv_diag = false
   if _minv_diag
       _AMP_DBG_BUDGET[] -= 1
       println("[MINV_DIAG apply] Minv inds=", [(ITensors.dim(I), string(ITensors.tags(I)), ITensors.plev(I)) for I in ITensors.inds(Minv)])
-      _mdump("y(in)", y); _mdump("template", template)
+      minv_diag_dump("y(in)", y); minv_diag_dump("template", template)
   end
   schema_dbg("apply_minv INPUT y", y)
   z = @timeit SparseBackends.TIMER "amp.cpb" contract_preserve_bs(Minv, y; template = (fission ? template : nothing))
-  _minv_diag && _mdump("z after contract_preserve_bs", z)
+  _minv_diag && minv_diag_dump("z after contract_preserve_bs", z)
   schema_dbg("apply_minv z = Minv·y", z)
   z = @timeit SparseBackends.TIMER "amp.replaceprime" ITensors.replaceprime(z, 1 => 0; tags="Link")
-  _minv_diag && _mdump("z after replaceprime", z)
+  _minv_diag && minv_diag_dump("z after replaceprime", z)
   if do_dbg
     println("  AFTER contract+replaceprime, z inds: ", ITensors.inds(z))
     if ITensors.has_external_storage(z)
@@ -1168,10 +1176,10 @@ function apply_minv_preserve_bs(Minv::ITensors.ITensor, y::ITensors.ITensor, tem
       # Aliased recast: align Hv's inds order to phi-template's inds order
       # so subsequent Path-B apply_minv calls see consistent classification.
       z = @timeit SparseBackends.TIMER "amp.recast2_aliased" ITensors._itensor_from_external_storage(recast_aliased_to_template(Cw, Tw))
-      _minv_diag && _mdump("z after recast_aliased_to_template", z)
+      _minv_diag && minv_diag_dump("z after recast_aliased_to_template", z)
     end
   end
-  _minv_diag && _mdump("z RETURNED", z)
+  _minv_diag && minv_diag_dump("z RETURNED", z)
   return z
  end
 end

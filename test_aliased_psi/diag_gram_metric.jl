@@ -17,9 +17,6 @@
 #      eigenvalue. This is what Path-B SHOULD return at this bond. Then run the
 #      ACTUAL aliased Path-B eigsolve (mirroring dmrg.jl) and compare.
 
-ENV["SB_ALIASED_ENABLE"] = "1"
-ENV["BMF_ISO_PATH"] = "0"  # Path-B
-
 using SparseBackends, ITensors, ITensorMPS
 using Random, Printf
 using LinearAlgebra
