@@ -125,7 +125,7 @@ function _aliased_shared_via_bs_fission!(
     empty!(C.templates); append!(C.templates, C_bs.data)
     C.n_templates = nb
     empty!(C.keys);      append!(C.keys, C_bs.keys)
-    empty!(C.alias_ids); append!(C.alias_ids, collect(1:nb))
+    empty!(C.alias_ids); append!(C.alias_ids, _alias_id_range(eltype(C.alias_ids), nb))
     empty!(C.scalars);   append!(C.scalars, ones(TC, nb))
     return C
 end
@@ -221,6 +221,7 @@ function contract_shared!(
     @assert length(desired_keepA) == length(keepA0) && Set(desired_keepA) == Set(keepA0)
     @assert length(desired_keepB) == length(keepB0) && Set(desired_keepB) == Set(keepB0)
 
+    
     # ── 3) Permute A and B ────────────────────────────────────────────────────
     # A: prefix=[keep_pref..., shared_pref...], dense=[keepA..., red...]
     # B: prefix=[keep_pref..., shared_pref...], dense=[red...,   keepB...]

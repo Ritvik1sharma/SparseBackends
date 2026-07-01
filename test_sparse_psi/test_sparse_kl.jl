@@ -2,9 +2,8 @@
 # regime: warmup sweeps first (JIT compile + ramp to maxdim), then reset timers
 # and profile subsequent sweeps where mult is fully grown. Reports both
 # ITensorMPS.PROJMPO_TIMER (DMRG-level) and SparseBackends.TIMER (kernel-level).
-# Forces BMF_ISO_PATH=1 so dmrg uses the standard eigsolve path (no M^{-1/2}
-# wrap), since iso is preserved by strict-cap SVD in this run.
-ENV["BMF_ISO_PATH"] = "1"
+# Uses run_mode=:iso (see dmrg call) so dmrg runs the standard eigsolve path (no
+# M^{-1/2} wrap), since iso is preserved by strict-cap SVD in this run.
 using SparseBackends, ITensors, ITensorMPS
 using TimerOutputs: reset_timer!, print_timer
 using Random
@@ -264,7 +263,7 @@ function run_sweeps(H, psi0, n_sweeps::Int, maxdim::Int;
     for i in 1:n_sweeps
         sw = Sweeps(1)
         setmaxdim!(sw, maxdim); setmindim!(sw, mindim); setcutoff!(sw, cutoff)
-        t = @elapsed (E, psi, _esw, terr) = dmrg(H, psi, sw; outputlevel=0, use_early_exit=false)
+        t = @elapsed (E, psi, _esw, terr) = dmrg(H, psi, sw; outputlevel=0, use_early_exit=false, run_mode=:iso)
         push!(sweep_times, t); push!(sweep_energies, E)
         cum += t
         if i > 1; cum_excl1 += t; end
@@ -287,7 +286,7 @@ let
     maxdim_target = parsed_args["maxdim"]
     target_E = parsed_args["target-energy"]
 
-    println("BMF_ISO_PATH = ", ENV["BMF_ISO_PATH"], "  (1 ⇒ standard eigsolve, no M⁻¹ wrap)")
+    println("run_mode = :iso  (standard eigsolve, no M⁻¹ wrap)")
     println("Projector sign = $psign  (P = ∏(I", psign > 0 ? "+" : "-", "C)/2)")
     println("N_plaq=$N_plaq  n_sweeps=$n_sweeps  maxdim=$maxdim_target  target_E=$(isnan(target_E) ? "—" : target_E)")
     println("Building setup for N=$N_plaq plaquettes ...")

@@ -1,10 +1,7 @@
 # KL benchmark — ALIASED-ψ runner (single backend).
-#
 # Mirror of ../test_sparse_psi/test_sparse_kl.jl, but ψ is carried as
 # WrappedAliasedBlockSparse (alias structure frozen across sweeps; only template
-# numeric data updates). This is the canonical aliased KL test — same model,
-# same CLI, same instrumentation as the sister sparse/dense KL runners, so the
-# three are directly comparable when run with matching args.
+# numeric data updates). 
 #
 # Constraint enforcement (see ../test_sparse_psi/README.md):
 #   - Aliased/BS ψ run DMRG on the BARE H. The projector constraint is enforced
@@ -29,12 +26,12 @@
 #   SB_ALIASED_ENABLE=1 SB_USE_QR=1 SB_BALANCED_OWNERSHIP=1 SB_ADAPTIVE_RANK=1 \
 #     julia --project=.. test_aliased_kl.jl --N-plaq 12 --maxdim 40 --n-sweeps 10
 ENV["SB_ALIASED_ENABLE"] = get(ENV, "SB_ALIASED_ENABLE", "1")
-ENV["BMF_ISO_PATH"]      = "0"   # Path-B (M-corrected eigsolve) — required for aliased ψ.
-ENV["BMF_APPLY_MINV"]    = get(ENV, "BMF_APPLY_MINV", "1")  # apply A = M⁻¹·H_eff (energy-correctness fix).
+# Eigensolve pathway is selected by the dmrg(...) run_mode kwarg (see dmrg call below),
+# not env flags. Aliased ψ uses run_mode=:bop_aliased (Path-B B=M^{-1/2}HM^{-1/2}, no densify).
 
 using SparseBackends, ITensors, ITensorMPS
 using TimerOutputs: reset_timer!, print_timer
-using LinearAlgebra: I as eye, norm
+using LinearAlgebra: I as eye, norm, mul!, BLAS
 using Random
 using ArgParse
 using Printf
@@ -50,12 +47,17 @@ println("[KrylovKit threads = ", KrylovKit.get_num_threads(),
         "   Julia threads = ", Threads.nthreads(), "]")
 
 include("../test_sparse_psi/utils.jl")
+include("../test_aliased_psi/setup.jl")
 
 const _ALIASED_ENABLE = get(ENV, "SB_ALIASED_ENABLE", "0") == "1"
 if !_ALIASED_ENABLE
     println("[SB_ALIASED_ENABLE != 1] Aliased path is gated off — set SB_ALIASED_ENABLE=1 to run.")
     exit(0)
 end
+
+# Schema for the initial aliased ψ (frozen across sweeps; only template numeric data updates). Used for invariance tracking.
+const _INIT_SCHEMA = Ref{Any}(nothing)
+
 
 function parse_command_line()
     s = ArgParseSettings()
@@ -84,6 +86,10 @@ function parse_command_line()
             help = "If set, log the first sweep at which E ≤ target (does not early-exit)."
             arg_type = Float64
             default = NaN
+        "--run-mode"
+            help = "Eigensolve pathway: bop_aliased (default, no densify) or bop_densify (env-dressed densified seed)."
+            arg_type = String
+            default = "bop_aliased"
     end
     return parse_args(s)
 end
@@ -125,212 +131,9 @@ function build_setup(N::Int, psign::Int, spin::Int)
     return H, psi_ali
 end
 
-mps_footprint_bytes(psi) = Base.summarysize(psi)
 
-# Reported link dim: dim of the single shared link Index between neighbours.
-reported_linkdims(psi) =
-    [ITensors.dim(commonind(psi[i], psi[i+1])) for i in 1:length(psi)-1]
 
-# HONEST per-bond dim: ∏ of ALL shared-index dims between psi[i], psi[i+1]
-# (channel × multiplicity under the doubled-link convention) — the true rank of
-# the bipartition. `dim(commonind)` returns only ONE shared index (the channel).
-function honest_linkdims(psi)
-    [(cis = commoninds(psi[i], psi[i+1]); isempty(cis) ? 0 : prod(ITensors.dim, cis))
-     for i in 1:length(psi)-1]
-end
-
-# Per-site storage breakdown for aliased (and BS / dense, for robustness).
-# Returns rows + totals + the per-site alias dedup ratios (nb/nt).
-function inspect_storage(psi)
-    payload_total = 0   # numeric data (templates / bs.data / dense)
-    keys_total    = 0
-    site_total    = 0
-    full_total    = 0   # if stored fully dense
-    bs_total      = 0   # if stored as plain BS (n_blocks * blksize)
-    ratios        = Float64[]
-    rows = String[]
-    for (i, T) in enumerate(psi)
-        s  = try ITensors.get_external_storage(T) catch _ nothing end
-        ss = Base.summarysize(T)
-        site_total += ss
-        if s isa SparseBackends.WrappedAliasedBlockSparse
-            ali    = s.aliased
-            nb     = length(ali.keys)
-            nt     = ali.n_templates
-            blksz  = ali.blksize
-            data_b = Base.summarysize(ali.templates)
-            keys_b = Base.summarysize(ali.keys) + Base.summarysize(ali.alias_ids) + Base.summarysize(ali.scalars)
-            full_b = prod(ali.dims) * sizeof(eltype(ali.templates))
-            bs_b   = nb * blksz * sizeof(eltype(ali.templates))
-            ratio  = nb / max(nt, 1)
-            payload_total += data_b; keys_total += keys_b; full_total += full_b; bs_total += bs_b
-            push!(ratios, ratio)
-            push!(rows, @sprintf("site %2d [ALI] nb=%d ntmpl=%d blksize=%d  dedup(nb/nt)=%.2fx  templates=%.2fKiB  keys+ids+scalars=%.2fKiB  if_dense=%.2fKiB  total=%.2fKiB",
-                                 i, nb, nt, blksz, ratio, data_b/1024, keys_b/1024, full_b/1024, ss/1024))
-        elseif s isa SparseBackends.WrappedBlockSparse
-            bs     = s.blocksparse
-            nb     = length(bs.keys)
-            data_b = Base.summarysize(bs.data)
-            keys_b = Base.summarysize(bs.keys) + Base.summarysize(bs.ids)
-            full_b = prod(bs.dims) * sizeof(eltype(bs.data))
-            payload_total += data_b; keys_total += keys_b; full_total += full_b; bs_total += data_b
-            push!(rows, @sprintf("site %2d [BS]  nblocks=%d blksize=%d  data=%.2fKiB  keys+ids=%.2fKiB  if_dense=%.2fKiB  total=%.2fKiB",
-                                 i, nb, bs.blksize, data_b/1024, keys_b/1024, full_b/1024, ss/1024))
-        else
-            a = ITensors.array(T)
-            data_b = Base.summarysize(a)
-            payload_total += data_b; full_total += data_b; bs_total += data_b
-            push!(rows, @sprintf("site %2d [dense] data=%.2fKiB  total=%.2fKiB", i, data_b/1024, ss/1024))
-        end
-    end
-    return rows, payload_total, keys_total, site_total, full_total, bs_total, ratios
-end
-
-# Iso check (sparse-aware). G = T * dag(prime(T, link)) on the link indices;
-# densify only that small (link × link') result. For aliased ψ the off-diagonals
-# are EXPECTED to be nonzero (structural; handled by Path-B's M⁻¹).
-function _link_gram(T::ITensors.ITensor, link_inds)
-    Tp = prime(T, link_inds)
-    G  = T * dag(Tp)
-    Gd = ITensors.has_external_storage(G) ? SparseBackends.to_dense_itensors_unfused(G) : G
-    link_pr = [prime(I) for I in link_inds]
-    G_arr = Array(Gd, link_inds..., link_pr...)
-    n = prod(ITensors.dim, link_inds)
-    return reshape(G_arr, n, n), n
-end
-
-function iso_violations(psi)
-    N = length(psi)
-    rows = NamedTuple{(:site, :left_iso_err, :right_iso_err, :right_link_dim, :left_link_dim), Tuple{Int, Float64, Float64, Int, Int}}[]
-    for i in 1:N
-        T = psi[i]
-        le = NaN; r_dim = 0
-        if i < N
-            ri = commoninds(psi[i], psi[i+1])
-            if !isempty(ri)
-                G, n = _link_gram(T, ri); r_dim = n; le = norm(G - eye(n)) / sqrt(n)
-            end
-        end
-        re = NaN; l_dim = 0
-        if i > 1
-            li = commoninds(psi[i], psi[i-1])
-            if !isempty(li)
-                G, n = _link_gram(T, li); l_dim = n; re = norm(G - eye(n)) / sqrt(n)
-            end
-        end
-        push!(rows, (site=i, left_iso_err=le, right_iso_err=re, right_link_dim=r_dim, left_link_dim=l_dim))
-    end
-    return rows
-end
-
-function print_iso(label, psi)
-    println("  iso check ($label):  [aliased ψ is structurally non-iso → off-diagonals expected; Path-B handles it]")
-    println("    site | left-iso(L†L=I rt)  right-iso(R R†=I lt) | rt-dim   lt-dim")
-    for r in iso_violations(psi)
-        lstr = isnan(r.left_iso_err)  ? "   -  " : @sprintf("%.2e", r.left_iso_err)
-        rstr = isnan(r.right_iso_err) ? "   -  " : @sprintf("%.2e", r.right_iso_err)
-        println(@sprintf("    %4d | %s            %s        | %5d    %5d", r.site, lstr, rstr, r.right_link_dim, r.left_link_dim))
-    end
-end
-
-# ── Schema-invariance check (SB_SCHEMA_TRACK=1) ────────────────────────────
-# ψ_aliased ≡ P·ψ_dense, so the alias SCHEMA — keys (which prefix blocks are
-# nonzero, set by P's sparsity), the key→template partition (alias_ids, set by
-# P's structure), and scalars (set by P's values) — encodes the constraint P,
-# which never changes. Across the whole DMRG flow only the *templates* (the
-# ψ_dense slices) may grow; keys / partition / scalars MUST stay invariant. Any
-# drift = the schema-freeze is broken = a bug.
-# Per-site fingerprint: (Set(keys), n_templates, sorted scalars, key→template
-# partition as a relabel-invariant Set-of-Sets-of-keys).
-function _schema_fingerprint(psi)
-    fps = Vector{Any}(undef, length(psi))
-    for (i, T) in enumerate(psi)
-        s = try ITensors.get_external_storage(T) catch _ nothing end
-        if s isa SparseBackends.WrappedAliasedBlockSparse
-            a = s.aliased
-            groups = Dict{Int,Vector{Int}}()
-            for (j, aid) in enumerate(a.alias_ids); push!(get!(groups, aid, Int[]), j); end
-            partition = Set(Set(a.keys[j] for j in g) for g in values(groups))
-            sc = sort([(round(real(z), digits=10), round(imag(z), digits=10)) for z in a.scalars])
-            fps[i] = (nkeys=length(a.keys), nt=a.n_templates,
-                      keys=Set(a.keys), scalars=sc, partition=partition)
-        else
-            fps[i] = nothing
-        end
-    end
-    return fps
-end
-
-function _compare_schema(init, cur; label="")
-    drift = String[]
-    for i in eachindex(init)
-        ii, cc = init[i], cur[i]
-        if ii === nothing || cc === nothing
-            ii === cc || push!(drift, "site $i storage-kind changed ($(ii===nothing ? "→aliased" : "aliased→dense/other"))")
-            continue
-        end
-        ii.nkeys      != cc.nkeys     && push!(drift, "site $i nkeys $(ii.nkeys)→$(cc.nkeys)")
-        ii.nt         != cc.nt        && push!(drift, "site $i n_templates $(ii.nt)→$(cc.nt)")
-        ii.keys       != cc.keys      && push!(drift, "site $i KEYS set changed")
-        ii.scalars    != cc.scalars   && push!(drift, "site $i SCALARS multiset changed")
-        ii.partition  != cc.partition && push!(drift, "site $i key→template PARTITION changed")
-    end
-    if isempty(drift)
-        println("  [$label] SCHEMA INVARIANT ✓ (keys / partition / scalars / n_templates unchanged at all sites)")
-    else
-        println("  [$label] ⚠ SCHEMA DRIFT ($(length(drift))):")
-        for d in drift; println("        $d"); end
-    end
-    return isempty(drift)
-end
-
-const _INIT_SCHEMA = Ref{Any}(nothing)
-
-function check_aliased_invariant(psi; label="")
-    bad = Int[]
-    for (i, T) in enumerate(psi)
-        if !(ITensors.has_external_storage(T) && T.tensor.data isa SparseBackends.WrappedAliasedBlockSparse)
-            push!(bad, i)
-        end
-    end
-    if !isempty(bad)
-        @warn "[$label] psi sites NOT aliased: $bad (alias invariant broken)"
-    else
-        println("  [$label] psi storage invariant ✓ (all $(length(psi)) sites aliased)")
-    end
-    return isempty(bad)
-end
-
-function report_state(label, psi, maxdim, E=nothing; verbose=false)
-    mb   = round(mps_footprint_bytes(psi) / 2^20, digits=3)
-    rep  = reported_linkdims(psi)
-    hon  = honest_linkdims(psi)
-    mx   = isempty(rep) ? 0 : maximum(rep)
-    mxh  = isempty(hon) ? 0 : maximum(hon)
-    println("  $label: footprint=$(mb) MiB  reported_maxlinkdim=$mx  honest_maxlinkdim=$mxh  (MAXDIM=$maxdim)")
-    println("    linkdims(reported, single shared idx)=$rep")
-    println("    linkdims(honest, ∏all shared)=$hon" * (E === nothing ? "" : "  E=$E"))
-    over = findall(h -> h > maxdim, hon)
-    if isempty(over)
-        println("    ✓ honest bond dim obeys MAXDIM at every bond.")
-    else
-        println("    ✗ honest bond dim EXCEEDS MAXDIM at bonds $over — rank not honestly bounded.")
-    end
-    if verbose
-        rows, payload, keys_b, site_total, full, bs_eq, ratios = inspect_storage(psi)
-        for r in rows; println("    $r"); end
-        non_data = site_total - payload
-        min_r  = isempty(ratios) ? 0.0 : minimum(ratios)
-        mean_r = isempty(ratios) ? 0.0 : sum(ratios)/length(ratios)
-        println("    --- MPS totals ---")
-        println("    data(numeric)=$(round(payload/1024,digits=2)) KiB   keys+ids+scalars=$(round(keys_b/1024,digits=2)) KiB   non-data=$(round(non_data/1024,digits=2)) KiB")
-        println("    sum-of-sites=$(round(site_total/1024,digits=2)) KiB   if_BS=$(round(bs_eq/1024,digits=2)) KiB   if_dense=$(round(full/1024,digits=2)) KiB")
-        @printf("    vs-dense payload compression = %.2fx   vs-BS = %.2fx\n", full/max(payload,1), bs_eq/max(payload,1))
-        @printf("    alias dedup (nb/nt): min=%.2fx  mean=%.2fx\n", min_r, mean_r)
-    end
-end
-
-function run_sweeps(H, psi0, n_sweeps::Int, maxdim::Int; cutoff=1e-10, mindim=1, target_E=NaN, label="ALI")
+function run_sweeps(H, psi0, n_sweeps::Int, maxdim::Int; cutoff=1e-10, mindim=1, target_E=NaN, label="ALI", run_mode::Symbol=:bop_aliased)
     psi = psi0
     # SB_SCHEMA_DBG: print the P-classification (sparse keys vs dense tail) of the
     # freshly-constructed aliased ψ at each site — the reference schema that the
@@ -343,7 +146,7 @@ function run_sweeps(H, psi0, n_sweeps::Int, maxdim::Int; cutoff=1e-10, mindim=1,
     target_reached_sweep = 0; target_reached_cum = NaN; target_reached_cum_excl1 = NaN
     for i in 1:n_sweeps
         sw = Sweeps(1); setmaxdim!(sw, maxdim); setmindim!(sw, mindim); setcutoff!(sw, cutoff)
-        t = @elapsed (E, psi, _esw, terr) = dmrg(H, psi, sw; outputlevel=0, use_early_exit=false)
+        t = @elapsed (E, psi, _esw, terr) = dmrg(H, psi, sw; outputlevel=0, use_early_exit=false, run_mode=run_mode)
         cum += t; if i > 1; cum_excl1 += t; end
         @printf("  [%s sweep %2d] t=%8.3fs  E=%.12f  maxtruncerr=%.3e\n", label, i, t, E, terr)
         check_aliased_invariant(psi; label="after sweep $i")
@@ -369,14 +172,10 @@ let
     target_E = parsed_args["target-energy"]
 
     println("=== KL benchmark — ALIASED ψ (Path-B) ===")
-    println("BMF_ISO_PATH=", ENV["BMF_ISO_PATH"], "  BMF_APPLY_MINV=", ENV["BMF_APPLY_MINV"],
-            "  (Path-B: A = M⁻¹·H_eff — the valid path for non-iso aliased ψ)")
+    println("run_mode=:$(parsed_args["run-mode"])  (Path-B: B = M⁻¹ᐟ²·H_eff·M⁻¹ᐟ²; aliased=no-densify seed, densify=env-dressed densified seed)")
     println("Projector sign = $psign  (P = ∏(I", psign > 0 ? "+" : "-", "C)/2)")
     println("N_plaq=$N_plaq  spin=$spin  n_sweeps=$n_sweeps  maxdim=$maxdim  target_E=$(isnan(target_E) ? "—" : target_E)")
-    _percm = get(ENV, "SB_ALIASED_PERCM_CAP", "0")
-    println("SB_ALIASED_PERCM_CAP=$_percm  → ", _percm == "1" ?
-            "CAPPED (mult=fld(maxdim,channel), honest_bd≤maxdim — starved, worse energy/maxdim)" :
-            "UNCAPPED (mult=maxdim, honest_bd=channel×maxdim — the benchmarked regime) [DEFAULT]")
+    println("UNCAPPED (mult=maxdim, honest_bd=channel×maxdim — the benchmarked regime) [DEFAULT]")
     println("ψ = ALIASED (P·ψ₀); DMRG on BARE H (constraint enforced structurally by channel sparsity).")
     println("Building setup for N=$N_plaq plaquettes ...")
     t_setup = @elapsed (H, psi_ali) = build_setup(N_plaq, psign, spin)
@@ -407,8 +206,9 @@ let
     reset_timer!(ITensorMPS.PROJMPO_TIMER)
     reset_timer!(SparseBackends.TIMER)
     SparseBackends.reset_cas_stats!()
+    SparseBackends.reset_roofline!()  # self-gates on SB_ROOFLINE (the single timing flag)
     println("\n=== RUN ($n_sweeps sweeps at maxdim=$maxdim; sweep 1 = JIT) ===")
-    res = run_sweeps(H, psi_ali, n_sweeps, maxdim; target_E=target_E)
+    res = run_sweeps(H, psi_ali, n_sweeps, maxdim; target_E=target_E, run_mode=Symbol(parsed_args["run-mode"]))
     E_prof = res.E; psi_prof = res.psi
 
     avg_excl1 = n_sweeps > 1 ? res.total_excl1 / (n_sweeps - 1) : NaN
@@ -451,12 +251,19 @@ let
         println("    Datastructure regression, NOT mere overhead — diagnose before any fix (hypothesis-tag it).")
     end
 
-    if get(ENV, "SB_CAS_STATS", "0") == "1"
+    # SB_ROOFLINE=1 is the ONE switch for the full kernel timing breakdown: the
+    # per-phase roofline (GEMM-only vs A-permute / Bconv / accum / prepass /
+    # finalize+sortperm / loop bookkeeping), the CAS redundancy counters, AND the
+    # PROJMPO/SparseBackends TimerOutputs trees. Off by default — a normal run prints
+    # only the per-sweep energies and the regression verdict.
+    if get(ENV, "SB_ROOFLINE", "0") == "1"
+        print_roofline_ceilings()
+        println("\n========== kernel roofline (SB_ROOFLINE) =========="); SparseBackends.show_roofline()
         println("\n========== CAS redundancy stats =========="); SparseBackends.show_cas_stats()
+        println("\n========== ITensorMPS.PROJMPO_TIMER ==========")
+        print_timer(ITensorMPS.PROJMPO_TIMER)
+        println("\n========== SparseBackends.TIMER ==========")
+        print_timer(SparseBackends.TIMER)
     end
-    println("\n========== ITensorMPS.PROJMPO_TIMER ==========")
-    print_timer(ITensorMPS.PROJMPO_TIMER)
-    println("\n========== SparseBackends.TIMER ==========")
-    print_timer(SparseBackends.TIMER)
 end
 nothing

@@ -39,7 +39,7 @@ end
     return true
 end
 
-# Redundancy counters (SB_CAS_STATS=1): quantify how much the per-block loop
+# Redundancy counters (reported under SB_ROOFLINE): quantify how much the per-block loop
 # repeats work. ntidA = Σ A.n_templates over calls; ngemm = total GEMMs (unique
 # combined_tids); niter = total block-iterations. Then:
 #   gemms_per_template = ngemm / ntidA   → how many times each A-template is
@@ -47,16 +47,12 @@ end
 #   iters_per_gemm     = niter / ngemm   → combined_tid dedup factor (≈1 ⇒ none)
 const _CAS_NCALLS = Ref(0); const _CAS_NTIDA = Ref(0)
 const _CAS_NGEMM  = Ref(0); const _CAS_NITER = Ref(0)
-# Fusion / locality diagnostic (SB_FUSION_DIAG=1):
-#   NGRP   = Σ over calls of #fusion groups (distinct (tidA,m_a) left operands)
-#   NGRP1  = #groups with exactly one work item (not fusable)
-#   GMAX   = largest fusion group seen (max B-slices sharing a left operand)
-#   SPRANGE= Σ over groups of (max_sp_lin - min_sp_lin) → how scattered the B-slices
-#            a group must gather are (locality cost proxy; 0 ⇒ already contiguous)
-# fusion_factor = NGEMM/NGRP (max BLAS-call reduction by operand fusion); >1 ⇒ fusable.
+# Fusion / locality diagnostic: REMOVED for now (counters retained but never
+# incremented — _fusion_diag is hard-off). Re-enable by restoring the accounting
+# block and a gate if the operand-fusion analysis is needed again.
 const _CAS_NGRP = Ref(0); const _CAS_NGRP1 = Ref(0); const _CAS_GMAX = Ref(0)
 const _CAS_SPRANGE = Ref(0)
-# Output-block dedup (SB_CAS_STATS=1, _direct path): NWORK = Σ (akey × m_a × m_b)
+# Output-block dedup (reported under SB_ROOFLINE, _direct path): NWORK = Σ (akey × m_a × m_b)
 # work items; NPEND = Σ n_pending (distinct output blocks). out_dedup = NWORK/NPEND.
 # ≈1 ⇒ each output block gets exactly ONE contribution ⇒ the β=1 read-modify-write
 # accumulate + the zero-fill prepass are both unnecessary (a scaled write suffices).
@@ -105,6 +101,14 @@ reset_roofline!() = (_RF_ON[] = get(ENV,"SB_ROOFLINE","0")=="1"; _RF_FLOPS[]=0.0
                      _RF_CONV_NS[]=0.0; _RF_ACC_NS[]=0.0; _RF_PRE_NS[]=0.0; _RF_ALLOC_NS[]=0.0; _RF_FIN_NS[]=0.0; _RF_LOOP_NS[]=0.0;
                      _RF_BLAS_SWITCH_NS[]=0.0; _RF_SPAWN_NS[]=0.0; _RF_REDUCE_NS[]=0.0; _RF_SETUP_NS[]=0.0;
                      _RF_PERMA_NS[]=0.0; _RF_PERMA_HITS[]=0; _RF_PERMA_CALLS[]=0)
+
+# THE single timing/instrumentation switch. SB_ROOFLINE=1 is the ONLY env flag:
+# it turns on the per-phase _RF timers (GEMM-only vs A-permute / Bconv / accum /
+# prepass / finalize+sortperm / loop bookkeeping) AND the CAS redundancy counters,
+# and both are reported when it is set. There is no separate SB_CAS_STATS env var
+# (CAS counting is gated on this) and SB_FUSION_DIAG is removed for now (it built a
+# per-call dict that perturbed the path being measured).
+@inline _roofline_on() = get(ENV, "SB_ROOFLINE", "0") == "1"
 @inline function _rf_gemm!(M::Int, N::Int, K::Int)
     if _RF_ON[]
         _RF_FLOPS[] += 8.0*M*N*K
@@ -134,7 +138,7 @@ function show_roofline()
             " s   fired ", _RF_PERMA_HITS[], "/", _RF_PERMA_CALLS[], " calls (non-identity permA)")
     println("[ROOFLINE]   align: ALIGN_OK=", _ALIGN_OK[], " fallback=", _ALIGN_FALLBACK[],
             "   recast_permutes=", _RECAST_PERMUTE_HITS[],
-            "   (ALIGN_OK>0 ⇒ output reorder fired; A-permute still high ⇒ order ≠ kernel canonical)")
+            "   (ALIGN_OK>0 ⇒ output reorder fired)")
     if _RF_BLAS_SWITCH_NS[] + _RF_SPAWN_NS[] + _RF_REDUCE_NS[] > 0.0
         println("[ROOFLINE] threaded overhead:  blas_switch=", round(_RF_BLAS_SWITCH_NS[]/1e9,digits=3),
                 " s  parallel_exec=", round(_RF_SPAWN_NS[]/1e9,digits=3),
@@ -346,7 +350,7 @@ function _contract_dense_threaded!(
         LinearAlgebra.BLAS.set_num_threads(_blas_save)
         _RF_ON[] && (_RF_BLAS_SWITCH_NS[] += Float64(time_ns() - _blas_t0r))
     end
-    if get(ENV, "SB_CAS_STATS", "0") == "1"
+    if _roofline_on()
         _CAS_NWORK[] += length(A.keys) * Mmov_total * Nm
         _CAS_NPEND[] += n_pending
     end
@@ -365,11 +369,529 @@ function _contract_dense_threaded!(
     return C
 end
 
+
+@inline function _gemm_mode!(C, A, B, α, β, ::Val{:AthenB}, ::Val{bconv}, TC) where {bconv}
+    B2 = bconv ? convert(Matrix{TC}, B) : B
+    mul!(C, A, B2, α, β)
+end
+@inline function _gemm_mode!(C, A, B, α, β, ::Val{:BthenA}, ::Val{bconv}, TC) where {bconv}
+    B2 = bconv ? convert(Matrix{TC}, B) : B
+    mul!(C, transpose(B2), transpose(A), α, β)
+end
+# 3-arg (overwrite, α=1/β=0) variants. NOT equivalent to passing one(TC)/zero(TC)
+# to the 5-arg form above: the 3-arg `mul!` dispatches through MulAddMul{true,false}
+# (a strong-zero, scaling-free BLAS path) which is bit-for-bit what the pre-refactor
+# fused GEMM used. Keep these for the fused path so output stays bit-identical.
+@inline function _gemm_mode!(C, A, B, ::Val{:AthenB}, ::Val{bconv}, TC) where {bconv}
+    B2 = bconv ? convert(Matrix{TC}, B) : B
+    mul!(C, A, B2)
+end
+@inline function _gemm_mode!(C, A, B, ::Val{:BthenA}, ::Val{bconv}, TC) where {bconv}
+    B2 = bconv ? convert(Matrix{TC}, B) : B
+    mul!(C, transpose(B2), transpose(A))
+end
+
+function _iter_runs(f, A, join_posA, n_sp, sp_strides, Bp, NB, K, N, Nm)
+    iA = firstindex(A.keys); nA = lastindex(A.keys)
+    @inbounds while iA <= nA
+        iA2   = _advance_run(A.keys, iA, nA, join_posA)
+        akey0 = A.keys[iA]
+        sp_lin = 1
+        for t in 1:n_sp; sp_lin += (akey0[join_posA[t]] - 1) * sp_strides[t]; end
+        Bsub   = n_sp == 0 ? Bp : (@views Bp[ntuple(t -> akey0[join_posA[t]], n_sp)...,
+                                                ntuple(_ -> Colon(), NB - n_sp)...])
+        f(iA, iA2, akey0, sp_lin, reshape(Bsub, K, N, Nm))
+        iA = iA2
+    end
+end
+
+# ── BLAS fast-path helpers (the can_blas branch of _contract_dense_serial!) ───
+# Each specializes on MODE (:AthenB / :BthenA) so the GEMM + scatter compile
+# branch-free per mode (chosen once via a function barrier at the call site).
+@inline _gemm_timer_label(::Val{:AthenB}) = "mul!"
+@inline _gemm_timer_label(::Val{:BthenA}) = "mul_T!"
+
+# Fused-GEMM output buffer Ffull holds ALL Nm moved-keepB slabs at once:
+# AthenB ⇒ (M, N·Nm), BthenA ⇒ (N·Nm, M). Backed by a task-local pool (default;
+# resize! ≈ no-op after warmup, and it's fully overwritten by each GEMM so reuse
+# is safe). SB_ALIASED_KERNEL_POOL=0 forces a fresh allocation per call.
+function _alloc_ffull(::Type{TC}, M::Int, N::Int, Nm::Int, mode::Symbol) where {TC}
+    frows, fcols = mode === :AthenB ? (M, N * Nm) : (N * Nm, M)
+    if get(ENV, "SB_ALIASED_KERNEL_POOL", "1") == "1"
+        fb = _ws_ffull(TC); resize!(fb, frows * fcols)
+        return reshape(fb, frows, fcols)          # dense-Vector reshape ⇒ Matrix{TC}
+    end
+    return Matrix{TC}(undef, frows, fcols)
+end
+
+# Single-pass: cid for output key `ck`, assigned on first sight (in iteration
+# order) and its output block zeroed. cids run 1,2,… == length(ck_to_cid) order.
+@inline function _cid_single_pass!(ck_to_cid, pending::Vector{TC}, ck, blksize::Int) where {TC}
+    cid = get(ck_to_cid, ck, 0)
+    if cid == 0
+        cid = length(ck_to_cid) + 1
+        ck_to_cid[ck] = cid
+        need = cid * blksize
+        length(pending) < need && resize!(pending, max(need, 2 * length(pending), blksize))
+        @views fill!(pending[(cid - 1) * blksize + 1 : cid * blksize], zero(TC))
+    end
+    return cid
+end
+
+# Accumulate αA·(the m_b-th slab of Ffull) into the output block at `outoff`.
+# AthenB slab = N contiguous columns; BthenA slab = an N-row band.
+@inline function _scatter_slab!(pending, outoff::Int, αA, Ffull, m_b_lin::Int,
+                                M::Int, N::Int, ::Val{:AthenB}, lmap)
+    cb = (m_b_lin - 1) * N
+    if lmap === nothing
+        oblk = reshape(view(pending, outoff + 1 : outoff + M * N), M, N)
+        @views oblk .+= αA .* Ffull[:, cb + 1 : cb + N]
+    else
+        # Interleaved Cdense: the GEMM result is in [keepA, keepB] order but the
+        # output block's dense tail is in the (interleaved) Cdense order, so each
+        # GEMM element lands at the precomputed block position lmap[gemm_linear].
+        # Same element count as the contiguous write — just strided.
+        @inbounds for b in 1:N, a in 1:M
+            pending[outoff + lmap[a + (b - 1) * M]] += αA * Ffull[a, cb + b]
+        end
+    end
+end
+@inline function _scatter_slab!(pending, outoff::Int, αA, Ffull, m_b_lin::Int,
+                                M::Int, N::Int, ::Val{:BthenA}, lmap)
+    # lmap is always nothing here: interleaved Cdense is realized via the :AthenB
+    # GEMM + lmap path (chosen in contract_shared!), never :BthenA.
+    rb   = (m_b_lin - 1) * N
+    oblk = reshape(view(pending, outoff + 1 : outoff + M * N), N, M)
+    @views oblk .+= αA .* Ffull[rb + 1 : rb + N, :]
+end
+
+# Precompute the linear-index map for an interleaved-Cdense strided scatter:
+# lmap[g] = the column-major position within the output block (Cdense order) of
+# the element at column-major position g in the GEMM result ([keepA…, keepB…]
+# order). Built once per contract_shared! call; consumed by _scatter_slab!.
+function _build_interleave_lmap(Cdense::AbstractVector, desired_keepA::AbstractVector,
+                                desired_keepB::AbstractVector, cdims::Vector{Int})
+    n = length(Cdense)
+    dimof  = Dict(Cdense[i] => cdims[i] for i in 1:n)
+    gorder = vcat(desired_keepA, desired_keepB)               # GEMM axis order
+    gdims  = Int[dimof[l] for l in gorder]
+    gstride = ones(Int, n); for i in 2:n; gstride[i] = gstride[i-1] * gdims[i-1]; end
+    cstride = ones(Int, n); for i in 2:n; cstride[i] = cstride[i-1] * cdims[i-1]; end
+    gposof = Dict(gorder[g] => g for g in 1:n)                # Cdense leg -> GEMM axis
+    gpos   = Int[gposof[Cdense[p]] for p in 1:n]
+    total  = isempty(gdims) ? 1 : prod(gdims)
+    lmap   = Vector{Int}(undef, total)
+    @inbounds for l in 1:total
+        lc = 1
+        for p in 1:n
+            g     = gpos[p]
+            idx_g = ((l - 1) ÷ gstride[g]) % gdims[g]         # 0-based index along axis g
+            lc   += idx_g * cstride[p]
+        end
+        lmap[l] = lc
+    end
+    return lmap
+end
+
+# The fused-GEMM run loop, specialized on MODE. One GEMM per (A-template, m_a)
+# produces all Nm slabs; each slab is scattered (β=1, weighted by αA) into its
+# deduplicated output block. ck_to_cid is pre-filled (two-pass) or grown here
+# (single-pass). Mutates `pending`/`ck_to_cid` in place only ⇒ no captured-Int box.
+function _blas_run!(A, Bp, pending::Vector{TC}, ck_to_cid, Ffull, _ckey,
+                    M::Int, N::Int, K::Int, Nm::Int, Mmov_total::Int,
+                    n_sp::Int, NB::Int, join_posA, sp_strides, blksize::Int,
+                    _bconv::Bool, _sp::Bool, ::Val{MODE}, lmap=nothing) where {TC,MODE}
+    _iter_runs(A, join_posA, n_sp, sp_strides, Bp, NB, K, N, Nm) do iA, iA2, _akey0, _sp_lin, Bsub_3d
+        _ct0  = _RF_ON[] ? time_ns() : UInt64(0)
+        Bfull = reshape(Bsub_3d, K, N * Nm)
+        _bconv && (Bfull = convert(Matrix{TC}, Bfull))     # contiguous copy for BLAS
+        _RF_ON[] && (_RF_CONV_NS[] += Float64(time_ns() - _ct0))
+        for ii in iA:(iA2 - 1)
+            akey = A.keys[ii]; αA = convert(TC, A.scalars[ii])
+            tmpl_A_3d = reshape(_aliased_template_view(A, A.alias_ids[ii]), M, Mmov_total, K)
+            for m_a_lin in 1:Mmov_total
+                Amat = @view tmpl_A_3d[:, m_a_lin, :]      # (M, K)
+                _rf_gemm!(M, N * Nm, K)
+                _gt0 = _RF_ON[] ? time_ns() : UInt64(0)
+                @timeit TIMER _gemm_timer_label(Val(MODE)) _gemm_mode!(
+                    Ffull, Amat, Bfull, Val(MODE), Val(false), TC)
+                _RF_ON[] && (_RF_GEMM_NS[] += Float64(time_ns() - _gt0))
+                for m_b_lin in 1:Nm
+                    ck  = _ckey(akey, m_a_lin, m_b_lin)
+                    cid = _sp ? _cid_single_pass!(ck_to_cid, pending, ck, blksize) : ck_to_cid[ck]
+                    _acct0 = _RF_ON[] ? time_ns() : UInt64(0)
+                    _scatter_slab!(pending, (cid - 1) * blksize, αA, Ffull, m_b_lin, M, N, Val(MODE), lmap)
+                    _RF_ON[] && (_RF_ACC_NS[] += Float64(time_ns() - _acct0))
+                end
+            end
+        end
+    end
+    return nothing
+end
+
+# Finalize the direct-output path: publish `pending` as C's templates and write
+# the deduplicated keys. Two-pass already assigned cids in prefix-sorted order
+# (no sort); single-pass assigned first-seen order, so sort the keys here.
+# Zero-copy publish: `pending` already holds the result contiguously (it IS the
+# task-local pool buffer under SB_ALIASED_PREALLOC_BUF), so hand it straight to
+# C instead of append!-copying the whole buffer every call (that copy was the
+# dominant finalize cost). C's old (emptied-at-entry) template buffer is recycled
+# back into the pool so the next call reuses its capacity — and so the pool no
+# longer aliases the buffer now owned by C.
+function _finalize_direct!(C::AliasedBlockSparse{TC,NC,N2C,PC}, pending::Vector{TC},
+                           ck_to_cid, _sp::Bool) where {TC,NC,N2C,PC}
+    _ft0 = _RF_ON[] ? time_ns() : UInt64(0)
+    np = length(ck_to_cid); bs = C.blksize
+    resize!(pending, np * bs)
+    recycled = C.templates
+    C.templates = pending
+    empty!(recycled)
+    task_local_storage((:aliased_ws_pending, TC), recycled)
+    C.n_templates = np
+    resize!(C.keys, np); resize!(C.alias_ids, np); resize!(C.scalars, np)
+    for (k, cid) in ck_to_cid
+        C.keys[cid] = k; C.alias_ids[cid] = cid; C.scalars[cid] = one(TC)
+    end
+    if _sp
+        pdims = ntuple(i -> C.dims[i], Val(PC))
+        p = sortperm(C.keys; by = k -> _prefix_lin(k, pdims))
+        C.keys = C.keys[p]; C.alias_ids = C.alias_ids[p]; C.scalars = C.scalars[p]
+    end
+    _RF_ON[] && (_RF_FIN_NS[] += Float64(time_ns() - _ft0))
+    return C
+end
+
+# Generic rank-1 accumulate of one output block: dest = Σ_k A[:,k]⊗B[k,:]
+# (AthenB) or B[k,:]⊗A[:,k] (BthenA), matching the BLAS GEMM's index order.
+function _rank1_block!(dest, Amat, Bmat, K::Int, mode::Symbol)
+    fill!(dest, zero(eltype(dest)))
+    o = one(eltype(dest))
+    if mode === :AthenB
+        @inbounds for k in 1:K; _rank1_add_generic!(dest, o, @view(Amat[:, k]), @view(Bmat[k, :])); end
+    else
+        @inbounds for k in 1:K; _rank1_add_generic!(dest, o, @view(Bmat[k, :]), @view(Amat[:, k])); end
+    end
+    return dest
+end
+
+# ── Generic (non-BLAS) fallback ──────────────────────────────────────────────
+# Reached only when can_blas is false (non-BlasFloat / mismatched eltypes). Builds
+# each combined template by a generic rank-1 accumulate, dedupes via combined_tid,
+# and contributes through the lazy alias/accum dicts. Runs a handful of times per
+# sweep, so the runtime `mode` branch in _rank1_block! is a non-issue.
+function _contract_dense_generic!(
+        C::AliasedBlockSparse{TC,NC,N2C,PC}, A, Bp, blksize::Int,
+        M::Int, N::Int, K::Int, Nm::Int, Mmov_total::Int, n_sp::Int, NB::Int,
+        join_posA, sp_strides, mode::Symbol, _prealloc_buf::Bool, _cas_stats::Bool,
+        pending::Vector{TC}, key_to_alias, key_to_accum, combined_tid_map, _ckey,
+    ) where {TC,NC,N2C,PC}
+    n_pending  = 0
+    _cas_niter = 0
+    @timeit TIMER "main_loop" begin
+        _iter_runs(A, join_posA, n_sp, sp_strides, Bp, NB, K, N, Nm) do iA, iA2, _akey0, sp_lin, Bsub_3d
+            for ii in iA:(iA2 - 1)
+                tidA = A.alias_ids[ii]; αA = convert(TC, A.scalars[ii]); akey = A.keys[ii]
+                tmpl_A_3d = reshape(_aliased_template_view(A, tidA), M, Mmov_total, K)
+                for m_a_lin in 1:Mmov_total, m_b_lin in 1:Nm
+                    ct_key       = (tidA, sp_lin, m_a_lin, m_b_lin)
+                    combined_tid = get(combined_tid_map, ct_key, 0)
+                    if combined_tid == 0
+                        n_pending += 1; combined_tid = n_pending
+                        combined_tid_map[ct_key] = combined_tid
+                        Amat = @view tmpl_A_3d[:, m_a_lin, :]
+                        Bmat = @view Bsub_3d[:, :, m_b_lin]
+                        if _prealloc_buf
+                            need = combined_tid * blksize
+                            length(pending) < need && resize!(pending, max(need, 2 * length(pending), blksize))
+                            _rank1_block!(view(pending, (combined_tid - 1) * blksize + 1 : combined_tid * blksize),
+                                          Amat, Bmat, K, mode)
+                        else
+                            tmpl = Vector{TC}(undef, blksize)
+                            _rank1_block!(tmpl, Amat, Bmat, K, mode)
+                            append!(pending, tmpl)
+                        end
+                    end
+                    ckey = _ckey(akey, m_a_lin, m_b_lin)
+                    _cas_stats && (_cas_niter += 1)
+                    @timeit TIMER "cas.contribute" _aliased_contribute!(
+                        key_to_alias, key_to_accum, pending, ckey, combined_tid, αA, blksize)
+                end
+            end
+        end
+    end
+    if _cas_stats
+        _CAS_NCALLS[] += 1; _CAS_NTIDA[] += A.n_templates
+        _CAS_NGEMM[]  += n_pending; _CAS_NITER[] += _cas_niter
+    end
+    @timeit TIMER "cas.commit" _commit_aliased_dicts_lazy!(C, key_to_alias, key_to_accum, pending, n_pending)
+    return C
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _contract_dense_serial_outstat!  —  OUTPUT-STATIONARY AliasedBS × Dense kernel
+# ─────────────────────────────────────────────────────────────────────────────
+# Replaces the reduction-stationary (run-grouped) kernel + its per-work-item
+# `_ckey` + `ck_to_cid` hash (measured 30.9 s / N=12 md40 6-sweep — the single
+# largest matvec cost) AND its `_scatter_slab!` scatter, with NO hash and NO
+# scatter:
+#
+#   • Group A's blocks by their KEPT prefix (output prefix) instead of by the
+#     reduced shared-prefix. With A.keys stored col-major (kept = fast axes,
+#     shared = slow axes), a STABLE sort by the kept-prefix linear index gathers
+#     each output group's members in shared-prefix-ASCENDING order — i.e. the
+#     exact accumulation order the old kernel used ⇒ bit-identical reduction.
+#   • The output slot is then pure ARITHMETIC: cid = group_base +
+#     (m_a-1)·Nmov + m_b. No `_ckey` tuple, no Dict lookup.
+#   • The GEMM writes DIRECTLY into a contiguous slice of the output buffer and
+#     the shared-prefix reduction is `mul!`'s β=1 accumulation over the group's
+#     members — no separate accumulate/scatter pass.
+#       :AthenB — one (M,K)·(K,N·Nmov) GEMM per (group,m_a) lands as the Nmov
+#                 consecutive (M,N) blocks contiguously (Nmov batching kept ONLY
+#                 because it needs no non-local scatter).
+#       :BthenA — the batched slabs would be row-strided (non-contiguous), so we
+#                 emit one (N,K)·(K,M)→(N,M) GEMM per (m_a,m_b) block, each
+#                 written contiguously into its own block. Still no scatter.
+#   • β=0 on the first member overwrites (so the output buffer needs no
+#     pre-zeroing); β=1 on the rest accumulates.
+#
+# Same call signature as _contract_dense_serial! (drop-in dispatch), plus a trailing
+# `out_dense_perm` (default nothing). Two regimes, selected by that arg:
+#   • out_dense_perm === nothing  (default / non-SB_OUTSTAT_SCHED path): unchanged behaviour
+#     — GEMM in the dispatcher-chosen `mode` (:AthenB/:BthenA), plain finalize. Byte-identical
+#     to before, so runs that don't opt in are unaffected.
+#   • out_dense_perm !== nothing  (SB_OUTSTAT_SCHED): the kernel OWNS every requested order.
+#     It always GEMMs in natural :AthenB [keepA, keepB] order, then applies ONE `permutedims`
+#     phase (`out_dense_perm`, computed from labels in contract_shared!) to reach the requested
+#     order — AthenB→identity, BthenA→swap, interleaved→interleave. `permutedims` on the aliased
+#     storage permutes each template's dense tail AND remaps+sorts the prefix keys, so it
+#     subsumes the finalize sort. Self-contained: no `lmap`, no scatter, no fallback.
+
+function _contract_dense_serial_outstat!(
+    C             :: AliasedBlockSparse{TC,NC,N2C,PC},
+    A             :: AliasedBlockSparse{TA,NA,N2A,PA},
+    Bp,
+    blksize       :: Int,
+    M :: Int, N :: Int, K :: Int, Nm :: Int, Mmov_total :: Int,
+    Nmov_total    :: Int,
+    n_sp :: Int, NB :: Int,
+    join_posA, sp_strides,
+    _bconv        :: Bool, _noconv :: Bool,
+    mode          :: Symbol,
+    can_blas      :: Bool,
+    c_src_kind, c_src_idx,
+    movA_dims_vec, movB_dims_vec, movA_strides, movB_strides,
+    _fuse :: Bool, _direct :: Bool, _sp :: Bool,
+    _prealloc_buf :: Bool, _cas_stats :: Bool, _fusion_diag :: Bool,
+    pending       :: Vector{TC},
+    key_to_alias, key_to_accum, combined_tid_map,
+    Cscratch      :: Matrix{TC},
+    _fgroups,
+    lmap          = nothing,
+    out_dense_perm = nothing,
+) where {TC,NC,N2C,PC,TA,NA,N2A,PA}
+
+    # SB_OUTSTAT_SCHED path ⇔ out_dense_perm provided: own every order via a permute phase.
+    _use_perm = out_dense_perm !== nothing
+
+    nkeys = length(A.keys)
+    n_keep_pref = PA - n_sp                      # kept (output) prefix axes = 1:n_keep_pref
+
+    # Output key for one (group-representative akey, m_a, m_b). Built once per
+    # output block (n_pending times), NOT per work-item.
+    @inline _ckey(akey, m_a_lin, m_b_lin) = ntuple(j -> begin
+        kind = c_src_kind[j]; idx = c_src_idx[j]
+        kind === :A    ? akey[idx] :
+        kind === :movA ? Int((m_a_lin - 1) ÷ movA_strides[idx] % movA_dims_vec[idx]) + 1 :
+                         Int((m_b_lin - 1) ÷ movB_strides[idx] % movB_dims_vec[idx]) + 1
+    end, Val(PC))
+
+    if nkeys == 0
+        empty!(C.templates); C.n_templates = 0
+        empty!(C.keys); empty!(C.alias_ids); empty!(C.scalars)
+        return C
+    end
+
+    # ── 1) Group A's entries by kept-prefix (output prefix) ───────────────────
+    # keep-linear index (col-major over kept prefix axes 1:n_keep_pref).
+    keep_strides = Vector{Int}(undef, max(n_keep_pref, 1))
+    if n_keep_pref > 0
+        keep_strides[1] = 1
+        @inbounds for j in 2:n_keep_pref
+            keep_strides[j] = keep_strides[j-1] * A.dims[j-1]
+        end
+    end
+    @inline _keeplin(ii) = begin
+        kl = 1
+        @inbounds for j in 1:n_keep_pref
+            kl += (A.keys[ii][j] - 1) * keep_strides[j]
+        end
+        kl
+    end
+    keeplins = Vector{Int}(undef, nkeys)
+    @timeit TIMER "outstat.keylin" (@inbounds for ii in 1:nkeys; keeplins[ii] = _keeplin(ii); end)
+    # STABLE sort ⇒ within an equal-keep group the members stay in their original
+    # (shared-prefix-ascending) order ⇒ bit-identical reduction order.
+    order = @timeit TIMER "outstat.sort" sortperm(keeplins; alg = Base.Sort.MergeSort)
+
+    blk_per_group = Mmov_total * Nmov_total
+    # number of distinct kept-prefix groups
+    n_groups = 1
+    @inbounds for r in 2:nkeys
+        (keeplins[order[r]] != keeplins[order[r-1]]) && (n_groups += 1)
+    end
+    n_pending = n_groups * blk_per_group
+
+    resize!(pending, n_pending * blksize)
+    @timeit TIMER "outstat.fill" fill!(pending, zero(TC))   # β=1 accumulate starts from 0
+
+    # ── 2) Accumulate: output-stationary, GEMM-direct, β-reduction over members ──
+    # Under the permute path the kernel always produces natural :AthenB [keepA, keepB];
+    # the requested order (incl. BthenA / interleaved) is realized by the permute phase
+    # below. Non-permute path keeps the dispatcher-chosen mode (unchanged behaviour).
+    _kmode = _use_perm ? :AthenB : mode
+    if _kmode === :AthenB
+        _outstat_run!(C, A, Bp, pending, order, keeplins, n_keep_pref,
+                      blksize, M, N, K, Nm, Mmov_total, Nmov_total, n_sp, NB,
+                      join_posA, blk_per_group, _bconv, Val(:AthenB))
+    else
+        _outstat_run!(C, A, Bp, pending, order, keeplins, n_keep_pref,
+                      blksize, M, N, K, Nm, Mmov_total, Nmov_total, n_sp, NB,
+                      join_posA, blk_per_group, _bconv, Val(:BthenA))
+    end
+
+    # ── 3) Finalize: write keys (arithmetic cid in natural order), publish templates ──
+    @timeit TIMER "outstat.finalize" begin
+        recycled = C.templates
+        C.templates = pending
+        empty!(recycled)
+        task_local_storage((:aliased_ws_pending, TC), recycled)
+        C.n_templates = n_pending
+        resize!(C.keys, n_pending); resize!(C.alias_ids, n_pending); resize!(C.scalars, n_pending)
+        let gidx = 0, r = 1
+            @inbounds while r <= nkeys
+                r2 = r
+                while r2 < nkeys && keeplins[order[r2+1]] == keeplins[order[r]]; r2 += 1; end
+                rep = A.keys[order[r]]                   # any member: :A key parts share kept prefix
+                gbase = gidx * blk_per_group
+                for m_a in 1:Mmov_total, m_b in 1:Nmov_total
+                    cid = gbase + (m_a - 1) * Nmov_total + m_b
+                    C.keys[cid] = _ckey(rep, m_a, m_b)
+                    C.alias_ids[cid] = cid
+                    C.scalars[cid] = one(TC)
+                end
+                gidx += 1; r = r2 + 1
+            end
+        end
+    end
+
+    # ── 4) Output order ──
+    if _use_perm && !all(i -> out_dense_perm[i] == i, eachindex(out_dense_perm))
+        # PERMUTE PHASE (separate from the multiply, mirrors the input permA phase):
+        # C currently holds natural [keepA, keepB] dense data; relabel C's dense dims to
+        # that natural order, then permutedims to the requested order. permutedims permutes
+        # each template's dense tail AND remaps+sorts the prefix keys — so it also does the
+        # canonical key sort. Returns a fresh storage with the requested (target) dims.
+        orig_dims = C.dims
+        invp = invperm(out_dense_perm)
+        C.dims = ntuple(k -> k <= PC ? orig_dims[k] : orig_dims[PC + invp[k - PC]], Val(NC))
+        full_perm = vcat(collect(1:PC), Int[PC + out_dense_perm[i] for i in 1:N2C])
+        return @timeit TIMER "outstat.permute" permutedims(C, full_perm)
+    else
+        # No relayout needed (natural order == requested): canonical key sort only.
+        pdims = ntuple(i -> C.dims[i], Val(PC))
+        p = sortperm(C.keys; by = k -> _prefix_lin(k, pdims))
+        C.keys = C.keys[p]; C.alias_ids = C.alias_ids[p]; C.scalars = C.scalars[p]
+        return C
+    end
+end
+
+# Output-stationary accumulation, specialized on MODE. For each kept-prefix group,
+# each member (shared-prefix-ascending) contributes a GEMM accumulated (β) directly
+# into the group's contiguous output region — no scatter, no key lookup.
+function _outstat_run!(C, A, Bp, pending::Vector{TC}, order, keeplins,
+                       n_keep_pref::Int, blksize::Int, M::Int, N::Int, K::Int, Nm::Int,
+                       Mmov_total::Int, Nmov_total::Int, n_sp::Int, NB::Int, join_posA,
+                       blk_per_group::Int, _bconv::Bool, ::Val{MODE}) where {TC,MODE}
+    nkeys = length(order)
+    gidx = 0
+    r = 1
+    # Bslab cache: the contiguous B-slab depends ONLY on the shared-prefix key
+    # values (sp_vals); the same sp_vals recurs across many A-blocks within this
+    # contraction, so convert each distinct slab once and reuse (kills the bulk
+    # of outstat.conv). Keyed by the linearized sp index over Bp's first n_sp dims.
+    _Bdims = size(Bp)
+    _Bcache = (MODE === :AthenB && _bconv && n_sp > 0) ? Dict{Int,Matrix{TC}}() : nothing
+    @inbounds while r <= nkeys
+        # extent of this kept-prefix group within `order`
+        r2 = r
+        while r2 < nkeys && keeplins[order[r2+1]] == keeplins[order[r]]; r2 += 1; end
+        gbase = gidx * blk_per_group               # first block index (0-based) of group
+
+        for oi in r:r2
+            ii  = order[oi]
+            αA  = convert(TC, A.scalars[ii])
+            β   = one(TC)                           # pending pre-zeroed ⇒ accumulate from 0
+            akey = A.keys[ii]
+            tmpl_A_3d = reshape(_aliased_template_view(A, A.alias_ids[ii]), M, Mmov_total, K)
+            # B sub-block for this member's shared-prefix key (dense ⇒ just an offset/strided view)
+            if n_sp == 0
+                Bsub = Bp
+            else
+                sp_vals = ntuple(t -> akey[join_posA[t]], n_sp)
+                idx     = (sp_vals..., ntuple(_ -> Colon(), NB - n_sp)...)
+                Bsub    = @views Bp[idx...]
+            end
+            if MODE === :AthenB
+                if _Bcache === nothing
+                    Bslab = @timeit TIMER "outstat.conv" (_bconv ?
+                                convert(Matrix{TC}, reshape(Bsub, K, N * Nmov_total)) :
+                                Matrix{TC}(reshape(Bsub, K, N * Nmov_total)))
+                else
+                    sp_lin = 1; _st = 1
+                    for t in 1:n_sp
+                        sp_lin += (Int(sp_vals[t]) - 1) * _st
+                        _st *= _Bdims[t]
+                    end
+                    Bslab = get!(_Bcache, sp_lin) do
+                        @timeit TIMER "outstat.conv" convert(Matrix{TC}, reshape(Bsub, K, N * Nmov_total))
+                    end
+                end
+                for m_a in 1:Mmov_total
+                    off    = (gbase + (m_a - 1) * Nmov_total) * blksize
+                    # GEMM directly into the contiguous output region (zero-copy, BLAS-native).
+                    region = unsafe_wrap(Matrix{TC}, pointer(pending, off + 1), (M, N * Nmov_total))
+                    Amat   = @view tmpl_A_3d[:, m_a, :]      # (M,K)
+                    @timeit TIMER "outstat.gemm" mul!(region, Amat, Bslab, αA, β)
+                end
+            else  # :BthenA — per-block GEMM (batched slabs would be row-strided ⇒ would need a scatter)
+                Bslab3 = @timeit TIMER "outstat.conv" (_bconv ?
+                             convert(Array{TC,3}, reshape(Bsub, K, N, Nmov_total)) :
+                             Array{TC,3}(reshape(Bsub, K, N, Nmov_total)))
+                for m_a in 1:Mmov_total
+                    Amat = @view tmpl_A_3d[:, m_a, :]        # (M,K)
+                    for m_b in 1:Nmov_total
+                        off   = (gbase + (m_a - 1) * Nmov_total + (m_b - 1)) * blksize
+                        block = unsafe_wrap(Matrix{TC}, pointer(pending, off + 1), (N, M))
+                        Bmb   = @view Bslab3[:, :, m_b]      # (K,N)
+                        @timeit TIMER "outstat.gemm_T" mul!(block, transpose(Bmb), transpose(Amat), αA, β)
+                    end
+                end
+            end
+        end
+        gidx += 1; r = r2 + 1
+    end
+    return nothing
+end
+
 # ─────────────────────────────────────────────────────────────────────────────
 # _contract_dense_serial!
-# Serial fast-path (m_b-fused GEMM + BS-style β=1 direct output) and legacy
-# generic loop. Called from contract_shared!(C::AliasedBS, A::AliasedBS,
-# B::Dense, ...) when _threaded is false.
+# Serial AliasedBS × Dense kernel. Two paths: a BLAS fast path (fused per-m_a
+# GEMM + β=1 direct deduplicated output) and a generic rank-1 fallback. Called
+# from contract_shared! when _threaded is false. In the dispatcher
+# _fuse == _direct == can_blas, so BLAS path ⟺ can_blas; the legacy (_fuse,
+# !_direct)/(!_fuse,_direct) hybrids and the in-fallback BLAS branches were dead
+# and have been removed (the args _fuse/_direct/_noconv/_fusion_diag/Cscratch/
+# _fgroups are retained only to keep the dispatcher call site unchanged).
 # ─────────────────────────────────────────────────────────────────────────────
 function _contract_dense_serial!(
     C             :: AliasedBlockSparse{TC,NC,N2C,PC},
@@ -391,389 +913,77 @@ function _contract_dense_serial!(
     key_to_alias, key_to_accum, combined_tid_map,
     Cscratch      :: Matrix{TC},
     _fgroups,
+    lmap          = nothing,
 ) where {TC,NC,N2C,PC}
 
-    n_pending = 0
-    _cas_niter = 0
+    # Output key for one work item (akey, m_a_lin, m_b_lin); shared by both paths.
+    @timeit TIMER "ckey_closure!" begin
+        @inline _ckey(akey, m_a_lin, m_b_lin) = ntuple(j -> begin
+            kind = c_src_kind[j]; idx = c_src_idx[j]
+            kind === :A    ? akey[idx] :
+            kind === :movA ? Int((m_a_lin - 1) ÷ movA_strides[idx] % movA_dims_vec[idx]) + 1 :
+                             Int((m_b_lin - 1) ÷ movB_strides[idx] % movB_dims_vec[idx]) + 1
+        end, Val(PC))
+    end
 
-    # ckey closure and ck_to_cid are defined inside this function (not passed in).
-    @inline _ckey(akey, m_a_lin, m_b_lin) = ntuple(j -> begin
-        kind = c_src_kind[j]; idx = c_src_idx[j]
-        if kind === :A
-            akey[idx]
-        elseif kind === :movA
-            Int((m_a_lin - 1) ÷ movA_strides[idx] % movA_dims_vec[idx]) + 1
-        else
-            Int((m_b_lin - 1) ÷ movB_strides[idx] % movB_dims_vec[idx]) + 1
-        end
-    end, Val(PC))
+    # Generic fallback (non-BlasFloat / mismatched eltypes).
+    if !can_blas
+        return _contract_dense_generic!(C, A, Bp, blksize, M, N, K, Nm, Mmov_total,
+            n_sp, NB, join_posA, sp_strides, mode, _prealloc_buf, _cas_stats,
+            pending, key_to_alias, key_to_accum, combined_tid_map, _ckey)
+    end
 
-    # ── 7′) Fast paths: m_b-fused GEMM and/or BS-style β=1 direct output ──────
-    # Composable via (_fuse, _direct); "neither" falls through to the loop below.
-    if _fuse || _direct
-        # P2 pre-pass: dedup output keys → cid; zero a contiguous output slab in `pending`.
-        # Skipped when _sp (single-pass): cid assignment + per-block zeroing move inline.
-        ck_to_cid = _direct ? Dict{NTuple{PC,Int}, Int}() : nothing
-        if _direct && !_sp
-            _pt0 = _RF_ON[] ? time_ns() : UInt64(0)
-            # Two-pass sorted prepass: collect unique keys, sort by prefix linear index,
-            # assign cids in sorted order. Eliminates sortperm + 3 indexed copies from
-            # finalize (those 4 per-call allocations were the dominant finalize overhead).
-            _ckeys_pre = NTuple{PC,Int}[]
+    # ── BLAS fast path: fused per-(template, m_a) GEMM + β=1 direct output ────
+    ck_to_cid = Dict{NTuple{PC,Int}, Int}()
+
+    # Two-pass: dedup output keys up front, assign cids in prefix-sorted order (so
+    # finalize needs no sort) and zero the output slab. Single-pass (default,
+    # SB_ALIASED_SINGLE_PASS) skips this — cids are assigned inline in _blas_run!.
+    if !_sp
+        @timeit TIMER "prepass" begin
+            _pt0  = _RF_ON[] ? time_ns() : UInt64(0)
+            ckeys = NTuple{PC,Int}[]
             iAp = firstindex(A.keys); nAp = lastindex(A.keys)
             @inbounds while iAp <= nAp
                 iAp2 = _advance_run(A.keys, iAp, nAp, join_posA)
-                for ii in iAp:(iAp2-1)
+                for ii in iAp:(iAp2 - 1)
                     akey = A.keys[ii]
                     for m_a_lin in 1:Mmov_total, m_b_lin in 1:Nm
                         ck = _ckey(akey, m_a_lin, m_b_lin)
-                        haskey(ck_to_cid, ck) || (ck_to_cid[ck] = 0; push!(_ckeys_pre, ck))
+                        haskey(ck_to_cid, ck) || (ck_to_cid[ck] = 0; push!(ckeys, ck))
                     end
                 end
                 iAp = iAp2
             end
-            _pdims_pre = ntuple(i -> C.dims[i], Val(PC))
-            sort!(_ckeys_pre; by = k -> _prefix_lin(k, _pdims_pre))
-            for (i, ck) in enumerate(_ckeys_pre); ck_to_cid[ck] = i; end
-            n_pending = length(_ckeys_pre)
-            if get(ENV, "SB_CAS_STATS", "0") == "1"
-                # work items = Σ over A-keys of Mmov_total × Nm (one (akey,m_a,m_b) each)
-                _CAS_NWORK[] += length(A.keys) * Mmov_total * Nm
-                _CAS_NPEND[] += n_pending
-            end
-            resize!(pending, n_pending * blksize); fill!(pending, zero(TC))
+            pdims = ntuple(i -> C.dims[i], Val(PC))
+            sort!(ckeys; by = k -> _prefix_lin(k, pdims))
+            for (i, ck) in enumerate(ckeys); ck_to_cid[ck] = i; end
+            _cas_stats && (_CAS_NWORK[] += length(A.keys) * Mmov_total * Nm;
+                           _CAS_NPEND[] += length(ckeys))
+            resize!(pending, length(ckeys) * blksize); fill!(pending, zero(TC))
             _RF_ON[] && (_RF_PRE_NS[] += Float64(time_ns() - _pt0))
         end
-        # Fusion scratch and pending-mode group dedup.
-        _at0 = _RF_ON[] ? time_ns() : UInt64(0)
-        Ffull = if _fuse
-            _frows, _fcols = mode == :AthenB ? (M, N*Nm) : (N*Nm, M)
-            if get(ENV, "SB_ALIASED_KERNEL_POOL", "0") == "1"
-                _fb = _ws_ffull(TC); resize!(_fb, _frows * _fcols)
-                reshape(_fb, _frows, _fcols)   # shares _fb memory; Array ⇒ stays Matrix{TC}
-            else
-                Matrix{TC}(undef, _frows, _fcols)
-            end
-        else
-            Matrix{TC}(undef, 0, 0)
-        end
-        _RF_ON[] && (_RF_ALLOC_NS[] += Float64(time_ns() - _at0))
-        fgmap = (_fuse && !_direct) ? Dict{NTuple{3,Int}, Int}() : nothing
+    end
 
-        iA = firstindex(A.keys); nA = lastindex(A.keys)
+    _at0  = _RF_ON[] ? time_ns() : UInt64(0)
+    Ffull = _alloc_ffull(TC, M, N, Nm, mode)
+    _RF_ON[] && (_RF_ALLOC_NS[] += Float64(time_ns() - _at0))
+
+    @timeit TIMER "outer_loop" begin
         _loop_t0 = _RF_ON[] ? time_ns() : UInt64(0)
-        @inbounds while iA <= nA
-            iA2   = _advance_run(A.keys, iA, nA, join_posA)
-            akey0 = A.keys[iA]
-            sp_lin = 1
-            for t in 1:n_sp
-                sp_lin += (akey0[join_posA[t]] - 1) * sp_strides[t]
-            end
-            if n_sp == 0
-                Bsub = Bp
-            else
-                sp_vals = ntuple(t -> akey0[join_posA[t]], n_sp)
-                idx     = (sp_vals..., ntuple(_ -> Colon(), NB - n_sp)...)
-                @views Bsub = Bp[idx...]
-            end
-            Bsub_3d = reshape(Bsub, K, N, Nm)
-            # L3(a): hoist the per-(ii,m_a) redundant convert of Bfull to ONCE per
-            # shared-prefix run — Bfull depends only on Bsub, not ii/m_a. Bit-identical;
-            # removes the convert from the GEMM inner block. Only used in the _fuse path.
-            _ct0 = _RF_ON[] ? time_ns() : UInt64(0)
-            Bfull_run = _fuse ? (_bconv ? convert(Matrix{TC}, reshape(Bsub, K, N * Nm)) :
-                                          reshape(Bsub, K, N * Nm)) : nothing
-            _RF_ON[] && (_RF_CONV_NS[] += Float64(time_ns() - _ct0))
-
-            for ii in iA:(iA2-1)
-                akey = A.keys[ii]; tidA = A.alias_ids[ii]; αA = convert(TC, A.scalars[ii])
-                tmpl_A_3d = reshape(_aliased_template_view(A, tidA), M, Mmov_total, K)
-                for m_a_lin in 1:Mmov_total
-                    Amat = @view tmpl_A_3d[:, m_a_lin, :]            # (M, K)
-                    if _fuse
-                        _rf_gemm!(M, N * Nm, K)                      # roofline: Amat(M,K)·Bfull(K,N·Nm)
-                        _gt0 = _RF_ON[] ? time_ns() : UInt64(0)      # now times pure mul! (convert hoisted)
-                        if mode == :AthenB
-                            mul!(Ffull, Amat, Bfull_run)
-                        else
-                            mul!(Ffull, transpose(Bfull_run), transpose(Amat))
-                        end
-                        _RF_ON[] && (_RF_GEMM_NS[] += Float64(time_ns() - _gt0))
-                        if !_direct
-                            # pending mode: dedup the (tidA,sp_lin,m_a) group → Nm consecutive tids.
-                            gkey = (tidA, sp_lin, m_a_lin)
-                            base = get(fgmap, gkey, 0)
-                            if base == 0
-                                base = n_pending + 1; n_pending += Nm; fgmap[gkey] = base
-                                need = (base - 1 + Nm) * blksize
-                                length(pending) < need && resize!(pending, max(need, 2*length(pending), blksize))
-                                if mode == :AthenB
-                                    copyto!(pending, (base-1)*blksize + 1, vec(Ffull), 1, Nm*blksize)
-                                else
-                                    for mb in 1:Nm
-                                        boff = (base-1+mb-1)*blksize; rb = (mb-1)*N
-                                        for col in 1:M, row in 1:N
-                                            pending[boff + (col-1)*N + row] = Ffull[rb + row, col]
-                                        end
-                                    end
-                                end
-                            end
-                            for m_b_lin in 1:Nm
-                                ck = _ckey(akey, m_a_lin, m_b_lin)
-                                @timeit TIMER "cas.contribute" _aliased_contribute!(key_to_alias, key_to_accum,
-                                    pending, ck, base + (m_b_lin - 1), αA, blksize)
-                            end
-                        end
-                    end
-                    for m_b_lin in 1:Nm
-                        if _direct
-                            ck  = _ckey(akey, m_a_lin, m_b_lin)
-                            if _sp
-                                # Single-pass: assign cid on first sight, zero the new block.
-                                cid = get(ck_to_cid, ck, 0)
-                                if cid == 0
-                                    n_pending += 1; cid = n_pending
-                                    ck_to_cid[ck] = cid
-                                    need = n_pending * blksize
-                                    length(pending) < need &&
-                                        resize!(pending, max(need, 2 * length(pending), blksize))
-                                    @views fill!(pending[(cid-1)*blksize+1 : cid*blksize], zero(TC))
-                                end
-                                outoff = (cid - 1) * blksize
-                            else
-                                outoff = (ck_to_cid[ck] - 1) * blksize
-                            end
-                            if _fuse
-                                # Accumulate α·(m_b slab of Ffull) into output block — vectorized
-                                # broadcast (the scalar element-loop was the cause of `both`'s
-                                # regression). AthenB slab = contiguous columns; BthenA = row band.
-                                _acct0 = _RF_ON[] ? time_ns() : UInt64(0)
-                                if mode == :AthenB
-                                    cb   = (m_b_lin - 1) * N
-                                    oblk = reshape(view(pending, outoff+1:outoff+blksize), M, N)
-                                    @views oblk .+= αA .* Ffull[:, cb+1:cb+N]
-                                else
-                                    rb   = (m_b_lin - 1) * N
-                                    oblk = reshape(view(pending, outoff+1:outoff+blksize), N, M)
-                                    @views oblk .+= αA .* Ffull[rb+1:rb+N, :]
-                                end
-                                _RF_ON[] && (_RF_ACC_NS[] += Float64(time_ns() - _acct0))
-                            else
-                                Bmat = @view Bsub_3d[:, :, m_b_lin]
-                                _rf_gemm!(M, N, K)                   # roofline FLOP count (non-fuse path)
-                                if mode == :AthenB
-                                    Cblk = reshape(view(pending, outoff+1:outoff+blksize), M, N)
-                                    _bconv ? mul!(Cblk, Amat, convert(Matrix{TC}, Bmat), αA, one(TC)) :
-                                             mul!(Cblk, Amat, Bmat, αA, one(TC))
-                                else
-                                    Cblk = reshape(view(pending, outoff+1:outoff+blksize), N, M)
-                                    _bconv ? mul!(Cblk, transpose(convert(Matrix{TC}, Bmat)), transpose(Amat), αA, one(TC)) :
-                                             mul!(Cblk, transpose(Bmat), transpose(Amat), αA, one(TC))
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-            iA = iA2
+        # Function barrier on mode ⇒ the GEMM + scatter compile branch-free per mode.
+        if mode === :AthenB
+            _blas_run!(A, Bp, pending, ck_to_cid, Ffull, _ckey, M, N, K, Nm, Mmov_total,
+                       n_sp, NB, join_posA, sp_strides, blksize, _bconv, _sp, Val(:AthenB), lmap)
+        else
+            _blas_run!(A, Bp, pending, ck_to_cid, Ffull, _ckey, M, N, K, Nm, Mmov_total,
+                       n_sp, NB, join_posA, sp_strides, blksize, _bconv, _sp, Val(:BthenA), lmap)
         end
         _RF_ON[] && (_RF_LOOP_NS[] += Float64(time_ns() - _loop_t0))
-
-        if _sp && get(ENV, "SB_CAS_STATS", "0") == "1"
-            _CAS_NWORK[] += length(A.keys) * Mmov_total * Nm
-            _CAS_NPEND[] += n_pending
-        end
-        if _direct
-            _ft0 = _RF_ON[] ? time_ns() : UInt64(0)
-            # C.templates/keys/alias_ids/scalars were cleared at contract_shared! entry.
-            append!(C.templates, view(pending, 1:n_pending*blksize))
-            C.n_templates = n_pending
-            resize!(C.keys, n_pending); resize!(C.alias_ids, n_pending); resize!(C.scalars, n_pending)
-            for (k, cid) in ck_to_cid
-                C.keys[cid] = k; C.alias_ids[cid] = cid; C.scalars[cid] = one(TC)
-            end
-            if _sp
-                # Single-pass assigns cids in first-seen order; sort needed.
-                pdims = ntuple(i -> C.dims[i], Val(PC))
-                p = sortperm(C.keys; by = k -> _prefix_lin(k, pdims))
-                C.keys = C.keys[p]; C.alias_ids = C.alias_ids[p]; C.scalars = C.scalars[p]
-            end
-            # !_sp: sorted prepass already assigned cids in sorted order; no sort needed.
-            _RF_ON[] && (_RF_FIN_NS[] += Float64(time_ns() - _ft0))
-        else
-            @timeit TIMER "cas.commit" _commit_aliased_dicts_lazy!(C, key_to_alias, key_to_accum, pending, n_pending)
-        end
-        return C
+        _sp && _cas_stats && (_CAS_NWORK[] += length(A.keys) * Mmov_total * Nm;
+                              _CAS_NPEND[] += length(ck_to_cid))
+        _finalize_direct!(C, pending, ck_to_cid, _sp)
     end
-
-    # ── 7) Main loop: runs of A sharing the same shared-prefix values ─────────
-    iA = firstindex(A.keys); nA = lastindex(A.keys)
-
-    @inbounds while iA <= nA
-        iA2   = _advance_run(A.keys, iA, nA, join_posA)
-        akey0 = A.keys[iA]
-
-        # Column-major linear index of this run's shared-prefix values in B
-        sp_lin = 1
-        for t in 1:n_sp
-            sp_lin += (akey0[join_posA[t]] - 1) * sp_strides[t]
-        end
-
-        # Slice Bp along its leading n_sp dims; result has shape (red..., keepB..., movB...).
-        if n_sp == 0
-            Bsub = Bp
-        else
-            sp_vals = ntuple(t -> akey0[join_posA[t]], n_sp)
-            idx     = (sp_vals..., ntuple(_ -> Colon(), NB - n_sp)...)
-            @views Bsub = Bp[idx...]
-        end
-        # Reshape Bsub to (K, N, Nmov_total) so we can iterate over moved_keepB
-        # values by indexing the last dim.
-        Bsub_3d = reshape(Bsub, K, N, Nmov_total)
-
-        for ii in iA:(iA2-1)
-            akey = A.keys[ii]
-            tidA = A.alias_ids[ii]
-            αA   = convert(TC, A.scalars[ii])
-
-            # A template (full): laid out as (M, Mmov, K). Reshape per (m_a, *)
-            # slicing later.
-            tmpl_A_3d = reshape(_aliased_template_view(A, tidA), M, Mmov_total, K)
-
-            for m_a_lin in 1:Mmov_total, m_b_lin in 1:Nmov_total
-                ct_key = (tidA, sp_lin, m_a_lin, m_b_lin)
-                combined_tid = get(combined_tid_map, ct_key, 0)
-                if combined_tid == 0
-                    n_pending += 1
-                    combined_tid = n_pending
-                    combined_tid_map[ct_key] = combined_tid
-                    if _fusion_diag
-                        gk = (tidA, m_a_lin)
-                        g  = get(_fgroups, gk, nothing)
-                        if g === nothing
-                            _fgroups[gk] = Int[1, sp_lin, sp_lin]
-                        else
-                            g[1] += 1; g[2] = min(g[2], sp_lin); g[3] = max(g[3], sp_lin)
-                        end
-                    end
-                    Amat = @view tmpl_A_3d[:, m_a_lin, :]            # (M, K)
-                    Bmat = @view Bsub_3d[:, :, m_b_lin]              # (K, N)
-                    if _prealloc_buf
-                        # Write GEMM result directly into the preallocated pending buffer.
-                        off  = (combined_tid - 1) * blksize
-                        need = combined_tid * blksize
-                        length(pending) < need && resize!(pending, max(need, 2 * length(pending), blksize))
-                        dest = view(pending, off+1:off+blksize)   # contiguous, length blksize
-                        if can_blas
-                            if _noconv
-                                # P1: pass strided template/B views straight into BLAS (no copy).
-                                if mode == :AthenB
-                                    if _bconv
-                                        mul!(Cscratch, Amat, convert(Matrix{TC}, Bmat))
-                                    else
-                                        mul!(Cscratch, Amat, Bmat)
-                                    end
-                                else
-                                    if _bconv
-                                        mul!(Cscratch, transpose(convert(Matrix{TC}, Bmat)), transpose(Amat))
-                                    else
-                                        mul!(Cscratch, transpose(Bmat), transpose(Amat))
-                                    end
-                                end
-                            else
-                                # pre-P1 baseline (A/B): convert both operands.
-                                if mode == :AthenB
-                                    mul!(Cscratch, convert(Matrix{TC}, Amat), convert(Matrix{TC}, Bmat))
-                                else
-                                    mul!(Cscratch, convert(Matrix{TC}, transpose(Bmat)), convert(Matrix{TC}, transpose(Amat)))
-                                end
-                            end
-                            copyto!(dest, 1, vec(Cscratch), 1, blksize)   # column-major flat == reshape layout
-                        else
-                            fill!(dest, zero(TC))
-                            if mode == :AthenB
-                                for k in 1:K
-                                    _rank1_add_generic!(dest, one(TC), @view(Amat[:, k]), @view(Bmat[k, :]))
-                                end
-                            else
-                                for k in 1:K
-                                    _rank1_add_generic!(dest, one(TC), @view(Bmat[k, :]), @view(Amat[:, k]))
-                                end
-                            end
-                        end
-                    else
-                    new_tmpl = Vector{TC}(undef, C.blksize)
-                    if mode == :AthenB
-                        Cmat = reshape(new_tmpl, M, N)
-                        if can_blas
-                            if _bconv
-                                mul!(Cmat, Amat, convert(Matrix{TC}, Bmat))
-                            else
-                                mul!(Cmat, Amat, Bmat)
-                            end
-                        else
-                            fill!(new_tmpl, zero(TC))
-                            for k in 1:K
-                                _rank1_add_generic!(new_tmpl, one(TC),
-                                                    @view(Amat[:, k]), @view(Bmat[k, :]))
-                            end
-                        end
-                    else
-                        Cmat = reshape(new_tmpl, N, M)
-                        if can_blas
-                            if _bconv
-                                mul!(Cmat, transpose(convert(Matrix{TC}, Bmat)), transpose(Amat))
-                            else
-                                mul!(Cmat, transpose(Bmat), transpose(Amat))
-                            end
-                        else
-                            fill!(new_tmpl, zero(TC))
-                            for k in 1:K
-                                _rank1_add_generic!(new_tmpl, one(TC),
-                                                    @view(Bmat[k, :]), @view(Amat[:, k]))
-                            end
-                        end
-                    end
-                    append!(pending, new_tmpl)
-                    end
-                end
-
-                ckey = ntuple(j -> begin
-                    kind = c_src_kind[j]
-                    idx  = c_src_idx[j]
-                    if kind === :A
-                        akey[idx]
-                    elseif kind === :movA
-                        Int((m_a_lin - 1) ÷ movA_strides[idx] % movA_dims_vec[idx]) + 1
-                    else   # :movB
-                        Int((m_b_lin - 1) ÷ movB_strides[idx] % movB_dims_vec[idx]) + 1
-                    end
-                end, Val(PC))
-
-                _cas_stats && (_cas_niter += 1)
-                @timeit TIMER "cas.contribute" _aliased_contribute!(key_to_alias, key_to_accum, pending,
-                                     ckey, combined_tid, αA, C.blksize)
-            end   # m_a, m_b loop
-        end   # ii loop
-
-        iA = iA2
-    end   # main while
-
-    if _cas_stats
-        _CAS_NCALLS[] += 1; _CAS_NTIDA[] += A.n_templates
-        _CAS_NGEMM[]  += n_pending; _CAS_NITER[] += _cas_niter
-    end
-    if _fusion_diag
-        for (_, g) in _fgroups
-            _CAS_NGRP[] += 1
-            g[1] == 1 && (_CAS_NGRP1[] += 1)
-            _CAS_GMAX[] = max(_CAS_GMAX[], g[1])
-            _CAS_SPRANGE[] += (g[3] - g[2])
-        end
-        # ensure GEMM count is available even if SB_CAS_STATS is off
-        _cas_stats || (_CAS_NGEMM[] += n_pending)
-    end
-    @timeit TIMER "cas.commit" _commit_aliased_dicts_lazy!(C, key_to_alias, key_to_accum, pending, n_pending)
     return C
 end
 
@@ -854,8 +1064,31 @@ function contract_shared!(
 
     Cdense = labelsC[PC+1:NC]
     mode, desired_keepA, desired_keepB = _cdense_grouping_and_orders(Cdense, keepA0, keepB0)
-    mode == :interleaved &&
-        error("Cdense interleaves A/B kept dims; unsupported — reorder C labels so A-kept and B-kept form contiguous groups")
+    # OUTPUT-STATIONARY relayout perm (self-contained; replaces the lmap path for outstat).
+    # The output-stationary kernel always GEMMs in natural [desired_keepA…, desired_keepB…]
+    # dense order; `out_dense_perm` maps that natural order to the REQUESTED `Cdense` order
+    # (identity when Cdense is already AthenB-grouped, a swap for BthenA, an interleave for
+    # interleaved). The kernel applies it as a single `permutedims` phase, so it owns every
+    # requested order with no scatter and no fallback. Computed from labels — no `lmap`.
+    _os_nat_dense  = vcat(desired_keepA, desired_keepB)
+    out_dense_perm = Int[findfirst(==(Cdense[j]), _os_nat_dense) for j in 1:length(Cdense)]
+    if get(ENV, "SB_PERM_DBG", "0") == "1"
+        _isid = all(j -> out_dense_perm[j] == j, eachindex(out_dense_perm))
+        println("[PERM_DBG bond=", get(ENV, "SB_BONDTYPE", "?"), " step=", get(ENV, "SB_STEP", "?"),
+                "] mode=", mode, " identity=", _isid, " out_dense_perm=", out_dense_perm,
+                "\n    requested Cdense=", Cdense, "  natural[keepA;keepB]=", _os_nat_dense,
+                "  desired_keepA=", desired_keepA, " desired_keepB=", desired_keepB)
+        flush(stdout)
+    end
+    # Interleaved Cdense (A-kept and B-kept dense legs interleaved in the output):
+    # the GEMM still computes keepA × keepB (mode :AthenB); the interleaved output
+    # layout is realized by a strided write (lmap) in the scatter. This lets the
+    # caller emit an output order that makes the NEXT step's permA the identity
+    # even when the reduction legs split across operand origins (the both-origin
+    # case `_canon_inds_for_next_A` would otherwise bail on). Realized on the
+    # serial BLAS path only; see the lmap guard at the dispatch below.
+    _interleaved = (mode === :interleaved)
+    _interleaved && (mode = :AthenB)
 
     # Fission detection: some keepA / keepB labels may have been moved to C's
     # prefix (caller used output_inds_hint at the wrapper level). Compute the
@@ -879,37 +1112,48 @@ function contract_shared!(
     @assert Set(vcat(desired_keepB, moved_keepB)) == Set(keepB0)
 
     # ── 3) Permute A: prefix=[keep_pref..., shared_pref...], dense=[desired_keepA..., moved_keepA..., red...] ──
-    permA = _find_perm_for_A_join_and_dense_order(
-        A, labelsA, mapA, shared_prefix,
-        vcat(desired_keepA, moved_keepA), red_dense)
-    _RF_ON[] && (_RF_PERMA_CALLS[] += 1)
-    _pa0 = _RF_ON[] ? time_ns() : UInt64(0)
-    if !_is_identity_perm(permA)   # non-allocating identity check (was: permA != collect(1:NA))
-        _RF_ON[] && (_RF_PERMA_HITS[] += 1)
-        A       = permutedims(A, permA)
-        labelsA = labelsA[permA]
-        mapA    = Dict(l => i for (i, l) in enumerate(labelsA))
+    @timeit TIMER "cas.permA" begin
+        permA = _find_perm_for_A_join_and_dense_order(
+            A, labelsA, mapA, shared_prefix,
+            vcat(desired_keepA, moved_keepA), red_dense)
+        _RF_ON[] && (_RF_PERMA_CALLS[] += 1)
+        _pa0 = _RF_ON[] ? time_ns() : UInt64(0)
+        if !_is_identity_perm(permA)   # non-allocating identity check (was: permA != collect(1:NA))
+            _RF_ON[] && (_RF_PERMA_HITS[] += 1)
+            get(ENV, "SB_PERMA_DBG", "0") == "1" &&
+                println("[PERMA_FIRED bond=", get(ENV,"SB_BONDTYPE","?"),
+                        " step=", get(ENV,"SB_STEP","?"), "] permA=", permA)
+            A       = permutedims(A, permA)
+            labelsA = labelsA[permA]
+            mapA    = Dict(l => i for (i, l) in enumerate(labelsA))
+        end
+        _RF_ON[] && (_RF_PERMA_NS[] += Float64(time_ns() - _pa0))
     end
-    _RF_ON[] && (_RF_PERMA_NS[] += Float64(time_ns() - _pa0))
 
     # ── 4) Permute B to layout (shared_prefix..., red_dense..., desired_keepB..., moved_keepB...) ──
-    sp_axes_B = Int[mapB[lab] for lab in shared_prefix]
-    rd_axes_B = Int[mapB[lab] for lab in red_dense]
-    kb_axes_B = Int[mapB[lab] for lab in desired_keepB]
-    mvb_axes_B = Int[mapB[lab] for lab in moved_keepB]
-    permB     = vcat(sp_axes_B, rd_axes_B, kb_axes_B, mvb_axes_B)
-    @assert length(permB) == NB "B perm length mismatch; labelsB must match B ndims"
-    Bp = _is_identity_perm(permB) ? B :
-         (@timeit TIMER "cas.permuteB" permutedims(B, permB))
+    @timeit TIMER "cas.permB" begin
+        sp_axes_B = Int[mapB[lab] for lab in shared_prefix]
+        rd_axes_B = Int[mapB[lab] for lab in red_dense]
+        kb_axes_B = Int[mapB[lab] for lab in desired_keepB]
+        mvb_axes_B = Int[mapB[lab] for lab in moved_keepB]
+        permB     = vcat(sp_axes_B, rd_axes_B, kb_axes_B, mvb_axes_B)
+        @assert length(permB) == NB "B perm length mismatch; labelsB must match B ndims"
+        Bp = _is_identity_perm(permB) ? B :
+            (@timeit TIMER "cas.permuteB" permutedims(B, permB))
 
-    if get(ENV, "SB_SETUP_DBG", "0") == "1" && _SETUP_DBG_N[] < 6
-        _SETUP_DBG_N[] += 1
-        println("[SETUP #", _SETUP_DBG_N[], "] PA=", PA, " NA=", NA, " NB=", NB,
-                "\n   permA=", permA, "  (identity? ", _is_identity_perm(permA), ")",
-                "\n   permB=", permB, "  (identity? ", _is_identity_perm(permB), ")",
-                "\n   shared_prefix=", shared_prefix, " red_dense=", red_dense,
-                "\n   desired_keepA=", desired_keepA, " moved_keepA=", moved_keepA,
-                " desired_keepB=", desired_keepB, " moved_keepB=", moved_keepB)
+        if get(ENV, "SB_SETUP_DBG", "0") == "1" &&
+           _SETUP_DBG_N[] < parse(Int, get(ENV, "SB_SETUP_DBG_MAX", "9"))
+            _SETUP_DBG_N[] += 1
+            spS=Set(shared_prefix); rdS=Set(red_dense); kaS=Set(desired_keepA); maS=Set(moved_keepA)
+            # role of each A leg; P=sparse-prefix slot, d=dense-tail slot, [dim] from A.dims
+            rolA = lab -> lab in spS ? "shared·contract" : lab in rdS ? "red·contract" :
+                        lab in kaS ? "keep" : lab in maS ? "moved→Cprefix" : "keepPrefix"
+            arep = join([string(i<=PA ? "P" : "d", "[", A.dims[i], "]", rolA(labelsA[i])) for i in 1:NA], "  ")
+            crep = join([string(i<=PC ? "P" : "d", "[", C.dims[i], "]") for i in 1:NC], "  ")
+            println("[SETUP #", _SETUP_DBG_N[], "] bond=", get(ENV, "SB_BOND", "?"),
+                    " step=", get(ENV, "SB_STEP", "?"), "  PA=", PA, " NA=", NA, " → PC=", PC, " NC=", NC,
+                    "   permA=", permA, " (id? ", _is_identity_perm(permA), ")")
+        end
     end
 
     n_sp    = length(shared_prefix)
@@ -942,40 +1186,42 @@ function contract_shared!(
     #   :movB → decoded from m_b_lin (moved_keepB index = c_src_idx[j]).
     # labelsC[1:PC] can interleave these freely (mode='AthenB'/'BthenA' is set
     # by _cdense_grouping_and_orders).
-    c_src_kind = Vector{Symbol}(undef, PC)
-    c_src_idx  = Vector{Int}(undef, PC)
-    shared_p_set = Set(shared_prefix)
-    movA_set     = Set(moved_keepA)
-    movB_set     = Set(moved_keepB)
-    @inbounds for j in 1:PC
-        lab = labelsC[j]
-        if lab in movA_set
-            c_src_kind[j] = :movA
-            c_src_idx[j]  = findfirst(==(lab), moved_keepA)
-        elseif lab in movB_set
-            c_src_kind[j] = :movB
-            c_src_idx[j]  = findfirst(==(lab), moved_keepB)
-        else
-            @assert haskey(mapA, lab) "C prefix label $lab must exist in A"
-            apos = mapA[lab]
-            @assert apos <= PA "C prefix label $lab must come from A sparse prefix"
-            @assert !(lab in shared_p_set) "C prefix label $lab cannot be a reduced shared-prefix label"
-            c_src_kind[j] = :A
-            c_src_idx[j]  = apos
+    @timeit TIMER "cas.csrc" begin
+        c_src_kind = Vector{Symbol}(undef, PC)
+        c_src_idx  = Vector{Int}(undef, PC)
+        shared_p_set = Set(shared_prefix)
+        movA_set     = Set(moved_keepA)
+        movB_set     = Set(moved_keepB)
+        @inbounds for j in 1:PC
+            lab = labelsC[j]
+            if lab in movA_set
+                c_src_kind[j] = :movA
+                c_src_idx[j]  = findfirst(==(lab), moved_keepA)
+            elseif lab in movB_set
+                c_src_kind[j] = :movB
+                c_src_idx[j]  = findfirst(==(lab), moved_keepB)
+            else
+                @assert haskey(mapA, lab) "C prefix label $lab must exist in A"
+                apos = mapA[lab]
+                @assert apos <= PA "C prefix label $lab must come from A sparse prefix"
+                @assert !(lab in shared_p_set) "C prefix label $lab cannot be a reduced shared-prefix label"
+                c_src_kind[j] = :A
+                c_src_idx[j]  = apos
+            end
         end
-    end
-    # Strides for decoding linear index into per-axis values.
-    movA_dims_vec = Int[dimsA_dense[n_keepA + i] for i in 1:n_movA]
-    movB_dims_vec = Int[dimsB_p[n_sp + n_red + n_keepB + i] for i in 1:n_movB]
-    join_posA = Int[mapA[lab] for lab in shared_prefix]   # positions of shared_prefix in A.key
+        # Strides for decoding linear index into per-axis values.
+        movA_dims_vec = Int[dimsA_dense[n_keepA + i] for i in 1:n_movA]
+        movB_dims_vec = Int[dimsB_p[n_sp + n_red + n_keepB + i] for i in 1:n_movB]
+        join_posA = Int[mapA[lab] for lab in shared_prefix]   # positions of shared_prefix in A.key
 
-    # Precompute strides into B's shared-prefix dimensions for sp_lin computation.
-    # sp_lin is the 1-based col-major linear index in (dimsB_p[1], ..., dimsB_p[n_sp]).
-    sp_strides = Vector{Int}(undef, max(n_sp, 1))
-    if n_sp > 0
-        sp_strides[1] = 1
-        for t in 2:n_sp
-            sp_strides[t] = sp_strides[t-1] * dimsB_p[t-1]
+        # Precompute strides into B's shared-prefix dimensions for sp_lin computation.
+        # sp_lin is the 1-based col-major linear index in (dimsB_p[1], ..., dimsB_p[n_sp]).
+        sp_strides = Vector{Int}(undef, max(n_sp, 1))
+        if n_sp > 0
+            sp_strides[1] = 1
+            for t in 2:n_sp
+                sp_strides[t] = sp_strides[t-1] * dimsB_p[t-1]
+            end
         end
     end
 
@@ -992,13 +1238,18 @@ function contract_shared!(
     # below now serves ONLY as the non-BLAS (generic rank-1) fallback.
     _fuse   = can_blas
     _direct = can_blas
-    # SB_ALIASED_SINGLE_PASS=1 (default off): merge the _direct cid-assignment prepass
+    # SB_ALIASED_SINGLE_PASS (default ON): merge the _direct cid-assignment prepass
     # INTO the main loop. The two-pass _direct walks every (akey,m_a,m_b) work item twice
     # (prepass builds ck_to_cid + zeroes the slab; main loop recomputes _ckey to look the
     # cid up). Single-pass assigns cids on first sight and zeroes each new block as it is
     # first touched — one walk, one _ckey per item, no extra memory. Bit-identical: cids
     # are still first-seen order (identical iteration order), output is sorted at finalize.
-    _sp = can_blas && get(ENV, "SB_ALIASED_SINGLE_PASS", "0") == "1"
+    # Default flipped 2026-06-22 (N=12 md=40 4-sweep, SB_ROOFLINE): single-pass removes the
+    # prepass (measured 1.29s) at the cost of one finalize sortperm (+0.63s) → net ~0.66s/run,
+    # BIT-IDENTICAL energy (validated all 4 sweeps). A modest win, NOT the ~14s originally
+    # hypothesized — the prepass was never the bottleneck (finalize ~7.8s and accum ~4.2s are).
+    # Set SB_ALIASED_SINGLE_PASS=0 to restore the old two-pass.
+    _sp = can_blas && get(ENV, "SB_ALIASED_SINGLE_PASS", "1") == "1"
     # SB_ALIASED_NTHREADS=N (default 1 ⇒ serial): a KERNEL-ONLY scheduling knob for the aliased matvec's
     # outer-loop parallelism over A-key runs. It is deliberately SEPARATE from
     # JULIA_NUM_THREADS / OPENBLAS_NUM_THREADS — it controls only how many tasks THIS
@@ -1034,59 +1285,92 @@ function contract_shared!(
 
     # Preallocated template buffer (SB_ALIASED_PREALLOC_BUF=1): GEMM into a
     # reused scratch matrix and write the result directly into a preallocated
-    # `pending` buffer (resize! amortized geometric growth), eliminating the
-    # per-template `Vector(undef,blksize)` alloc and the `append!` reallocation
-    # (~26% of kernel allocations). Numerically identical — same GEMM, only the
-    # buffer management changes.
+    # `pending` buffer (resize! amortized geometric growth)
     _prealloc_buf = get(ENV, "SB_ALIASED_PREALLOC_BUF", "1") == "1"   # default ON (hardened 2026-06)
-    _cas_stats = get(ENV, "SB_CAS_STATS", "0") == "1"   # redundancy counting (off ⇒ zero overhead)
+    _cas_stats = _roofline_on()   # CAS redundancy counting is reported under SB_ROOFLINE (no separate env var)
     blksize = C.blksize
     # P1 (BS-mirrored, hardened 2026-06): pass the strided template/B slices straight
-    # into mul! instead of convert(Matrix{TC},·)-copying them. The convert was the
-    # dominant matvec cost (~27 GiB / the bulk of the 42%-of-runtime kernel at
-    # N=12/md=40), and `gemms_per_template≈8.72` means each A-template was re-copied
-    # 8.72×. The A-template slice `@view tmpl_A_3d[:,m,:]` is always a unit-first-stride
-    # StridedMatrix{TC} (contiguous template storage) → BLAS-ready with no copy
-    # (verified: stride(·,1)==1, mul! routes to gemm!, bit-identical). The B slice is
-    # unit-first-stride only when there are no shared-prefix axes (n_sp==0 ⇒ Bsub==Bp
-    # contiguous); when n_sp>0 the slice is a non-strided ReshapedArray view and must
-    # be copied for BLAS. The branch is hoisted (constant per call) for type stability.
+    # into mul! instead of convert(Matrix{TC},·)-copying them. 
     _bconv = n_sp > 0
-    # HARDENED (2026-06): P1 (pass strided template/B views straight into BLAS, no
-    # convert-copy) is always on — it's bit-identical and −30% allocation. (Used only in
-    # the legacy non-BLAS-fallback loop's BLAS branch, which is itself now unreachable.)
     _noconv = true
-    # Fusion/locality diagnostic (read-only; off ⇒ zero overhead). Per call, group
-    # work items by shared left operand (tidA,m_a) and track count + sp_lin span.
-    _fusion_diag = get(ENV, "SB_FUSION_DIAG", "0") == "1"
-    _fgroups = _fusion_diag ? Dict{Tuple{Int,Int}, Vector{Int}}() : nothing  # (tidA,m_a)->[count,min_sp,max_sp]
-    # Cscratch is consumed ONLY by the legacy non-fuse GEMM branch (runs when
-    # !_fuse). The fused fast path (the matvec; _fuse=can_blas=true) uses Ffull +
-    # pending and never touches Cscratch — so the old `can_blas && _prealloc_buf`
-    # gate allocated a full M×N scratch on every matvec call that was immediately
-    # garbage (dead per-call churn). Gate on !_fuse so it's empty on the hot path.
+    _fusion_diag = false
+    _fgroups = nothing
     Cscratch = (!_fuse && _prealloc_buf) ?
         Matrix{TC}(undef, (mode == :AthenB ? (M, N) : (N, M))...) :
         Matrix{TC}(undef, 0, 0)
 
     Nm = Nmov_total
 
+    # Interleaved Cdense → precompute the GEMM→block strided-scatter map (serial
+    # BLAS path only). _canon_inds_for_next_A gates the interleaved emission to
+    # serial, so it must not reach the threaded/generic paths.
+    lmap = nothing
+    if _interleaved
+        (_threaded || !can_blas) &&
+            error("interleaved Cdense reached non-serial/non-BLAS path (should be gated in _canon_inds_for_next_A)")
+        cdims = Int[C.dims[PC + i] for i in 1:length(Cdense)]
+        lmap  = _build_interleave_lmap(Cdense, desired_keepA, desired_keepB, cdims)
+    end
+
     _RF_ON[] && (_RF_SETUP_NS[] += Float64(time_ns() - _setup0))
     if _threaded
-        return _contract_dense_threaded!(C, A, Bp, blksize, M, N, K, Nm, Mmov_total,
+        return @timeit TIMER "kbd.threadedcontractdensecall" _contract_dense_threaded!(C, A, Bp, blksize, M, N, K, Nm, Mmov_total,
             n_sp, NB, join_posA, sp_strides, _bconv, mode,
             c_src_kind, c_src_idx, movA_dims_vec, movB_dims_vec, movA_strides, movB_strides,
             _kernel_nt, pending)
     else
-        # kbd.serialcall: total time in the serial kernel BODY. Comparing this to
-        # the global _RF phase sum (prepass+loop+finalize) localises the ~76s gap
-        # between kbd.general_contract and the timed phases: if serialcall ≈ phase
-        # sum, the gap is dispatcher setup (above this call); if serialcall ≫ phase
-        # sum, it's GC / unbucketed work inside the function.
-        return @timeit TIMER "kbd.serialcall" _contract_dense_serial!(C, A, Bp, blksize, M, N, K, Nm, Mmov_total, Nmov_total,
+        # ── SB_OUTSTAT_SCHED=1: output-stationary OWNS every can_blas aliased×dense call ──
+        # (any requested order, realized by the kernel's permute phase via out_dense_perm).
+        # Additive + default OFF ⇒ runs that don't set it are byte-identical to before.
+        # Mutually exclusive with the legacy A/B hook so we never accidentally run legacy.
+        _sched_on = get(ENV, "SB_OUTSTAT_SCHED", "0") == "1"
+        (_sched_on && get(ENV, "SB_ALIASED_LEGACY", "0") == "1") &&
+            error("SB_ALIASED_LEGACY and SB_OUTSTAT_SCHED are mutually exclusive — set only one")
+        if _sched_on && can_blas
+            return @timeit TIMER "kbd.serial_outstat" _contract_dense_serial_outstat!(C, A, Bp, blksize, M, N, K, Nm, Mmov_total, Nmov_total,
+                n_sp, NB, join_posA, sp_strides, _bconv, _noconv, mode, can_blas,
+                c_src_kind, c_src_idx, movA_dims_vec, movB_dims_vec, movA_strides, movB_strides,
+                _fuse, _direct, _sp, _prealloc_buf, _cas_stats, _fusion_diag,
+                pending, key_to_alias, key_to_accum, combined_tid_map, Cscratch, _fgroups, nothing, out_dense_perm)
+        end
+        # A/B HOOK (SB_ALIASED_LEGACY=1): route to the pre-session legacy reduction-
+        # stationary kernel (append!-copy finalize, from git HEAD) for back-to-back
+        # finalize-cost comparison. Takes precedence over outstat. Pair with
+        # SB_ALIASED_OUTSTAT=0 so the "current" side is the swap-finalize
+        # _contract_dense_serial!, NOT the output-stationary kernel.
+        # GATED on lmap === nothing: the legacy kernel predates interleaved-Cdense
+        # support and ignores lmap, so interleaved contractions MUST fall through to
+        # the current _contract_dense_serial! (else wrong energy). The A/B then
+        # isolates the finalize change on the non-interleaved contractions.
+        if lmap === nothing && get(ENV, "SB_ALIASED_LEGACY", "0") == "1"
+            return @timeit TIMER "kbd.serial_legacy" _contract_dense_serial_legacy!(C, A, Bp, blksize, M, N, K, Nm, Mmov_total, Nmov_total,
+                n_sp, NB, join_posA, sp_strides, _bconv, _noconv, mode, can_blas,
+                c_src_kind, c_src_idx, movA_dims_vec, movB_dims_vec, movA_strides, movB_strides,
+                _fuse, _direct, _sp, _prealloc_buf, _cas_stats, _fusion_diag,
+                pending, key_to_alias, key_to_accum, combined_tid_map, Cscratch, _fgroups, lmap)
+        end
+        # OUTPUT-STATIONARY kernel (default): keep-grouped, GEMM-direct, no scatter/hash.
+        # Handles the BLAS non-interleaved case; interleaved (lmap) and non-BLAS fall
+        # through to the legacy reduction-stationary _contract_dense_serial!.
+        # Toggle off with SB_ALIASED_OUTSTAT=0 to A/B against the legacy kernel.
+        # OUTPUT-STATIONARY kernel (default ON). Bit-identical (to ~1e-12); back-to-back
+        # under matched throttle it runs on par with the legacy kernel (~46 vs ~45 s/sweep,
+        # within noise) — the earlier "regression" was a throttle artifact. Profiled below
+        # to find where its time goes (redundant per-member B-convert, fill, β-RMW, per-call
+        # sort are the suspects). Toggle SB_ALIASED_OUTSTAT=0 for the legacy kernel.
+        _outstat = can_blas && lmap === nothing && get(ENV, "SB_ALIASED_OUTSTAT", "1") == "1"
+        if _outstat
+            return @timeit TIMER "kbd.serial_outstat" _contract_dense_serial_outstat!(C, A, Bp, blksize, M, N, K, Nm, Mmov_total, Nmov_total,
+                n_sp, NB, join_posA, sp_strides, _bconv, _noconv, mode, can_blas,
+                c_src_kind, c_src_idx, movA_dims_vec, movB_dims_vec, movA_strides, movB_strides,
+                _fuse, _direct, _sp, _prealloc_buf, _cas_stats, _fusion_diag,
+                pending, key_to_alias, key_to_accum, combined_tid_map, Cscratch, _fgroups, lmap)
+        end
+        # kbd.serial_current: total time in the current (reduction-stationary) serial kernel.
+        return @timeit TIMER "kbd.serial_current" _contract_dense_serial!(C, A, Bp, blksize, M, N, K, Nm, Mmov_total, Nmov_total,
             n_sp, NB, join_posA, sp_strides, _bconv, _noconv, mode, can_blas,
             c_src_kind, c_src_idx, movA_dims_vec, movB_dims_vec, movA_strides, movB_strides,
             _fuse, _direct, _sp, _prealloc_buf, _cas_stats, _fusion_diag,
-            pending, key_to_alias, key_to_accum, combined_tid_map, Cscratch, _fgroups)
+            pending, key_to_alias, key_to_accum, combined_tid_map, Cscratch, _fgroups, lmap)
     end
 end

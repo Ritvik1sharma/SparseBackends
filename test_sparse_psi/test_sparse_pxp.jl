@@ -6,9 +6,8 @@
 #   - psi_sp = P · psi_random (block-sparse storage inherited from P)
 #   - DMRG on BARE H (since [H,P] = 0, psi stays in image(P))
 #
-# Path A flags: BMF_ISO_PATH=1 (strict iso eigsolve), SB_USE_QR=1, SB_BALANCED_OWNERSHIP=1,
-# SB_ADAPTIVE_RANK=1 (cleanest config from our optimization work).
-ENV["BMF_ISO_PATH"] = "1"
+# Path A: run_mode=:iso (strict iso eigsolve, see dmrg calls), SB_USE_QR=1,
+# SB_BALANCED_OWNERSHIP=1, SB_ADAPTIVE_RANK=1 (cleanest config from our optimization work).
 using SparseBackends, ITensors, ITensorMPS
 using TimerOutputs: reset_timer!, print_timer
 using Random
@@ -133,10 +132,10 @@ function run_sweeps(H, psi0, n_sweeps::Int, maxdim::Int;
         sw = Sweeps(1)
         setmaxdim!(sw, maxdim); setmindim!(sw, mindim); setcutoff!(sw, cutoff)
         t = if orthogonal_states === nothing
-            @elapsed (E, psi) = dmrg(H, psi, sw; outputlevel=0, use_early_exit=false)
+            @elapsed (E, psi) = dmrg(H, psi, sw; outputlevel=0, use_early_exit=false, run_mode=:iso)
         else
             @elapsed (E, psi) = dmrg(H, orthogonal_states, psi, sw;
-                outputlevel=0, use_early_exit=false, weight=weight)
+                outputlevel=0, use_early_exit=false, weight=weight, run_mode=:iso)
         end
         push!(sweep_times, t); push!(sweep_energies, E)
         cum += t
@@ -160,7 +159,7 @@ let
     mindim_target = parsed_args["mindim"]
     target_E = parsed_args["target-energy"]
 
-    println("PXP Path A sparse  BMF_ISO_PATH=$(ENV["BMF_ISO_PATH"])")
+    println("PXP Path A sparse  run_mode=:iso")
     println("N=$N  n_sweeps=$n_sweeps  maxdim=$maxdim_target  target_E=$(isnan(target_E) ? "—" : target_E)")
     println("Building setup ...")
     H, psi_sp = build_setup(N)
@@ -182,7 +181,7 @@ let
     sw = Sweeps(n_sweeps)
     setmaxdim!(sw, maxdim_target); setmindim!(sw, mindim_target); setcutoff!(sw, 1e-10)
     t_ex = @elapsed (E_ex, psi_ex) = dmrg(H, [psi_gs], psi_init, sw;
-        outputlevel=0, use_early_exit=false, weight=20.0)
+        outputlevel=0, use_early_exit=false, weight=20.0, run_mode=:iso)
     @printf("[excited]   total=%.3fs  E=%.12f\n", t_ex, E_ex)
     report_state("final psi_ex", psi_ex, E_ex)
 

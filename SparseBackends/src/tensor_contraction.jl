@@ -349,9 +349,10 @@ end
 
 
 
-function contract_and_fuse_links(
+function top_level_contract(
   A::ITensors.ITensor, B::ITensors.ITensor,
   Abackend::Symbol, Bbackend::Symbol,
+  Cbackend::Union{Nothing,Symbol},
   bondmap::BondMap;
   denseLinksA::Union{Nothing,Int}=nothing,
   denseLinksB::Union{Nothing,Int}=nothing,
@@ -360,39 +361,82 @@ function contract_and_fuse_links(
   bLeft::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing,
   bRight::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing
 )
-  if Abackend === :dense && Bbackend === :dense
-    return ITensors.contract(A, B), bondmap
+  # Parse the public Symbol API to the canonical Backend enum (strict: a
+  # non-canonical name like the old :aliasedblocksparse throws here).
+  Ab = to_backend(Abackend)
+  Bb = to_backend(Bbackend)
+  Cb = Cbackend === nothing ? nothing : to_backend(Cbackend)
+  # An ALIASED input backend signals "produce an aliased output" (the old
+  # contract_and_fuse_links_aliased semantics): a dense input with ALIASED
+  # backend is wrapped DENSE below, and the COO/Dense→Aliased kernel makes the
+  # output aliased — but only if Cb===ALIASED reaches contract_and_fuse_links.
+  # Infer it here when the caller left Cbackend unset (e.g. build_setup's
+  # contract(...,:coo,:aliased; denseLinksB=0)).
+  if Cb === nothing && (Ab === ALIASED || Bb === ALIASED)
+    Cb = ALIASED
   end
-  # When either side requests :aliased storage, route through the aliased
-  # per-site kernel. This is the only entry point that handles the :aliased
-  # backend; other paths remain unchanged.
-  if Abackend === :aliased || Bbackend === :aliased
-    return contract_and_fuse_links_aliased(A, B, Abackend, Bbackend, bondmap;
-      denseLinksA=denseLinksA, denseLinksB=denseLinksB,
-      aLeft=aLeft, aRight=aRight, bLeft=bLeft, bRight=bRight)
+  if Ab === DENSE && Bb === DENSE
+    if Cb === DENSE
+      return ITensors.contract(A, B), bondmap
+    end
+    error("Not optimal backend combination: both inputs are dense but Cbackend is not :dense.")
   end
-  Aw = wrap_itensor(A; backend=Abackend, denseLinks=denseLinksA)
-  Bw = wrap_itensor(B; backend=Bbackend, denseLinks=denseLinksB)
-  return contract_and_fuse_links(Aw, Bw, bondmap; aLeft=aLeft, aRight=aRight, bLeft=bLeft, bRight=bRight)
+  # Wrap inputs if needed
+  Aw = if Ab === ALIASED
+      if ITensors.has_external_storage(A)
+          wrap_itensor_aliased(A; denseLinks=denseLinksA)
+      else
+          wrap_itensor(A; backend=DENSE, denseLinks=denseLinksA)
+      end
+    else
+        wrap_itensor(A; backend=Ab, denseLinks=denseLinksA)
+  end
+  Bw = if Bb === ALIASED
+      if ITensors.has_external_storage(B)
+          wrap_itensor_aliased(B; denseLinks=denseLinksB)
+      else
+          wrap_itensor(B; backend=DENSE, denseLinks=denseLinksB)
+      end
+    else
+      wrap_itensor(B; backend=Bb, denseLinks=denseLinksB)
+  end
+  return contract_and_fuse_links(Aw, Bw, Cb, bondmap;
+                                 aLeft=aLeft, aRight=aRight, bLeft=bLeft, bRight=bRight)
 end
 
 @inline _bs_head_len(::WrappedBlockSparse{T,N,N2,P}) where {T,N,N2,P} = P
 
 function contract_and_fuse_links(
-  Aw::WrappedTensorTypes, Bw::WrappedTensorTypes,
+  Aw::WrappedTensorTypes, Bw::WrappedTensorTypes, Cbackend::Union{Nothing,Symbol,Backend},
   bondmap::BondMap;
   aLeft::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing,
   aRight::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing,
   bLeft::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing,
   bRight::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing
 )
-  Cw = contract(Aw, Bw)  
-  # println("    dirty? ", Cw.coo.dirty)
+  Cb = Cbackend === nothing ? nothing : to_backend(Cbackend)
+  if Aw isa WrappedAliasedBlockSparse || Bw isa WrappedAliasedBlockSparse || Cb === ALIASED
+    if Cb === ALIASED
+      Cw = wrapped_contract_aliased(Aw, Bw; preserve_bs_output=true)  # <-- aliased output
+    elseif Cb === DENSE
+      Cw = wrapped_contract_aliased(Aw, Bw)  # <-- dense output
+    else
+      error("Unsupported Cbackend=$Cb for contract_and_fuse_links with aliased inputs.")
+    end
+  else
+    Cw = contract(Aw, Bw)
+  end
   _nz(v) = (v !== nothing && !isempty(v))
   if _nz(aLeft) && _nz(bLeft)
     aBondLogical = first(aLeft)  # stable logical id for bondmap key
     bBondLogical = first(bLeft)
-    if Cw isa WrappedBlockSparse
+    if Cw isa WrappedAliasedBlockSparse
+      # Native canonicalization preserves aliasing (fuse_axes! is now
+      # native for prefix-only / tail-only cases). If a mixed fuse is
+      # forced, fuse_axes! demotes locally and the result becomes BS.
+      Cw, bondmap = _canonicalize_bond_aliased!(
+          Cw, bondmap, aBondLogical, bBondLogical, aLeft, bLeft)
+    elseif Cw isa WrappedBlockSparse
       Cw, bondmap = _canonicalize_bond_blocksparse!(Cw, bondmap, aBondLogical, bBondLogical, aLeft, bLeft)
     else
       Cw, bondmap = _canonicalize_bond_single!(Cw, bondmap, aBondLogical, bBondLogical, aLeft, bLeft)
@@ -402,157 +446,24 @@ function contract_and_fuse_links(
   if _nz(aRight) && _nz(bRight)
     aBondLogical = first(aRight)
     bBondLogical = first(bRight)
-    if Cw isa WrappedBlockSparse
+    if Cw isa WrappedAliasedBlockSparse
+            Cw, bondmap = _canonicalize_bond_aliased!(
+                Cw, bondmap, aBondLogical, bBondLogical, aRight, bRight)  
+    elseif Cw isa WrappedBlockSparse
       Cw, bondmap = _canonicalize_bond_blocksparse!(Cw, bondmap, aBondLogical, bBondLogical, aRight, bRight)
     else
       Cw, bondmap = _canonicalize_bond_single!(Cw, bondmap, aBondLogical, bBondLogical, aRight, bRight)
     end
   end
   Cw isa ITensors.ITensor && return Cw, bondmap
-  if Cw isa WrappedBlockSparse && _bs_head_len(Cw) == 0
-    dense_data = to_dense(Cw.blocksparse)
-    return ITensors.ITensor(dense_data, Cw.inds...), bondmap
+  # Collapse P=0 results to plain ITensor
+  if Cw isa WrappedAliasedBlockSparse && _abs_head_len(Cw) == 0
+      dense_data = to_dense(Cw.aliased)
+      return ITensors.ITensor(dense_data, Cw.inds...), bondmap
   end
-  # println("------------- ", Cw.inds, " with bondmap keys ", keys(bondmap))
-  # println(Cw.coo.keys, " with info ", Cw.coo.dirty)
-  # error("err")
+  if Cw isa WrappedBlockSparse && _bs_head_len(Cw) == 0
+      dense_data = to_dense(Cw.blocksparse)
+      return ITensors.ITensor(dense_data, Cw.inds...), bondmap
+  end
   return ITensors._itensor_from_external_storage(Cw), bondmap
 end
-
-
-
-
-# function _fuse_and_canonicalize_links!(
-#   Cw::WrappedCOOTensor,
-#   bondmap::BondMap;
-#   #   bondmap::Dict{Tuple{ITensors.Index,ITensors.Index}, ITensors.Index};
-#   aLeft::Union{Nothing,ITensors.Index}=nothing,
-#   aRight::Union{Nothing,ITensors.Index}=nothing,
-#   bLeft::Union{Nothing,ITensors.Index}=nothing,
-#   bRight::Union{Nothing,ITensors.Index}=nothing
-# )
-#   # helper for one bond
-#   function canon_one_bond(Cw_local::WrappedCOOTensor, aBond::ITensors.Index, bBond::ITensors.Index)
-#     axA = _find_axis_of_ind(Cw_local.inds, aBond)
-#     axB = _find_axis_of_ind(Cw_local.inds, bBond)
-
-
-#     if axA === nothing && axB === nothing
-#         if ITensors.dim(aBond) == 1 && ITensors.dim(bBond) == 1
-#             return Cw_local  # scalar bond vanished; fine
-#         else
-#             error("COO: neither bond leg found in Cw.inds (aBond=$(aBond), bBond=$(bBond))")
-#         end
-#     elseif axA === nothing
-#       # only bBond survived (often because dim(aBond)==1 and got dropped)
-#       raw = Cw_local.inds[axB]
-#       can = get_or_create_cbond!(bondmap, aBond, bBond, :all, raw)
-#       relabel_ind!(Cw_local, raw, can)
-#       return Cw_local
-#     elseif axB === nothing
-#       # only aBond survived (often because dim(bBond)==1 and got dropped)
-#       raw = Cw_local.inds[axA]
-#       can = get_or_create_cbond!(bondmap, aBond, bBond, :all, raw)
-#       relabel_ind!(Cw_local, raw, can)
-#       return Cw_local
-#     elseif axA == axB
-#       # already same axis (rare)
-#       raw = Cw_local.inds[axA]
-#       can = get_or_create_cbond!(bondmap, aBond, bBond, :all, raw)
-#       relabel_ind!(Cw_local, raw, can)
-#       return Cw_local
-#     else
-#       # fuse the two legs
-#       a1, a2 = min(axA, axB), max(axA, axB)
-#       Cw_local = fuse_axes!(Cw_local, a1, a2)
-#       raw = Cw_local.inds[a1]  # fused lives at a1
-#       can = get_or_create_cbond!(bondmap, aBond, bBond, :all, raw)
-#       relabel_ind!(Cw_local, raw, can)
-#       return Cw_local
-#     end
-#   end
-
-#   if aLeft !== nothing && bLeft !== nothing
-#     Cw = canon_one_bond(Cw, aLeft, bLeft)
-#   end
-#   if aRight !== nothing && bRight !== nothing
-#     Cw = canon_one_bond(Cw, aRight, bRight)
-#   end
-
-#   return Cw, bondmap
-# end
-
-
-# function _fuse_and_canonicalize_links!(
-#   Cw::WrappedBlockSparse,
-#   bondmap::BondMap;
-#   aLeft::Union{Nothing,ITensors.Index}=nothing,
-#   aRight::Union{Nothing,ITensors.Index}=nothing,
-#   bLeft::Union{Nothing,ITensors.Index}=nothing,
-#   bRight::Union{Nothing,ITensors.Index}=nothing
-# )
-#   # Canonicalize a single bond (aBond,bBond) possibly represented by 0/1/2 surviving axes.
-#   function fuse_one_bond(Cw_local::WrappedBlockSparse, aBond::ITensors.Index, bBond::ITensors.Index)
-#     axA = _find_axis_of_ind(Cw_local.inds, aBond)
-#     axB = _find_axis_of_ind(Cw_local.inds, bBond)
-#     # Case 0: both legs vanished (typically dim-1 axes got dropped upstream)
-#     if axA === nothing && axB === nothing
-#       if ITensors.dim(aBond) == 1 && ITensors.dim(bBond) == 1
-#         return Cw_local
-#       else
-#         error("BS: neither bond leg found in Cw.inds (aBond=$(aBond), bBond=$(bBond))")
-#       end
-#     end
-#     # Case 1: only one leg survived -> just canonicalize that survivor (region from its axis)
-#     if axA === nothing
-#       raw = Cw_local.inds[axB]
-#       reg = _link_region(Cw_local, axB)
-#       can = get_or_create_cbond!(bondmap, aBond, bBond, reg, raw)
-#       relabel_ind!(Cw_local, raw, can)
-#       return Cw_local
-#     end
-#     if axB === nothing
-#       raw = Cw_local.inds[axA]
-#       reg = _link_region(Cw_local, axA)
-#       can = get_or_create_cbond!(bondmap, aBond, bBond, reg, raw)
-#       relabel_ind!(Cw_local, raw, can)
-#       return Cw_local
-#     end
-#     if axA == axB
-#       raw = Cw_local.inds[axA]
-#       reg = _link_region(Cw_local, axA)
-#       can = get_or_create_cbond!(bondmap, aBond, bBond, reg, raw)
-#       relabel_ind!(Cw_local, raw, can)
-#       return Cw_local
-#     end
-
-#     regA = _link_region(Cw_local, axA)
-#     regB = _link_region(Cw_local, axB)
-
-#     if regA == regB
-#       # Same region: fuse in that region, then canonicalize fused leg
-#       a1, a2 = min(axA, axB), max(axA, axB)
-#       Cw_local = fuse_axes!(Cw_local, a1, a2)
-#       raw = Cw_local.inds[a1]                 # fused index lives at a1
-#       can = get_or_create_cbond!(bondmap, aBond, bBond, regA, raw)
-#       relabel_ind!(Cw_local, raw, can)
-#       return Cw_local
-#     else
-#       # Cross head/tail: CANNOT fuse. Canonicalize each leg separately under distinct keys.
-#       rawA = Cw_local.inds[axA]
-#       canA = get_or_create_cbond!(bondmap, aBond, bBond, regA, rawA)
-#       relabel_ind!(Cw_local, rawA, canA)
-#       rawB = Cw_local.inds[axB]
-#       canB = get_or_create_cbond!(bondmap, aBond, bBond, regB, rawB)
-#       relabel_ind!(Cw_local, rawB, canB)
-#       return Cw_local
-#     end
-#   end
-#   if aLeft !== nothing && bLeft !== nothing
-#     Cw = fuse_one_bond(Cw, aLeft, bLeft)
-#   end
-#   if aRight !== nothing && bRight !== nothing
-#     Cw = fuse_one_bond(Cw, aRight, bRight)
-#   end
-#   return Cw, bondmap
-# end

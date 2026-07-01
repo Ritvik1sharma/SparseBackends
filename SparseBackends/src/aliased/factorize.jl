@@ -314,9 +314,12 @@ function _aliased_alias_reduced_factorize(
         println("[ADD_DIAG] since-last: axpy_match=", _ADD_AXPY_MATCH[],
                 "  plus_match=", _ADD_PLUS_MATCH[],
                 "  plus_merge=", _ADD_PLUS_MERGE[], "  plus_dense=", _ADD_PLUS_DENSE[],
+                "  inplace=", _ADD_INPLACE[], "  inplace_try=", _ADD_INPLACE_TRY[],
+                "  inplace_fail=", _ADD_INPLACE_FAIL[], "  inner_inplace=", _INNER_INPLACE[],
                 "   (merge/dense are EXACT but drop compression; all paths value-exact)")
         _ADD_AXPY_MATCH[] = 0; _ADD_PLUS_MATCH[] = 0
-        _ADD_PLUS_MERGE[] = 0; _ADD_PLUS_DENSE[] = 0
+        _ADD_PLUS_MERGE[] = 0; _ADD_PLUS_DENSE[] = 0; _ADD_INPLACE[] = 0
+        _ADD_INPLACE_TRY[] = 0; _ADD_INPLACE_FAIL[] = 0; _INNER_INPLACE[] = 0
     end
     @inbounds for i in eachindex(counts)
         if counts[i] > 1
@@ -388,21 +391,8 @@ function _aliased_alias_reduced_factorize(
     F = svd(M_red)
     sv = real.(F.S)
     # Per-cM cap (mirror of the BS Path-B factorize, ops_factorize_qr.jl:471).
-    # The new bond is channel × multiplicity (doubled-link convention), so the
-    # HONEST bond dim = bond_ch_dim × mult_new. To bound it at `maxdim`, the
-    # multiplicity (= n_keep) must be capped at fld(maxdim, bond_ch_dim), NOT at
-    # `maxdim` — otherwise the channel dim multiplies through and the honest bond
-    # inflates (e.g. 4×4 = 16 > maxdim=4). This matches the BS per-cM cap exactly;
-    # L stays non-iso (structural) and Path-B's M⁻¹ corrects it, same as BS.
-    # Gated SB_ALIASED_PERCM_CAP. DEFAULT OFF (="0") = UNCAPPED multiplicity
-    # (mult = maxdim, honest_bd = channel×maxdim). This is the regime we study and
-    # benchmark: uncapped aliased Pareto-dominates dense on memory at iso-energy.
-    # The cap (="1") starves multiplicity (mult = fld(maxdim, channel)) → honest_bd
-    # ≤ maxdim like BS, but gives much worse energy per maxdim. Hardened OFF
-    # 2026-06 after the capped default silently mismatched the benchmarked
-    # (uncapped) working size — do NOT flip back without updating every runner.
-    mult_cap = get(ENV, "SB_ALIASED_PERCM_CAP", "0") == "1" ?   # default OFF = uncapped
-               max(1, fld(maxdim, max(1, bond_ch_dim))) : maxdim
+    # The new bond is channel × multiplicity (doubled-link convention).
+    mult_cap = maxdim
     n_keep = min(length(sv), mult_cap)
     if cutoff > 0
         total = sum(s -> s*s, sv)
