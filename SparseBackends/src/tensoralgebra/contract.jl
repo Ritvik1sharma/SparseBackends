@@ -88,7 +88,6 @@ function contract!(
   end
 
   if length(reduced) == 1
-    # Keep your assumption if you want:
     @assert length(shared) == 1 "Expected exactly 1 shared label; got $shared"
 
     rlab = reduced[1]

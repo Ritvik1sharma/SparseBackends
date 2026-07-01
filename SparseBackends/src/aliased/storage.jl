@@ -17,6 +17,31 @@
 
 using Base: OneTo
 
+# Default element type for the alias-id vector (template indices). Settable per
+# construction via the `AI` type parameter; this is just the default for freshly
+# built aliased tensors. UInt8 caps at 255 templates — many call sites widen to
+# UInt16 (65535) by constructing with an explicit `AI`.
+const DEFAULT_ALIAS_ID_TYPE = UInt8
+
+# Convert a (1-based) template index to the alias-id type, with a clear error
+# when it exceeds the type's capacity (instead of a cryptic InexactError).
+@inline function _alias_id(::Type{AI}, tid::Integer) where {AI<:Integer}
+    tid <= typemax(AI) || error(
+        "AliasedBlockSparse: template index ($tid) exceeds the alias-id type " *
+        "$AI capacity ($(typemax(AI))); construct with a wider alias-id type " *
+        "(e.g. UInt16 covers 65535, UInt32 covers ~4.3e9).")
+    return tid % AI
+end
+
+# Build an identity alias mapping 1:nb as a Vector{AI}, capacity-checked.
+@inline function _alias_id_range(::Type{AI}, nb::Integer) where {AI<:Integer}
+    nb <= typemax(AI) || error(
+        "AliasedBlockSparse: number of blocks ($nb) exceeds the alias-id type " *
+        "$AI capacity ($(typemax(AI))); construct the input with a wider " *
+        "alias-id type (e.g. UInt16 covers 65535).")
+    return collect(AI, 1:nb)
+end
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Struct
 # ─────────────────────────────────────────────────────────────────────────────
@@ -33,6 +58,11 @@ Type parameters
 - `N`:  total number of dimensions
 - `N2`: number of dense (block-interior) dimensions
 - `P`:  number of sparse (prefix) dimensions  (P = N − N2)
+- `K`:  element type of the sparse prefix keys (`<: Integer`)
+- `AI`: element type of the alias-id vector (`<: Integer`), i.e. the template
+        indices. Independent of `K`; defaults to `$(DEFAULT_ALIAS_ID_TYPE)` for
+        freshly built tensors (see `DEFAULT_ALIAS_ID_TYPE`). Widen per
+        construction when a tensor needs more than `typemax(AI)` templates.
 
 Storage layout
 - `templates[1 : n_templates * blksize]` — flat array of unique dense blocks.
@@ -43,17 +73,26 @@ Storage layout
 `keys` are kept sorted in column-major order (same convention as
 `NewBlockSparseSorted`), enabling O(log N) binary-search element access.
 """
-mutable struct AliasedBlockSparse{T,N,N2,P,K<:Integer} <: SparseTensor{T,N}
+mutable struct AliasedBlockSparse{T,N,N2,P,K<:Integer,AI<:Integer} <: SparseTensor{T,N}
     dims        :: NTuple{N,Int}
     blksize     :: Int                       # prod(dims[P+1 : N])
     templates   :: Vector{T}                 # length = n_templates * blksize
     n_templates :: Int
     keys        :: Vector{NTuple{P,K}}       # sorted sparse prefix keys (key type K)
-    alias_ids   :: Vector{Int}               # alias_ids[i] → template index (1-based)
+    alias_ids   :: Vector{AI}                # alias_ids[i] → template index (1-based)
     scalars     :: Vector{T}                 # scalar multiplier per block
 end
 
-# Backwards-compatible outer constructor (K=Int default)
+# Outer constructor inferring the alias-id type AI from the passed vector. Keeps
+# every existing `AliasedBlockSparse{T,N,N2,P,K}(...)` call site working and
+# preserves the source alias-id width when propagating (permutedims, slicing,
+# copies, etc.).
+AliasedBlockSparse{T,N,N2,P,K}(dims, blksize, templates, n_templates,
+                               keys, alias_ids, scalars) where {T,N,N2,P,K} =
+    AliasedBlockSparse{T,N,N2,P,K,eltype(alias_ids)}(
+        dims, blksize, templates, n_templates, keys, alias_ids, scalars)
+
+# Backwards-compatible outer constructor (K=Int default; AI inferred above)
 AliasedBlockSparse{T,N,N2,P}(dims, blksize, templates, n_templates,
                               keys::Vector{NTuple{P,Int}}, alias_ids, scalars) where {T,N,N2,P} =
     AliasedBlockSparse{T,N,N2,P,Int}(dims, blksize, templates, n_templates, keys, alias_ids, scalars)
@@ -64,7 +103,7 @@ AliasedBlockSparse{T,N,N2,P}(dims, blksize, templates, n_templates,
 
 _dims(x::AliasedBlockSparse) = x.dims
 
-Base.eltype(::Type{AliasedBlockSparse{T,N,N2,P,K}}) where {T,N,N2,P,K} = T
+Base.eltype(::Type{AliasedBlockSparse{T,N,N2,P,K,AI}}) where {T,N,N2,P,K,AI} = T
 Base.eltype(A::AliasedBlockSparse) = eltype(typeof(A))
 Base.size(A::AliasedBlockSparse{T,N,N2,P,K}) where {T,N,N2,P,K} = A.dims
 Base.axes(A::AliasedBlockSparse{T,N,N2,P,K}) where {T,N,N2,P,K} =
@@ -76,7 +115,7 @@ Base.IndexStyle(::Type{<:AliasedBlockSparse}) = IndexCartesian()
 # ─────────────────────────────────────────────────────────────────────────────
 
 # View of the t-th template block
-@inline function _aliased_template_view(A::AliasedBlockSparse{T,N,N2,P,K}, t::Int) where {T,N,N2,P,K}
+@inline function _aliased_template_view(A::AliasedBlockSparse{T,N,N2,P,K}, t::Integer) where {T,N,N2,P,K}
     off = (t - 1) * A.blksize
     return @view(A.templates[off+1 : off + A.blksize])
 end
@@ -127,10 +166,10 @@ function AliasedBlockSparse{T,N,N2}(dims::NTuple{N,Int}) where {T,N,N2}
     @assert 0 <= N2 <= N
     @assert all(dims .>= 1)
     blksize = N2 == 0 ? 1 : prod(ntuple(i -> dims[P+i], Val(N2)))
-    return AliasedBlockSparse{T,N,N2,P,Int}(
+    return AliasedBlockSparse{T,N,N2,P,Int,DEFAULT_ALIAS_ID_TYPE}(
         dims, blksize,
         Vector{T}(), 0,
-        Vector{NTuple{P,Int}}(), Int[], Vector{T}(),
+        Vector{NTuple{P,Int}}(), DEFAULT_ALIAS_ID_TYPE[], Vector{T}(),
     )
 end
 

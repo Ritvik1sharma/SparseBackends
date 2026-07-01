@@ -125,14 +125,15 @@ function _commit_aliased_dicts!(
     key_to_alias :: Dict{NTuple{PC,Int}, Tuple{Int,TC}},
     key_to_accum :: Dict{NTuple{PC,Int}, Vector{TC}},
 ) where {TC,NC,N2,PC}
+    AI = eltype(C.alias_ids)
     for (k, (tid, α)) in key_to_alias
-        push!(C.keys, k); push!(C.alias_ids, tid); push!(C.scalars, α)
+        push!(C.keys, k); push!(C.alias_ids, _alias_id(AI, tid)); push!(C.scalars, α)
     end
     for (k, acc) in key_to_accum
         C.n_templates += 1
         append!(C.templates, acc)
         push!(C.keys,      k)
-        push!(C.alias_ids, C.n_templates)
+        push!(C.alias_ids, _alias_id(AI, C.n_templates))
         push!(C.scalars,   one(TC))
     end
     if !isempty(C.keys)
@@ -178,9 +179,10 @@ function _commit_aliased_dicts_lazy!(
     C.n_templates = final_tid
 
     # 3) Push aliased blocks with remapped tids.
+    AI = eltype(C.alias_ids)
     for (k, (ptid, α)) in key_to_alias
         push!(C.keys, k)
-        push!(C.alias_ids, remap[ptid])
+        push!(C.alias_ids, _alias_id(AI, remap[ptid]))
         push!(C.scalars, α)
     end
     # 4) Push accumulator blocks as new concrete templates.
@@ -188,7 +190,7 @@ function _commit_aliased_dicts_lazy!(
         C.n_templates += 1
         append!(C.templates, acc)
         push!(C.keys, k)
-        push!(C.alias_ids, C.n_templates)
+        push!(C.alias_ids, _alias_id(AI, C.n_templates))
         push!(C.scalars, one(TC))
     end
     # 5) Sort by prefix col-major.

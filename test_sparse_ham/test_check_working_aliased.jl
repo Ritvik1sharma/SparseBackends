@@ -3,7 +3,7 @@
 # Variant of ../test_check_working.jl that stores the projected Hamiltonian
 # (H_new in the original) using `AliasedBlockSparse` instead of
 # `NewBlockSparseSorted`. Both intermediates of `sandwich_mpo` are routed
-# through `contract_aliased_itensor` when `output_hint = :aliasedblocksparse`.
+# through `contract_aliased_itensor` when `output_hint = :aliased`.
 #
 # Original behaviour is preserved when no output_hint is supplied.
 
@@ -11,7 +11,7 @@ using SparseBackends, Random
 using ITensors, ITensorMPS
 using TimerOutputs: reset_timer!, print_timer
 using LinearAlgebra: BLAS
-BLAS.set_num_threads(1)
+BLAS.set_num_threads(parse(Int, get(ENV, "BENCH_BLAS_THREADS", "1")))
 println("[BLAS threads pinned to ", BLAS.get_num_threads(), "]")
 
 const _DIAG = get(ENV, "DMRG_DIAG", "0") == "1"
@@ -50,30 +50,16 @@ end
 # `output_hint` controls the storage of intermediate / output tensors:
 #   :default              — original behaviour (NewBlockSparseSorted via
 #                           SparseBackends.contract with :coo / :blocksparse).
-#   :aliasedblocksparse   — both contractions go through
+#   :aliased              — both contractions go through
 #                           SparseBackends.contract_aliased_itensor so the
 #                           result is backed by AliasedBlockSparse.
 #   :dense                — plain ITensors.contract (no sparse storage).
 # ─────────────────────────────────────────────────────────────────────────────
 function sandwich_mpo(P::MPO, H::MPO; output_hint::Symbol = :default)
-    if output_hint === :aliasedblocksparse
-        new_H = MPO(length(H))
-        for i in 1:length(H)
-            H1      = SparseBackends.contract_aliased_itensor(P[i]'', H[i]', :coo, :dense)
-            H_eff_i = SparseBackends.contract_aliased_itensor(P[i], H1, :coo, :aliased)
-            new_H[i] = replaceprime(H_eff_i, 3 => 1)
-        end
-        return new_H
-    elseif output_hint === :dense
-        H1    = contract(P'', H')
-        H_eff = contract(P, H1)
-        return replaceprime(H_eff, 3 => 1)
-    else
-        # :default — original behaviour (NewBlockSparseSorted)
-        H1    = contract(P'', H', :coo, :dense)
-        H_eff = contract(P, H1, :coo, :blocksparse)
-        return replaceprime(H_eff, 3 => 1)
-    end
+    H1    = contract(P'', H', :coo, :dense; Cbackend=output_hint)
+    H_eff = contract(P, H1, :coo, output_hint; Cbackend=output_hint)
+    return replaceprime(H_eff, 3 => 1)
+    # end
 end
 
 function sandwich_mpo_dense(P::MPO, H::MPO)
@@ -165,12 +151,6 @@ end
 
 length(ARGS) < 1 && error("Usage: julia test_check_working_aliased.jl <N_plaq>")
 
-const _ALIASED_ENABLE = get(ENV, "SB_ALIASED_ENABLE", "0") == "1"
-if !_ALIASED_ENABLE
-    println("[SB_ALIASED_ENABLE != 1] Aliased path is gated off — set SB_ALIASED_ENABLE=1 to run.")
-    exit(0)
-end
-
 let
     spin        = parse(Int, get(ENV, "BENCH_SPIN", "3"))
     spin_sector = 1.0
@@ -219,15 +199,16 @@ let
     H                = MPO(os, sites)
 
     # ── Aliased path ──────────────────────────────────────────────────────────
-    println("\n[building H_new with output_hint = :aliasedblocksparse]")
-    H_new_aliased = sandwich_mpo(ConsOpsCombined, copy(H); output_hint = :aliasedblocksparse)
+    println("\n[building H_new with output_hint = :aliased]")
+    H_new_aliased = sandwich_mpo(ConsOpsCombined, copy(H); output_hint = :aliased)
 
-    if get(ENV, "SB_FUSE_LINKS", "0") == "1"
-        println("\n[fusing multi-strand sparse links in H_new_aliased]")
-        println("  pre-fuse  H[3] inds: ", inds(H_new_aliased[3]))
-        fuse_sparse_links!(H_new_aliased)
-        println("  post-fuse H[3] inds: ", inds(H_new_aliased[3]))
-    end
+    # Link fusion is always applied for the aliased path (was gated by
+    # SB_FUSE_LINKS): it produces the compact "FusedSparse"-tagged links the
+    # aliased matvec + env canonicalization rely on to skip permutations.
+    println("\n[fusing multi-strand sparse links in H_new_aliased]")
+    println("  pre-fuse  H[3] inds: ", inds(H_new_aliased[3]))
+    fuse_sparse_links!(H_new_aliased)
+    println("  post-fuse H[3] inds: ", inds(H_new_aliased[3]))
 
     if get(ENV, "SB_PREPERMUTE_H", "0") == "1"
         println("\n[prepermuting aliased H tails]")

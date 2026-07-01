@@ -298,47 +298,48 @@ function run_bond(b, psi_d, psi_ali, gc_d, gc_ali, H, sites, nn_ali, ee_ali)
         @printf("D3. aliased Path-B eigsolve (FIX) FAILED: %s\n", err)
     end
 
-    # ----- D4. generalized Rayleigh-Ritz oracle (PARKED) -----
-    # ARCHIVED 2026-06: the Rayleigh-Ritz direction is parked. It matches the
-    # dense oracle at b=1/b=3 (~1e-11) and the B_op energy end-to-end, but is
-    # ~2.5× slower than B_op, and b=2 exposes a PRE-EXISTING aliased H_eff matvec
-    # bug that is upstream of RR (raw==recast, both ≠ dense ‖Hφ‖²). Gated behind
-    # BMF_RAYLEIGH_RITZ=1 so the default diagnostic (D1–D3) is unchanged. See the
-    # README "ARCHIVED: Rayleigh-Ritz" section to resume.
-    if get(ENV, "BMF_RAYLEIGH_RITZ", "0") == "1"
-        recast_ali = function(Hv)
-            if ITensors.has_external_storage(Hv) && ITensors.has_external_storage(phi_ali)
-                Tw = ITensors.get_external_storage(phi_ali)
-                Cw = ITensors.get_external_storage(Hv)
-                if Cw isa SparseBackends.WrappedAliasedBlockSparse && Tw isa SparseBackends.WrappedAliasedBlockSparse
-                    return ITensors._itensor_from_external_storage(
-                        SparseBackends.recast_aliased_to_template(Cw, Tw))
-                end
-            end
-            return Hv
-        end
-        Hop_rr = v -> recast_ali(ITensorMPS.product(PH_ali, v))
-        try
-            vals, vecs = SparseBackends.rayleigh_ritz_local_eigsolve(
-                Hop_rr, phi_ali, Lgram_ali, Rgram_ali;
-                which=:SR, tol=1e-12,
-                krylovdim=parse(Int, get(ENV, "RR_KRYLOVDIM", "8")),
-                maxiter=parse(Int, get(ENV, "RR_MAXITER", "100")), b=b)
-            lam_rr = real(vals[1])
-            okstr = isnan(lam_dense) ? "(no dense ref)" :
-                    (abs(lam_rr - lam_dense) < 1e-8 ? "MATCH ✓" : "MISMATCH ✗")
-            @printf("D4. Rayleigh-Ritz smallest = %.10f   (dense ref=%.10f, |Δ|=%.2e) %s\n",
-                    lam_rr, lam_dense, isnan(lam_dense) ? NaN : abs(lam_rr - lam_dense), okstr)
-            # Confirm the raw-gram Mop matches the dense_M_apply reference on phi.
-            Mop_rr = v -> SparseBackends.apply_minv_preserve_bs(Lgram_ali,
-                            SparseBackends.apply_minv_preserve_bs(Rgram_ali, v, phi_ali), phi_ali)
-            q_rr = real(inner(phi_ali, Mop_rr(phi_ali)))
-            @printf("    <phi|M|phi> via raw-gram Mop = %.10f   (dense-ref=%.10f, |Δ|=%.2e)\n",
-                    q_rr, q_dref, abs(q_rr - q_dref))
-        catch err
-            @printf("D4. Rayleigh-Ritz FAILED: %s\n", err)
-        end
-    end
+    # THIS HAS BEEN ARCHIVED
+    # # ----- D4. generalized Rayleigh-Ritz oracle (PARKED) -----
+    # # ARCHIVED 2026-06: the Rayleigh-Ritz direction is parked. It matches the
+    # # dense oracle at b=1/b=3 (~1e-11) and the B_op energy end-to-end, but is
+    # # ~2.5× slower than B_op, and b=2 exposes a PRE-EXISTING aliased H_eff matvec
+    # # bug that is upstream of RR (raw==recast, both ≠ dense ‖Hφ‖²). Gated behind
+    # # BMF_RAYLEIGH_RITZ=1 so the default diagnostic (D1–D3) is unchanged. See the
+    # # README "ARCHIVED: Rayleigh-Ritz" section to resume.
+    # if get(ENV, "BMF_RAYLEIGH_RITZ", "0") == "1"
+    #     recast_ali = function(Hv)
+    #         if ITensors.has_external_storage(Hv) && ITensors.has_external_storage(phi_ali)
+    #             Tw = ITensors.get_external_storage(phi_ali)
+    #             Cw = ITensors.get_external_storage(Hv)
+    #             if Cw isa SparseBackends.WrappedAliasedBlockSparse && Tw isa SparseBackends.WrappedAliasedBlockSparse
+    #                 return ITensors._itensor_from_external_storage(
+    #                     SparseBackends.recast_aliased_to_template(Cw, Tw))
+    #             end
+    #         end
+    #         return Hv
+    #     end
+    #     Hop_rr = v -> recast_ali(ITensorMPS.product(PH_ali, v))
+    #     try
+    #         vals, vecs = SparseBackends.rayleigh_ritz_local_eigsolve(
+    #             Hop_rr, phi_ali, Lgram_ali, Rgram_ali;
+    #             which=:SR, tol=1e-12,
+    #             krylovdim=8,
+    #             maxiter=100, b=b)
+    #         lam_rr = real(vals[1])
+    #         okstr = isnan(lam_dense) ? "(no dense ref)" :
+    #                 (abs(lam_rr - lam_dense) < 1e-8 ? "MATCH ✓" : "MISMATCH ✗")
+    #         @printf("D4. Rayleigh-Ritz smallest = %.10f   (dense ref=%.10f, |Δ|=%.2e) %s\n",
+    #                 lam_rr, lam_dense, isnan(lam_dense) ? NaN : abs(lam_rr - lam_dense), okstr)
+    #         # Confirm the raw-gram Mop matches the dense_M_apply reference on phi.
+    #         Mop_rr = v -> SparseBackends.apply_minv_preserve_bs(Lgram_ali,
+    #                         SparseBackends.apply_minv_preserve_bs(Rgram_ali, v, phi_ali), phi_ali)
+    #         q_rr = real(inner(phi_ali, Mop_rr(phi_ali)))
+    #         @printf("    <phi|M|phi> via raw-gram Mop = %.10f   (dense-ref=%.10f, |Δ|=%.2e)\n",
+    #                 q_rr, q_dref, abs(q_rr - q_dref))
+    #     catch err
+    #         @printf("D4. Rayleigh-Ritz FAILED: %s\n", err)
+    #     end
+    # end
 end
 
 for b in [1, 2, 3]

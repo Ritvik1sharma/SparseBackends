@@ -138,9 +138,10 @@ function contract_aliased!(
     end
 
     # ── Collect alias blocks ──
+    AI = eltype(C.alias_ids)
     for (k, (tid, α)) in key_to_alias
         push!(C.keys,      k)
-        push!(C.alias_ids, tid)
+        push!(C.alias_ids, _alias_id(AI, tid))
         push!(C.scalars,   α)
     end
 
@@ -149,7 +150,7 @@ function contract_aliased!(
         C.n_templates += 1
         append!(C.templates, acc)
         push!(C.keys,      k)
-        push!(C.alias_ids, C.n_templates)
+        push!(C.alias_ids, _alias_id(AI, C.n_templates))
         push!(C.scalars,   one(TC))
     end
 

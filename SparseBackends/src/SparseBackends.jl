@@ -124,7 +124,29 @@ export NewBlockSparseSorted, blocksparse_from_dense, to_dense
 export COOTensor, coo_from_dense, to_dense
 export AliasedBlockSparse, to_blocksparse, to_dense, contract_aliased!, compression_ratio
 export WrappedAliasedBlockSparse, contract_aliased_itensor,
-       contract_and_fuse_links_aliased, contract_coo_dense_aliased
+       contract_coo_dense_aliased
+
+# ── Backend tag (enum) ───────────────────────────────────────────────────────
+# The single source of truth for a tensor-storage backend. Using an enum (not a
+# bare Symbol) means there is exactly ONE name per backend — a second alias for
+# the same datatype (e.g. the old :aliasedblocksparse for :aliased) is impossible.
+# The public contract API still accepts Symbols for ergonomics; `to_backend`
+# converts at the boundary and ERRORS on any non-canonical name. Internal
+# dispatch compares the enum.
+@enum Backend DENSE COO BLOCKSPARSE ALIASED
+export Backend, DENSE, COO, BLOCKSPARSE, ALIASED, to_backend
+
+@inline to_backend(b::Backend) = b
+@inline function to_backend(s::Symbol)::Backend
+    s === :dense       ? DENSE :
+    s === :coo         ? COO :
+    s === :blocksparse ? BLOCKSPARSE :
+    s === :aliased     ? ALIASED :
+    throw(ArgumentError("Unknown backend $(repr(s)); valid: :dense, :coo, :blocksparse, :aliased"))
+end
+# Reverse map for the few internal helpers still keyed on a Symbol.
+@inline Base.Symbol(b::Backend) =
+    b === DENSE ? :dense : b === COO ? :coo : b === BLOCKSPARSE ? :blocksparse : :aliased
 
 include("base.jl")
 
@@ -153,6 +175,7 @@ include("tensoralgebra/contract_aliased_coo_dense.jl")   # COOTensor × Dense �
 include("tensoralgebra/contract_aliased.jl")              # AliasedBS × Dense / AliasedBS × AliasedBS (single label)
 include("tensoralgebra/contract_aliased_shared.jl")       # helpers + AliasedBS × AliasedBS (multi-label)
 include("tensoralgebra/contract_aliased_dense_shared.jl") # AliasedBS × Dense (multi-label, threaded + serial)
+include("tensoralgebra/contract_aliased_dense_legacy.jl") # legacy reduction-stationary serial kernel (A/B only, SB_ALIASED_LEGACY=1)
 include("tensoralgebra/contract_coo_aliased.jl")          # COOTensor × AliasedBS → AliasedBS (single label, r in B prefix)
 include("tensoralgebra/contract_aliased_dense_to_dense.jl") # AliasedBS × Dense → Dense (alias-amplified, for matvec)
 

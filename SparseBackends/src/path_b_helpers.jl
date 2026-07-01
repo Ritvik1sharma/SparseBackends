@@ -341,6 +341,18 @@ function build_half_pair_single(G::ITensors.ITensor; rtol::Real=1e-10)
   tol  = real(rtol * maxλ)
   sqrt_λ     = [real(l) > tol ? sqrt(real(l))     : zero(real(TC)) for l in λ]
   inv_sqrt_λ = [real(l) > tol ? 1 / sqrt(real(l)) : zero(real(TC)) for l in λ]
+  # STEP 2a — flat-c override (BMF_MINV_FLATC=1, default off): force the kept spectrum
+  # flat to c = mean(kept λ), i.e. use M^{±1/2} = c^{±1/2}·Π (the ideal scaled-projector
+  # form) instead of the actual graded spectrum. Uses the REAL range (V) but discards the
+  # graded tail. At convergence the spectrum is ALREADY flat (=2^⌈env/2⌉) so this is a
+  # no-op / byte-identical; during the ramp it flattens the tail. Tests whether the ideal
+  # c·Π form still converges. Byte-identical for canonical M=I (single kept eigenvalue).
+  if get(ENV, "BMF_MINV_FLATC", "0") == "1"
+    _kept = [real(l) for l in λ if real(l) > tol]
+    _cflat = isempty(_kept) ? one(real(TC)) : sum(_kept) / length(_kept)
+    sqrt_λ     = [real(l) > tol ? sqrt(_cflat)     : zero(real(TC)) for l in λ]
+    inv_sqrt_λ = [real(l) > tol ? 1 / sqrt(_cflat) : zero(real(TC)) for l in λ]
+  end
   # M-conditioning diagnostic (BMF_MINV_DIAG=1): the M⁻¹ correction is unstable
   # when an eigenvalue sits just ABOVE the rtol threshold → huge 1/√λ. Log the
   # spectrum so we can see if Linv blows up at large bond dim / many sweeps.
@@ -552,7 +564,7 @@ function wrap_dense_as_aliased_via_template(T::ITensors.ITensor,
     blk_off = (bs.ids[i] - 1) * bs.blksize
     append!(ali.templates, @view bs.data[blk_off+1 : blk_off+bs.blksize])
     push!(ali.keys,      key)
-    push!(ali.alias_ids, ali.n_templates)
+    push!(ali.alias_ids, _alias_id(eltype(ali.alias_ids), ali.n_templates))
     push!(ali.scalars,   one(TC))
   end
   return ITensors._itensor_from_external_storage(
@@ -1192,7 +1204,7 @@ end
 # rank-deficient (M is structurally rank-deficient for aliased ψ). Project out
 # M_small's near-null directions (per-block analog of the per-side pseudoinverse),
 # whiten, solve the reduced standard symmetric eig, and recover c in the original
-# basis (already M-normalized: cᵀ·M_small·c = 1). `rtol` is BMF_RR_RTOL.
+# basis (already M-normalized: cᵀ·M_small·c = 1).
 function solve_small_geneig(Hs::AbstractMatrix, Ms::AbstractMatrix, which::Symbol; rtol::Real=1e-8)
     k = size(Hs, 1)
     Hsym = LinearAlgebra.Hermitian((Hs + Hs') / 2)

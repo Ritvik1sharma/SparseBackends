@@ -25,7 +25,7 @@ using SparseBackends, Random
 using ITensors, ITensorMPS
 using TimerOutputs: reset_timer!, print_timer
 using LinearAlgebra: BLAS
-BLAS.set_num_threads(1)
+BLAS.set_num_threads(parse(Int, get(ENV, "BENCH_BLAS_THREADS", "1")))
 println("[BLAS threads pinned to ", BLAS.get_num_threads(), "]")
 
 const _ALIASED_ENABLE = get(ENV, "SB_ALIASED_ENABLE", "0") == "1"
@@ -123,12 +123,11 @@ let
     println("\n[Building H_aliased via sandwich_mpo_aliased]")
     H_aliased = sandwich_mpo_aliased(P, copy(H_raw))
 
-    if get(ENV, "SB_FUSE_LINKS", "0") == "1"
-        println("\n[fusing multi-strand sparse links in H_aliased]")
-        length(H_aliased) >= 3 && println("  pre-fuse  H[3] inds: ", inds(H_aliased[3]))
-        fuse_sparse_links!(H_aliased)
-        length(H_aliased) >= 3 && println("  post-fuse H[3] inds: ", inds(H_aliased[3]))
-    end
+    # Link fusion always applied for the aliased path (was gated by SB_FUSE_LINKS).
+    println("\n[fusing multi-strand sparse links in H_aliased]")
+    length(H_aliased) >= 3 && println("  pre-fuse  H[3] inds: ", inds(H_aliased[3]))
+    fuse_sparse_links!(H_aliased)
+    length(H_aliased) >= 3 && println("  post-fuse H[3] inds: ", inds(H_aliased[3]))
 
     if get(ENV, "SB_PREPERMUTE_H", "0") == "1"
         println("\n[prepermuting aliased H tails]")

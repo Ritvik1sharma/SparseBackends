@@ -92,8 +92,9 @@ end
 end
 @inline _has(l, labels) = _posin(l, labels) != 0
 
-# Diagnostic: when SB_PERMB_DBG=1, print the first N kernel calls in which
-# permute_B fires (i.e. env layout != [red_dense, keepB, shared_prefix]).
+# Diagnostic: when SB_PERM_PROFILE=1, print the first SB_PERMB_DBG_MAX kernel
+# calls in which permute_B fires (i.e. env layout != [red_dense, keepB,
+# shared_prefix]), then the aggregate pattern + per-step tables.
 const _PERMB_DBG_COUNT = Ref(0)
 
 # Pattern profiler: when SB_PERM_PROFILE=1, accumulate (permB, perm_C, dims)
@@ -116,8 +117,12 @@ Base.:(==)(a::_PermSig, b::_PermSig) =
     a.n_sp == b.n_sp && a.n_rd == b.n_rd && a.n_keepA == b.n_keepA &&
     a.n_keepB == b.n_keepB && a.n_cpfx == b.n_cpfx
 const _PERM_PROFILE = Dict{_PermSig, Int}()
+# Per-matvec-step permB tally (keyed by ENV["SB_STEP"]): value = [calls, permB_fired].
+# Only populated when SB_PERM_PROFILE=1. Answers "which step permutes".
+const _PERMB_STEP = Dict{String, Vector{Int}}()
 function _reset_perm_profile!()
     empty!(_PERM_PROFILE)
+    empty!(_PERMB_STEP)
 end
 function _report_perm_profile()
     isempty(_PERM_PROFILE) && (println("[perm_profile] (empty)"); return)
@@ -138,6 +143,15 @@ function _report_perm_profile()
                 rpad(sig, 22), rpad(permB_str, 30), perm_C_str)
     end
     println("==========")
+    if !isempty(_PERMB_STEP)
+        println("---------- permB by matvec step (SB_STEP) ----------")
+        println(rpad("step", 8), rpad("calls", 8), rpad("permB_fired", 14), "fire_frac")
+        for st in sort(collect(keys(_PERMB_STEP)))
+            c, f = _PERMB_STEP[st]
+            println(rpad(st, 8), rpad(c, 8), rpad(f, 14), round(f/max(c,1)*100; digits=1), "%")
+        end
+        println("----------")
+    end
 end
 @inline _perm_profile_enabled() = get(ENV, "SB_PERM_PROFILE", "0") == "1"
 
@@ -189,10 +203,14 @@ function contract_aliased_dense_to_dense!(
         if permB == collect(1:NB)
             Bp = B
         else
-            if get(ENV, "SB_PERMB_DBG", "0") == "1" &&
+            # Per-call permute_B detail: folded under the single SB_PERM_PROFILE
+            # flag (was its own SB_PERMB_DBG knob). Still capped via
+            # SB_PERMB_DBG_MAX so it prints the first N firings, then the
+            # aggregate + per-step tables come from _report_perm_profile.
+            if _perm_profile_enabled() &&
                _PERMB_DBG_COUNT[] < parse(Int, get(ENV, "SB_PERMB_DBG_MAX", "12"))
                 _PERMB_DBG_COUNT[] += 1
-                println("\n[SB_PERMB_DBG #", _PERMB_DBG_COUNT[], "] permute_B firing")
+                println("\n[permB #", _PERMB_DBG_COUNT[], "] permute_B firing  (SB_STEP=", get(ENV, "SB_STEP", "?"), ")")
                 println("  labelsA = ", labelsA, "  (PA = ", PA, ")")
                 println("  labelsB = ", labelsB)
                 println("  labelsC = ", labelsC)
@@ -249,6 +267,10 @@ function contract_aliased_dense_to_dense!(
         if _perm_profile_enabled()
             sig = _PermSig(copy(permB), copy(perm_C), n_sp, n_rd, n_keepA, n_keepB, n_cpfx)
             _PERM_PROFILE[sig] = get(_PERM_PROFILE, sig, 0) + 1
+            _st = get(ENV, "SB_STEP", "?")
+            _v  = get!(_PERMB_STEP, _st, Int[0, 0])
+            _v[1] += 1
+            (permB != collect(1:NB)) && (_v[2] += 1)
         end
 
         # ── Direct-write detection (skips permute_back) ──────────────────────

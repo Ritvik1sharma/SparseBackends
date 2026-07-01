@@ -38,8 +38,6 @@ dim(w::WrappedBlockSparse) = _dims(w)
 
 
 
-
-
 # concise single-line
 function summary(io::IO, w::WrappedTensorTypes{T,N}) where {T,N}
     print(io, "Wrapped", _backend(w), "{", T, ",", N, "}",
@@ -384,28 +382,31 @@ end
 
 backend_hint(::ITensors.ITensor) = :dense  # user can overload in their own code if desired
 
-function wrap_itensor(T::ITensors.ITensor; backend::Symbol=backend_hint(T), denseLinks::Union{Nothing,Int}=nothing)
+function wrap_itensor(T::ITensors.ITensor; backend::Union{Symbol,Backend}=backend_hint(T), denseLinks::Union{Nothing,Int}=nothing)
+  b = to_backend(backend)
   if ITensors.has_external_storage(T)
-    if backend === :coo
+    if b === COO
       tensor = ITensors.get_external_storage(T)
       if tensor isa WrappedCOOTensor
         return tensor
       else
         throw(ArgumentError("External storage is not a WrappedCOOTensor; cannot wrap as COO"))
       end
-    elseif backend === :blocksparse
+    elseif b === BLOCKSPARSE
       tensor = ITensors.get_external_storage(T)
       if tensor isa WrappedBlockSparse
         return tensor
       else
         throw(ArgumentError("External storage is not a WrappedBlockSparse; cannot wrap as BlockSparse"))
       end
+    elseif b === ALIASED
+      return wrap_itensor_aliased(T; denseLinks=denseLinks)
     else
-      throw(ArgumentError("Unsupported backend=$backend for ITensor with external storage"))
+      throw(ArgumentError("Unsupported backend=$b for ITensor with external storage"))
     end
   end
 
-  if backend === :dense
+  if b === DENSE
     # Fast path for plain dense ITensors: just reshape the raw data buffer
     # to its inds-order layout (which already matches ITensors.data(T)).
     # Skips mpo_axes_itensor's index classification + sort_links, since
@@ -415,13 +416,15 @@ function wrap_itensor(T::ITensors.ITensor; backend::Symbol=backend_hint(T), dens
     raw       = ITensors.data(T)
     array_full = reshape(raw, dims_full)
     return WrappedTensor(array_full, inds_full)
-  elseif backend === :coo
+  elseif b === COO
     return WrappedCOOTensor(T)
-  elseif backend === :blocksparse
+  elseif b === BLOCKSPARSE
     @assert denseLinks !== nothing "must pass denseLinks for :blocksparse"
     return WrappedBlockSparse(T, denseLinks)
+  elseif b === ALIASED
+    return wrap_itensor_aliased(T; denseLinks=denseLinks)
   else
-    throw(ArgumentError("Unknown backend=$backend; use :dense, :coo, or :blocksparse"))
+    throw(ArgumentError("Unknown backend=$b"))
   end
 end
 
@@ -455,16 +458,17 @@ function _dense_last_order(indsC_vec::Vector{ITensors.Index},
 end
 
 function contract(A::ITensors.ITensor, B::ITensors.ITensor,
-                  Abackend::Symbol,
-                  Bbackend::Symbol;
+                  Abackend::Union{Symbol,Backend},
+                  Bbackend::Union{Symbol,Backend};
                   denseLinksA::Union{Nothing,Int}=nothing,
                   denseLinksB::Union{Nothing,Int}=nothing,
                   preserve_bs_output::Bool=false)
-  if Abackend === :dense && Bbackend === :dense
+  Ab = to_backend(Abackend); Bb = to_backend(Bbackend)
+  if Ab === DENSE && Bb === DENSE
     return ITensors.contract(A, B)
   end
-  Aw = wrap_itensor(A; backend=Abackend, denseLinks=denseLinksA)
-  Bw = wrap_itensor(B; backend=Bbackend, denseLinks=denseLinksB)
+  Aw = wrap_itensor(A; backend=Ab, denseLinks=denseLinksA)
+  Bw = wrap_itensor(B; backend=Bb, denseLinks=denseLinksB)
   Cw = contract(Aw, Bw; preserve_bs_output=preserve_bs_output)
   Cw isa ITensors.ITensor && return Cw  # P_C=0: already a plain Dense ITensor
   return ITensors._itensor_from_external_storage(Cw)
@@ -483,7 +487,9 @@ end
 function contract_preserve_bs(A::ITensors.ITensor, B::ITensors.ITensor;
                               template::Union{Nothing,ITensors.ITensor}=nothing,
                               output_inds_hint::Union{Nothing,AbstractSet}=nothing,
-                              preferred_output_labels::Union{Nothing,AbstractVector}=nothing)
+                              preferred_output_labels::Union{Nothing,AbstractVector}=nothing,
+                              next_op=nothing,
+                              remaining_ops=nothing)
  @timeit TIMER "contract_preserve_bs" begin
   # Both inputs plain dense → no BS storage to preserve; standard contract.
   if !ITensors.has_external_storage(A) && !ITensors.has_external_storage(B)
@@ -543,10 +549,11 @@ function contract_preserve_bs(A::ITensors.ITensor, B::ITensors.ITensor;
   Cw = if _pref_order !== nothing
     @timeit TIMER "cpb.contract" contract(Aw, Bw; preserve_bs_output=true,
         output_inds_hint=output_inds_hint, template_for_filter=template_for_filter,
-        preferred_output_labels=_pref_order)
+        preferred_output_labels=_pref_order, next_op=next_op, remaining_ops=remaining_ops)
   else
     @timeit TIMER "cpb.contract" contract(Aw, Bw; preserve_bs_output=true,
-        output_inds_hint=output_inds_hint, template_for_filter=template_for_filter)
+        output_inds_hint=output_inds_hint, template_for_filter=template_for_filter,
+        next_op=next_op, remaining_ops=remaining_ops)
   end
   Cw isa ITensors.ITensor && return Cw
 
@@ -1134,6 +1141,23 @@ function __init__()
     for t in 1:Threads.nthreads()
         _scratch[t] = ContractScratch(Label[], Label[], Label[])
     end
+    # Install the aliased inner ⟨y|x⟩ fast-path into ITensors.inner so KrylovKit's
+    # Lanczos dots reduce position-wise over shared template buffers instead of a
+    # full aliased×aliased contraction (the `wrapped×wrapped` dots). Mutating the
+    # Ref's contents (not a method def) ⇒ no precompile conflict with the
+    # ITensorsVectorInterfaceExt extension. Gated; default ON.
+    ITensors._INNER_FASTPATH[] = _sparse_inner_fastpath
+end
+
+# ⟨y|x⟩ = Σ conj(y)·x for key-aligned aliased operands; nothing ⇒ fall through to
+# the standard ITensors contraction. _alias_inner conjugates the first arg, exactly
+# matching ITensors.inner(y,x) = (dag(y)*x)[].
+function _sparse_inner_fastpath(y::ITensors.ITensor, x::ITensors.ITensor)
+    # HARDENED: always taken for key-aligned aliased operands (bit-identical,
+    # faster); returns nothing → standard contraction only when not applicable.
+    yw = _alias_storage(y); xw = _alias_storage(x)
+    (yw !== nothing && xw !== nothing) || return nothing
+    return _alias_inner(yw, xw)
 end
 
 # Task-local contract-label scratch. Previously `_scratch[Threads.threadid()]`,
@@ -1943,10 +1967,8 @@ function itensor_blocksparse_svd_channel_aware(
         Int[bond_sp_dim]
     end
 
-    svd_fn = (get(ENV, "SB_USE_GROUPED_SVD", "0") == "1") ?
-                blocksparse_svd_channel_aware_fixed :
-                blocksparse_svd_channel_aware
-    U_bs, SV_bs, svs_kept, spec = svd_fn(bs_p;
+    # SB_USE_GROUPED_SVD deprecated
+    U_bs, SV_bs, svs_kept, spec = blocksparse_svd_channel_aware(bs_p;
         n_left_sparse = nls,
         n_left_dense  = nld,
         left_template, right_template,
