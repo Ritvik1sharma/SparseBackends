@@ -165,14 +165,12 @@ let
     # ── Ground state ──────────────────────────────────────────────────────────
     println("\n────────── Ground state DMRG ──────────")
     println("[DENSE  ground]")
-    ENV["SB_RUN_LABEL"] = "DENSE_G"
     (E0_d, psi0_d), t_g_dense = run_dmrg_ground("DENSE_ground",
-        H_dense, deepcopy(psi_init); nsweeps=_ns, maxdim, mindim, cutoff, outputlevel=1)
+        H_dense, deepcopy(psi_init); nsweeps=_ns, maxdim, mindim, cutoff, outputlevel=1, run_label="DENSE_G")
 
     println("[ALIASED ground]")
-    ENV["SB_RUN_LABEL"] = "ALIASED_G"
     (E0_a, psi0_a), t_g_ali = run_dmrg_ground("ALIASED_ground",
-        H_aliased, deepcopy(psi_init); nsweeps=_ns, maxdim, mindim, cutoff, outputlevel=1)
+        H_aliased, deepcopy(psi_init); nsweeps=_ns, maxdim, mindim, cutoff, outputlevel=1, run_label="ALIASED_G")
 
     # ── First excited state ───────────────────────────────────────────────────
     Random.seed!(43)
@@ -182,16 +180,14 @@ let
 
     println("\n────────── First excited DMRG ──────────")
     println("[DENSE  excited]")
-    ENV["SB_RUN_LABEL"] = "DENSE_E"
     (E1_d, psi1_d), t_e_dense = run_dmrg_excited("DENSE_excited",
         H_dense, [psi0_d], deepcopy(psi_init2);
-        nsweeps=_ns, maxdim, mindim, cutoff, weight=excited_weight, outputlevel=1)
+        nsweeps=_ns, maxdim, mindim, cutoff, weight=excited_weight, outputlevel=1, run_label="DENSE_E")
 
     println("[ALIASED excited]")
-    ENV["SB_RUN_LABEL"] = "ALIASED_E"
     (E1_a, psi1_a), t_e_ali = run_dmrg_excited("ALIASED_excited",
         H_aliased, [psi0_a], deepcopy(psi_init2);
-        nsweeps=_ns, maxdim, mindim, cutoff, weight=excited_weight, outputlevel=1)
+        nsweeps=_ns, maxdim, mindim, cutoff, weight=excited_weight, outputlevel=1, run_label="ALIASED_E")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     println("\n========== SUMMARY (PXP PHP, N=$N, maxdim=$_md, nsweeps=$_ns) ==========")

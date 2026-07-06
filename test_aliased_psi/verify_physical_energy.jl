@@ -55,11 +55,12 @@ function densify_mps(psi)
 end
 
 let
-    N      = parse(Int, get(ENV, "VN", "12"))
-    md     = parse(Int, get(ENV, "VMD", "50"))
-    nsw    = parse(Int, get(ENV, "VSW", "8"))
-    psign  = get(ENV, "VPS", "-1") == "-1" ? -1 : +1
-    spin   = parse(Int, get(ENV, "VSPIN", "3"))
+    # Were VN / VMD / VSW / VPS / VSPIN env vars — hardcoded, edit directly to change.
+    N      = 12
+    md     = 50
+    nsw    = 8
+    psign  = -1
+    spin   = 3
 
     println("=== PHYSICALITY VERIFY  N=$N md=$md sweeps=$nsw psign=$psign ===")
     H, P, psi = build_setup(N, psign, spin)

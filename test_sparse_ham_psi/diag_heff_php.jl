@@ -17,28 +17,39 @@
 #                       still wrong, the bug is in the Path-B M⁻¹/eigsolve layer.
 #
 # Run (machine must be free — see SKILLS contention rule):
-#   julia --project=.. diag_heff_php.jl            # N_plaq=2
-#   DIAG_N_PLAQ=2 julia --project=.. diag_heff_php.jl
+#   julia --project=.. diag_heff_php.jl                    # N_plaq=2
+#   julia --project=.. diag_heff_php.jl --N-plaq 2
 
 ENV["BMF_BOP_PROJECT"]           = get(ENV, "BMF_BOP_PROJECT", "1")
 ENV["BMF_MINV_RTOL"]             = get(ENV, "BMF_MINV_RTOL", "1e-2")
-ENV["SB_ALIASED_NATIVE_FISSION"] = get(ENV, "SB_ALIASED_NATIVE_FISSION", "1")
 ENV["SB_ALIASED_PERCM_CAP"]      = get(ENV, "SB_ALIASED_PERCM_CAP", "1")
 ENV["SB_USE_QR"]                 = get(ENV, "SB_USE_QR", "1")
 ENV["SB_BALANCED_OWNERSHIP"]     = get(ENV, "SB_BALANCED_OWNERSHIP", "1")
 ENV["SB_ADAPTIVE_RANK"]          = get(ENV, "SB_ADAPTIVE_RANK", "1")
 ENV["SB_FUSE_LINKS"]             = get(ENV, "SB_FUSE_LINKS", "1")
-ENV["SB_ALIASED_AA_ENV"]         = get(ENV, "SB_ALIASED_AA_ENV", "1")
-ENV["SB_ALIASED_AA_HINT"]        = get(ENV, "SB_ALIASED_AA_HINT", "1")
+# SB_ALIASED_AA_ENV / SB_ALIASED_AA_HINT hardened 2026-06 — always on now.
 
 using SparseBackends, ITensors, ITensorMPS
 using Random, Printf, LinearAlgebra
 using KrylovKit: eigsolve
+using ArgParse
 
 include("../test_sparse_psi/utils.jl")
 include("../test_sparse_ham/aliased_helpers.jl")
 
-const N_PLAQ = parse(Int, get(ENV, "DIAG_N_PLAQ", "2"))
+function parse_command_line()
+    s = ArgParseSettings()
+    @add_arg_table s begin
+        "--N-plaq"
+            help = "Number of plaquettes (N)"
+            arg_type = Int
+            default = 2
+    end
+    return parse_args(s)
+end
+
+# Was DIAG_N_PLAQ env var.
+const N_PLAQ = parse_command_line()["N-plaq"]
 
 function build_models(N::Int, psign::Int)
     Random.seed!(42)

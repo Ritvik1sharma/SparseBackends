@@ -24,8 +24,10 @@ using Random
 using ArgParse
 using Printf
 
+# Hardened 2026-06 to the default serial count (was SB_KK_NTHREADS,
+# default-on knob, never varied off 1).
 import KrylovKit
-KrylovKit.set_num_threads(parse(Int, get(ENV, "SB_KK_NTHREADS", "1")))
+KrylovKit.set_num_threads(1)
 println("[KrylovKit threads = ", KrylovKit.get_num_threads(),
         "   Julia threads = ", Threads.nthreads(), "]")
 
@@ -34,6 +36,9 @@ include("../test_aliased_psi/setup.jl")
 
 # Schema for the initial aliased ψ (frozen across sweeps; only template numeric data updates). Used for invariance tracking.
 const _INIT_SCHEMA = Ref{Any}(nothing)
+
+# Debug toggle (was SB_SCHEMA_TRACK env var) — flip to true manually to enable.
+const _SCHEMA_TRACK_ON = false
 
 
 # ── PXP site operators on S=1 (states 0, 1, 2; "1" = Rydberg-excited) ────────
@@ -67,6 +72,10 @@ function parse_command_line()
         "--no-excited"
             help = "Skip the excited-state search (useful for quick benchmarking)."
             action = :store_true
+        "--roofline"
+            help = "Enable the consolidated roofline/flop-count/env-footprint/perm-capture/GEMM-histogram instrumentation."
+            arg_type = Bool
+            default = false
     end
     return parse_args(s)
 end
@@ -122,7 +131,7 @@ end
 # ── Sweep runner ──────────────────────────────────────────────────────────────
 function run_sweeps(H, psi0, n_sweeps::Int, maxdim::Int;
                     cutoff=1e-10, mindim=1, target_E=NaN, label="ALI",
-                    orthogonal_states=nothing, weight=20.0)
+                    orthogonal_states=nothing, weight=20.0, roofline::Bool=false)
     psi = psi0
     E = NaN
     cum = 0.0; cum_excl1 = 0.0
@@ -130,15 +139,15 @@ function run_sweeps(H, psi0, n_sweeps::Int, maxdim::Int;
     for i in 1:n_sweeps
         sw = Sweeps(1); setmaxdim!(sw, maxdim); setmindim!(sw, mindim); setcutoff!(sw, cutoff)
         t = if orthogonal_states === nothing
-            @elapsed (E, psi, _esw, terr) = dmrg(H, psi, sw; outputlevel=0, use_early_exit=false)
+            @elapsed (E, psi, _esw, terr) = dmrg(H, psi, sw; outputlevel=0, use_early_exit=false, roofline=roofline)
         else
             @elapsed (E, psi, _esw, terr) = dmrg(H, orthogonal_states, psi, sw;
-                outputlevel=0, use_early_exit=false, weight=weight)
+                outputlevel=0, use_early_exit=false, weight=weight, roofline=roofline)
         end
         cum += t; if i > 1; cum_excl1 += t; end
         @printf("  [%s sweep %2d] t=%8.3fs  E=%.12f  maxtruncerr=%.3e\n", label, i, t, E, terr)
         check_aliased_invariant(psi; label="after sweep $i")
-        if get(ENV, "SB_SCHEMA_TRACK", "0") == "1" && _INIT_SCHEMA[] !== nothing
+        if _SCHEMA_TRACK_ON && _INIT_SCHEMA[] !== nothing
             _compare_schema(_INIT_SCHEMA[], _schema_fingerprint(psi); label="after sweep $i vs init")
         end
         flush(stdout)
@@ -159,6 +168,7 @@ let
     mindim     = parsed_args["mindim"]
     target_E   = parsed_args["target-energy"]
     no_excited = parsed_args["no-excited"]
+    roofline   = parsed_args["roofline"]
 
     println("=== PXP benchmark — ALIASED ψ (Path-B) ===")
     println("run_mode=:bop_aliased (default) — required for non-iso aliased ψ")
@@ -171,7 +181,7 @@ let
     println("Setup time: $(round(t_setup, digits=1))s.  System: $(length(psi_ali)) sites.")
     report_state("initial psi_ali", psi_ali, maxdim; verbose=true)
 
-    if get(ENV, "SB_SCHEMA_TRACK", "0") == "1"
+    if _SCHEMA_TRACK_ON
         _INIT_SCHEMA[] = _schema_fingerprint(psi_ali)
         println("  [init] captured alias schema fingerprint for invariance tracking")
     end
@@ -181,10 +191,10 @@ let
     reset_timer!(ITensorMPS.PROJMPO_TIMER)
     reset_timer!(SparseBackends.TIMER)
     SparseBackends.reset_cas_stats!()
-    SparseBackends.reset_roofline!()  # self-gates on SB_ROOFLINE (the single timing flag)
+    SparseBackends.reset_roofline!(roofline)  # zero accumulators once before the sweep loops below
 
     println("\n=== GROUND STATE ($n_sweeps sweeps at maxdim=$maxdim, mindim=$mindim; sweep 1 = JIT) ===")
-    res_gs = run_sweeps(H, psi_ali, n_sweeps, maxdim; mindim=mindim, target_E=target_E)
+    res_gs = run_sweeps(H, psi_ali, n_sweeps, maxdim; mindim=mindim, target_E=target_E, roofline=roofline)
     E_gs = res_gs.E; psi_gs = res_gs.psi
     avg_excl1 = n_sweeps > 1 ? res_gs.total_excl1 / (n_sweeps - 1) : NaN
     @printf("[ground]    total=%.3fs  excl1=%.3fs  avg/sw=%.3fs  E=%.12f\n",
@@ -197,7 +207,7 @@ let
         println("\n=== EXCITED STATE (orthogonal to gs; $n_sweeps sweeps; weight=20) ===")
         psi_init = deepcopy(psi_ali)
         res_ex = run_sweeps(H, psi_init, n_sweeps, maxdim; mindim=mindim, label="EX",
-                            orthogonal_states=[psi_gs], weight=20.0)
+                            orthogonal_states=[psi_gs], weight=20.0, roofline=roofline)
         E_ex = res_ex.E; psi_ex = res_ex.psi; t_ex = res_ex.total
         avg_ex = n_sweeps > 1 ? res_ex.total_excl1 / (n_sweeps - 1) : NaN
         @printf("[excited]   total=%.3fs  excl1=%.3fs  avg/sw=%.3fs  E=%.12f\n",
@@ -240,9 +250,12 @@ let
         !dedup_ok  && println("    - some site has n_templates == n_blocks → one-template collapse (dedup lost).")
     end
 
-    if get(ENV, "SB_ROOFLINE", "0") == "1"
-        println("\n========== kernel roofline (SB_ROOFLINE) =========="); SparseBackends.show_roofline()
+    if roofline
+        println("\n========== kernel roofline =========="); SparseBackends.show_roofline()
         println("\n========== CAS redundancy stats =========="); SparseBackends.show_cas_stats()
+        SparseBackends.report_flops("ALI")
+        ITensorMPS.print_env_footprint()
+        SparseBackends.show_gemm_dims_hist()
     end
     println("\n========== ITensorMPS.PROJMPO_TIMER ==========")
     print_timer(ITensorMPS.PROJMPO_TIMER)

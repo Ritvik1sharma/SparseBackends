@@ -42,7 +42,7 @@ function contract_aliased!(
     mapB     :: Dict{Label,Int},
     rlab     :: Label,
 ) where {TC,NC,N2,PC,TA,NA,TB,NB}
-    if get(ENV, "SB_TRACE", "0") == "1"
+    if false  # SB_TRACE — flip to true here for debug output
       println("[SB_TRACE] contract_aliased_coo_dense.contract_aliased!",
               "  COO(nnz=", length(A.keys), ", dims=", A.dims, ")",
               " × Dense(dims=", size(B), ")",
@@ -105,7 +105,7 @@ function contract_aliased!(
             end
 
         elseif haskey(key_to_alias, ckey)
-            if get(ENV, "SB_TRACE", "0") == "1"
+            if false  # SB_TRACE — flip to true here for debug output
               println("[SB_TRACE]   demotion fired @ ckey=", ckey, " (rv=", rv, ")")
             end
             # ── Second contribution to this key: demote alias → accumulator ──

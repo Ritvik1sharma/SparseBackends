@@ -56,7 +56,7 @@ function contract!(
     mapB::Dict{Label,Int},
     rlab::Label;
 ) where {TC,NC,N2,PC,TA,NA,TB,NB}
-  if get(ENV, "SB_TRACE", "0") == "1"
+  if false  # SB_TRACE — flip to true here for debug output
     println("[SB_TRACE] contract_coo_dense.contract!  COO(nnz=", length(A.keys),
             ", dims=", A.dims, ") × Dense(dims=", size(B), ")",
             "  → BS{NC=", NC, ",N2=", N2, ",PC=", PC, ", blksize=", C.blksize, "}")

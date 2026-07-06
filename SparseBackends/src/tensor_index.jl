@@ -195,6 +195,20 @@ function ITensors.dag(W::WrappedBlockSparse{T,N,N2,P}) where {T,N,N2,P}
   return ITensors._itensor_from_external_storage(WrappedBlockSparse{T,N,N2,P}(newA, newinds))
 end
 
+# COO dag: conjugate the stored nonzero values; the sparsity pattern (keys) is
+# unchanged. No QN arrows on COO indices, so ITensors.dag on each Index is a
+# structural no-op (kept for parity with the BS path). Mirrors the BS `dag` above
+# so the P†P transfer / overlap contractions stay sparse (no densify needed).
+function ITensors.dag(A::COOTensor{T,N,K}) where {T,N,K}
+  return COOTensor{T,N,K}(A.dims, copy(A.keys), conj.(A.vals), A.dirty)
+end
+
+function ITensors.dag(W::WrappedCOOTensor{T,N}) where {T,N}
+  newcoo = ITensors.dag(W.coo)
+  newinds = ntuple(i -> ITensors.dag(W.inds[i]), N)
+  return ITensors._itensor_from_external_storage(WrappedCOOTensor{T,N}(newcoo, newinds))
+end
+
 function ITensors.external_dag(es::ITensors.ExternalStorage{S}; kwargs...) where {S}
   data = es.data
   data isa WrappedTensorTypes || throw(MethodError(ITensors.external_dag, (es,)))

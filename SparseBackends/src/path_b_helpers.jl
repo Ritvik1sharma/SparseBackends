@@ -444,9 +444,10 @@ function build_minv_half_pair_factored(Lgram::ITensors.ITensor,
     # fission. This removes the case-4 md=16 crossover at its source (the factor
     # was fully dense ⇒ its channel landed in denseA ⇒ the no-hint fallback
     # parked the output channel in the dense tail). Pure relayout, values
-    # bit-identical. Gated SB_ALIASED_MINV_WRAP (default ON for aliased φ);
-    # cases 1/3 have dense/BS φ and never enter this branch.
-    elseif both_aliased && get(ENV, "SB_ALIASED_MINV_WRAP", "1") == "1" && phi_template !== nothing &&
+    # bit-identical. Hardened 2026-06 — always on for aliased φ (was
+    # SB_ALIASED_MINV_WRAP, default-on knob); cases 1/3 have dense/BS φ and
+    # never enter this branch.
+    elseif both_aliased && phi_template !== nothing &&
        ITensors.has_external_storage(phi_template) &&
        ITensors.get_external_storage(phi_template) isa WrappedAliasedBlockSparse
       @timeit SparseBackends.TIMER "bmf.aliaswrap" begin
@@ -1255,7 +1256,10 @@ function rayleigh_ritz_local_eigsolve(Hop::Function, phi::ITensors.ITensor,
     _ip(a, c) = real(ITensors.inner(a, c))
     _nrm(a) = sqrt(max(_ip(a, a), 0.0))
     orth_tol = 1e-12
-    dbg = get(ENV, "SB_RR_DBG", "0") == "1"
+    # RR-iteration debug print, disabled; flip to `true` (and restore the check
+    # below) to re-enable. Note: this whole Rayleigh-Ritz eigensolve is parked
+    # (never called in production, ~2.5x slower than the default B_op path).
+    dbg = false
     kdim = max(krylovdim, 2)
 
     n0 = _nrm(phi)
@@ -1305,10 +1309,10 @@ function rayleigh_ritz_local_eigsolve(Hop::Function, phi::ITensors.ITensor,
         # ── generalized residual r = H x - λ M x ──
         r = Hx - lam * Mx
         rnorm = _nrm(r)
-        if dbg
-            println("[RR b=$b ha=$ha sw=$sw] it=$outer_it k=$k lam=$lam rnorm=$rnorm")
-            flush(stdout)
-        end
+        # if dbg
+        #     println("[RR b=$b ha=$ha sw=$sw] it=$outer_it k=$k lam=$lam rnorm=$rnorm")
+        #     flush(stdout)
+        # end
         if rnorm < tol || abs(lam - lam_prev) < tol
             return ([lam], [x])
         end

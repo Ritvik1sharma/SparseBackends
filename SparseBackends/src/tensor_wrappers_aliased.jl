@@ -26,7 +26,7 @@ using LinearAlgebra: norm
 # 1.  Struct + basic traits
 # ─────────────────────────────────────────────────────────────────────────────
 const _ADD_DBG_COUNT1 = Ref(0)
-@inline _add_dbg_enabled1() = get(ENV, "SB_ALIASED_DEBUG", "0") == "1"
+@inline _add_dbg_enabled1() = false  # SB_ALIASED_DEBUG removed 2026-06 — flip to true here for debug output
 @inline _add_dbg_max1()     = parse(Int, get(ENV, "SB_ALIASED_DEBUG_MAX", "12"))
 
 
@@ -86,7 +86,7 @@ function recast_aliased_to_template(Cw::WrappedAliasedBlockSparse{TC,N,N2c,Pc},
             return Cw   # Cross-region permutation not supported here.
         end
     end
-    if get(ENV, "SB_RECAST_DBG", "0") == "1" && _RECAST_DBG_N[] < 6
+    if _RECAST_DBG && _RECAST_DBG_N[] < 6
         _RECAST_DBG_N[] += 1
         _tg(I) = (ITensors.dim(I), string(ITensors.tags(I)), ITensors.plev(I))
         println("[RECAST #", _RECAST_DBG_N[], "] Pc=", Pc, " perm=", perm,
@@ -113,7 +113,8 @@ Base.eltype(::Type{ITensors.ExternalStorage{W}}) where {W<:WrappedAliasedBlockSp
 # Aliased + Aliased adds fire the same-schema fast path (template+template)
 # instead of falling through to cross-schema merge / dense.
 function _snap_to_schema(Hv::WrappedAliasedBlockSparse{T,N,N2,P},
-                          v_schema::WrappedAliasedBlockSparse{T,N,N2,P}) where {T,N,N2,P}
+                          v_schema::WrappedAliasedBlockSparse{T,N,N2,P};
+                          dbg::Bool=false) where {T,N,N2,P}
     @assert Hv.aliased.dims == v_schema.aliased.dims "dims mismatch in _snap_to_schema"
     @assert Hv.aliased.blksize == v_schema.aliased.blksize "blksize mismatch"
     V = v_schema.aliased
@@ -127,9 +128,9 @@ function _snap_to_schema(Hv::WrappedAliasedBlockSparse{T,N,N2,P},
     @inbounds for (i, k) in enumerate(H.keys)
         h_lookup[k] = i
     end
-    # ── ERROR TRACKING (SB_ALIASED_SNAP_DBG=1) ────────────────────────────
+    # ── ERROR TRACKING (pass dbg=true at a call site to enable; was
+    # SB_ALIASED_SNAP_DBG=1) ────────────────────────────────────────────────
     # Track norm of Hv data that's dropped (keys in H but not in V).
-    dbg = get(ENV, "SB_ALIASED_SNAP_DBG", "0") == "1"
     if dbg
         v_keys_set = Set(V.keys)
         total_norm2 = 0.0
@@ -151,7 +152,7 @@ function _snap_to_schema(Hv::WrappedAliasedBlockSparse{T,N,N2,P},
         end
         if total_norm2 > 0
             dropped_frac = 1 - kept_norm2 / total_norm2
-            if _SNAP_DBG_COUNT[] < parse(Int, get(ENV, "SB_ALIASED_SNAP_DBG_MAX", "5"))
+            if _SNAP_DBG_COUNT[] < 5   # was SB_ALIASED_SNAP_DBG_MAX, default 5
                 _SNAP_DBG_COUNT[] += 1
                 println("[SNAP_DBG #$(_SNAP_DBG_COUNT[])] Hv n_blocks=$(length(H.keys))  V n_blocks=$(length(V.keys))  dropped_keys=$dropped_count  dropped_norm_frac=$(round(dropped_frac, sigdigits=4))  total_norm=$(round(sqrt(total_norm2), sigdigits=4))")
             end
@@ -508,9 +509,30 @@ end
 # #1 instrumentation: count how often the both-aliased contraction takes the
 # native kernel vs the dense-materialise fallback. Reset/read from test code via
 # SparseBackends._NATIVE_DOT_HITS[] / ._DENSIFY_DOT_HITS[]. Cheap Ref bumps.
+# Was SB_ALIASED_TRACE — set from the top by dmrg(...; debug=true) (dmrg.jl),
+# NOT an ENV var. Every trace print site below/elsewhere reads this Ref; each
+# site's own fire-count budget (e.g. `< 10`, `< 30`) stays a hardcoded literal,
+# not separately configurable.
+const ALIASED_TRACE = Ref(false)
+# DEBUGGING VAR — was SB_STEP env var. Current matvec-step index, set by
+# abstractprojmpo.jl (SparseBackends.CURRENT_STEP[] = idx) before each operator
+# in the matvec chain; consulted by trace prints below AND by
+# _static_output_pref's (bondtype, step) STATIC_OUTPUT_PERM lookup. NOT an
+# ENV var — a plain runtime Ref maintained across the process.
+const CURRENT_STEP = Ref{Union{Nothing,Int}}(nothing)
+# Was SB_RUN_LABEL env var — now threaded as a real `run_label::String` kwarg
+# from dmrg(...) down through position!/product → makeL!/makeR!/contract,
+# same as `debug`/`roofline`. This Ref is kept ONLY for the one remaining
+# writer in contract_bs_dense.jl's shared BS dense-dense contraction kernel,
+# which is reached via generic dispatch (no argument-carrying call chain from
+# dmrg reaches it) — the same structural reason GEMM_DIMS_HIST/permute-profile
+# needed a Ref instead of threading. Set alongside the threaded argument at
+# each site that has one; not itself a user-facing knob.
+const CURRENT_RUN_LABEL = Ref{String}("?")
 const _NATIVE_DOT_HITS  = Ref(0)
 const _DENSIFY_DOT_HITS = Ref(0)
-const _RECAST_DBG_N     = Ref(0)     # SB_RECAST_DBG: one-shot recast perm dump counter
+const _RECAST_DBG       = false      # flip to true to enable recast perm dumps (was SB_RECAST_DBG)
+const _RECAST_DBG_N     = Ref(0)     # one-shot recast perm dump counter, budgeted to 6
 const _RECAST_PERMUTE_HITS = Ref(0)  # # of actual (non-identity) recast permutedims calls
 const _ALIGN_OK         = Ref(0)     # SB_ALIASED_ALIGN_OUTPUT: native emitted aligned output
 const _ALIGN_FALLBACK   = Ref(0)     # align attempted but kernel couldn't honor it → default order
@@ -521,15 +543,14 @@ reset_dot_hits!() = (_NATIVE_DOT_HITS[] = 0; _DENSIFY_DOT_HITS[] = 0;
                      _DOT_CHECK_MAXABS[] = 0.0; _DOT_CHECK_MAXMAG[] = 0.0;
                      _RECAST_PERMUTE_HITS[] = 0; _ALIGN_OK[] = 0; _ALIGN_FALLBACK[] = 0)
 
-# SB_SCHEMA_DBG: print the aliased P-classification (sparse keys vs dense tail) of
+# schema_dbg: print the aliased P-classification (sparse keys vs dense tail) of
 # a tensor at a labelled point, to trace WHERE the constructed schema (e.g. P=3:
-# site+2 link-channels) collapses (e.g. P=2: channels pushed to dense). Budgeted.
-const _SCHEMA_DBG_BUDGET = Ref(-1)
+# site+2 link-channels) collapses (e.g. P=2: channels pushed to dense). Budgeted
+# to 40 calls. Flip _SCHEMA_DBG to true here to enable (includes key/template detail).
+const _SCHEMA_DBG = false
+const _SCHEMA_DBG_BUDGET = Ref(40)
 function schema_dbg(label, T)
-    get(ENV, "SB_SCHEMA_DBG", "0") == "1" || return nothing
-    if _SCHEMA_DBG_BUDGET[] < 0
-        _SCHEMA_DBG_BUDGET[] = parse(Int, get(ENV, "SB_SCHEMA_DBG_BUDGET", "40"))
-    end
+    _SCHEMA_DBG || return nothing
     _SCHEMA_DBG_BUDGET[] <= 0 && return nothing
     _SCHEMA_DBG_BUDGET[] -= 1
     _fmt(I) = (ITensors.dim(I), string(ITensors.tags(I)), ITensors.plev(I))
@@ -554,18 +575,14 @@ function schema_dbg(label, T)
                 "  prod(sparse_dims)=", psd, " fill=", round(fill, sigdigits=3),
                 "  keyhash=", string(kh % 0x10000, base=16), " scalhash=", string(sh % 0x10000, base=16),
                 "\n           SPARSE=", spk, "  DENSE=", dns)
-        if get(ENV, "SB_SCHEMA_KEYS", "0") == "1"
-            ks = a.keys
-            println("           blksize=", a.blksize, "  KEYS(", length(ks), ") = ",
-                    length(ks) <= 64 ? ks : ks[1:64])
-        end
-        if get(ENV, "SB_SCHEMA_TEMPLATES", "0") == "1"
-            nz = count(!iszero, a.templates); tot = length(a.templates)
-            println("           TEMPLATES: n_tmpl=", a.n_templates, " blksize=", a.blksize,
-                    "  template_nonzeros=", nz, "/", tot, " (", round(100*nz/max(tot,1),digits=1), "% filled)")
-            println("           alias_ids(key→tmpl) = ", length(a.alias_ids) <= 64 ? a.alias_ids : a.alias_ids[1:64])
-            println("           scalars             = ", length(a.scalars) <= 64 ? round.(a.scalars, sigdigits=3) : round.(a.scalars[1:64], sigdigits=3))
-        end
+        ks = a.keys
+        println("           blksize=", a.blksize, "  KEYS(", length(ks), ") = ",
+                length(ks) <= 64 ? ks : ks[1:64])
+        nz = count(!iszero, a.templates); tot = length(a.templates)
+        println("           TEMPLATES: n_tmpl=", a.n_templates, " blksize=", a.blksize,
+                "  template_nonzeros=", nz, "/", tot, " (", round(100*nz/max(tot,1),digits=1), "% filled)")
+        println("           alias_ids(key→tmpl) = ", length(a.alias_ids) <= 64 ? a.alias_ids : a.alias_ids[1:64])
+        println("           scalars             = ", length(a.scalars) <= 64 ? round.(a.scalars, sigdigits=3) : round.(a.scalars[1:64], sigdigits=3))
     else
         cls = T isa ITensors.ITensor ?
             (ITensors.has_external_storage(T) ? string(typeof(ITensors.get_external_storage(T))) : "dense ITensor") :
@@ -580,7 +597,8 @@ end
 # cannot belong to image(φ). Stores φ's sparse-leg ids (id→axis) and its key set.
 const _PHI_IMAGE = Ref{Any}(nothing)
 function capture_phi_image!(phi)
-    get(ENV, "TRACE_IMAGE", "0") == "1" || return nothing
+    # TRACE_IMAGE removed 2026-06 — this debug capture is now a permanent no-op.
+    return nothing
     (phi isa ITensors.ITensor && ITensors.has_external_storage(phi)) || return nothing
     w = ITensors.get_external_storage(phi)
     w isa WrappedAliasedBlockSparse || return nothing
@@ -598,7 +616,8 @@ end
 # project both onto the legs common (by Index id) to φ and report keys whose
 # projection has NO matching φ key (i.e. cannot extend to image(φ)).
 function check_image(label, Hv)
-    get(ENV, "TRACE_IMAGE", "0") == "1" || return nothing
+    # TRACE_IMAGE removed 2026-06 — this debug check is now a permanent no-op.
+    return nothing
     img = _PHI_IMAGE[]
     (img === nothing || !(Hv isa ITensors.ITensor) || !ITensors.has_external_storage(Hv)) && return nothing
     w = ITensors.get_external_storage(Hv)
@@ -814,9 +833,10 @@ function _canon_inds_for_next_A(next_op, indsA, indsB, indsC, denseLinksC::Int)
         # first, both reduction groups LAST) so the next step's permA is still the
         # identity; the kernel realizes this layout via a strided scatter (lmap).
         # Gated to the serial BLAS path (the only one wired for the strided write);
-        # elsewhere fall back to the kernel's permA (return nothing).
-        if get(ENV, "SB_ALIASED_INTERLEAVE", "1") == "1" &&
-           get(ENV, "SB_ALIASED_NTHREADS", "1") == "1"
+        # elsewhere fall back to the kernel's permA (return nothing). Interleaving
+        # itself hardened 2026-06 — always on (was SB_ALIASED_INTERLEAVE,
+        # default-on knob); SB_ALIASED_NTHREADS stays a live, genuine knob.
+        if get(ENV, "SB_ALIASED_NTHREADS", "1") == "1"
             vcat(A_keep, B_keep, A_red, B_red)
         else
             return nothing
@@ -850,7 +870,7 @@ function _canon_by_rank(indsC, denseLinksC::Int, remaining_ops)
     return vcat(pre, den)
 end
 
-# Permute-minimizing output order (SB_OUTSTAT_NRED). Unlike _canon_by_rank (which
+# Permute-minimizing output order (NRED; hardened always-on). Unlike _canon_by_rank (which
 # sorts ALL dense by reduction rank → interleaves A/B origins → forces the 9.6 GiB
 # output permute), this PRESERVES the [keepA; keepB] dense grouping (⇒ mode AthenB,
 # out_dense_perm = identity) and sorts ONLY:
@@ -894,28 +914,16 @@ const STATIC_OUTPUT_PERM = Dict{Tuple{Symbol,Int}, Vector{Int}}(
     (:right, 2) => [1, 2, 3, 5, 4],
     (:right, 3) => [1, 2, 3, 4],
 )
-# Look up the static output permutation for the current (bond-type, step) and apply
-# it to `indsC`. The (bond-type, step) coordinate lives in ENV but is only valid
-# DURING the matvec chain (`product(PH,v)`), which brackets the loop with
-# SB_IN_MATVEC=1/0. Non-matvec aliased contractions (orthogonalize!, environment
-# builds, recasts) reach this same kernel and would otherwise read the *stale*
-# coordinate the last matvec left behind and apply the wrong perm — so we bail
-# unless we're genuinely inside the matvec. Returns the reordered Vector{Index},
-# or nothing (→ default order) when the table has no entry for this step.
-function _static_output_pref(indsC)
-    get(ENV, "SB_IN_MATVEC", "0") == "1" || return nothing
+# Stateless lookup of the static output permutation for a given (bond-type,
+# step) — was _static_output_pref, gated on SB_IN_MATVEC (an ENV bracket set
+# around the matvec loop, since this used to read the coordinate from ENV and
+# had no other way to know whether it was stale). Now the matvec loop (the
+# only caller with a real answer, in abstractprojmpo.jl) passes bondtype/step
+# directly and threads the *result* down as `output_perm`; no other caller
+# can reach this by accident, so no gate is needed at all.
+function static_output_perm(bondtype::Symbol, step::Int)::Union{Nothing,Vector{Int}}
     isempty(STATIC_OUTPUT_PERM) && return nothing
-    bt = Symbol(get(ENV, "SB_BONDTYPE", ""))
-    st = tryparse(Int, get(ENV, "SB_STEP", ""))
-    st === nothing && return nothing
-    perm = get(STATIC_OUTPUT_PERM, (bt, st), nothing)
-    perm === nothing && return nothing
-    # Defensive: a step's output leg-count is structurally fixed across sweeps, so a
-    # matching table entry always matches in length. Guard anyway → default order.
-    if length(perm) != length(indsC)
-        return nothing
-    end
-    return ITensors.Index[indsC[p] for p in perm]
+    return get(STATIC_OUTPUT_PERM, (bondtype, step), nothing)
 end
 
 # Reorder an aliased φ so the legs it shares with `op` sit LAST within its sparse
@@ -970,7 +978,7 @@ function reorder_aliased_by_rank(phi::ITensors.ITensor, ops)
     den = sort(ph[Pc+1:Nc];  by=rkey, alg=Base.Sort.MergeSort)
     target = vcat(pre, den)
     perm = Int[findfirst(==(target[i]), ph) for i in 1:Nc]
-    if get(ENV, "SB_PERM_CAPTURE", "0") == "1"
+    if _roofline_on()   # was SB_PERM_CAPTURE; folded into the roofline switch
         println("[PERMCAP-PHI] bondtype=", get(ENV, "SB_BONDTYPE", "?"),
                 " ndims=", Nc, " Pc=", Pc, " perm=", perm)
     end
@@ -988,6 +996,8 @@ function wrapped_contract_aliased(
     output_inds_hint::Union{Nothing,AbstractSet}=nothing,
     next_op=nothing,
     remaining_ops=nothing,
+    output_perm::Union{Nothing,Vector{Int}}=nothing,
+    in_position::Bool=false,
 ) where {TA,TB,NA,NB}
     @timeit TIMER "get_data_info" begin
         Arep   = rep(A)
@@ -1008,7 +1018,7 @@ function wrapped_contract_aliased(
         TC     = promote_type(eltype(Arep), eltype(Brep))
     end
 
-    if get(ENV, "SB_IDX_DBG", "0") == "1"
+    if false  # SB_IDX_DBG removed 2026-06 — flip to true here for debug output
         _dA = Set(denseA); _dB = Set(denseB); _dC = Set(denseC)
         # tag each index: S=sparse-prefix, D=dense-tail (per its own operand)
         _tg(I, dset) = string(I in dset ? "D:" : "S:", ITensors.dim(I), "|",
@@ -1017,7 +1027,7 @@ function wrapped_contract_aliased(
         _red   = [I for I in indsA if I in _sB && !(I in _sC)]
         _keepA = [I for I in indsA if I in _sC]
         _keepB = [I for I in indsB if I in _sC && !(I in _sA)]
-        println("\n[IDX bond=", get(ENV,"SB_BONDTYPE","?"), " step=", get(ENV,"SB_STEP","?"),
+        println("\n[IDX bond=", get(ENV,"SB_BONDTYPE","?"), " step=", CURRENT_STEP[],
                 "]  (S=sparse-prefix, D=dense-tail)",
                 "\n   A     =", [_tg(I,_dA) for I in indsA],
                 "\n   B     =", [_tg(I,_dB) for I in indsB],
@@ -1124,7 +1134,7 @@ function wrapped_contract_aliased(
                     end
                     canon_inds = ITensors.Index[label_to_ind[l] for l in canon_labels]
                     canon_dims = ntuple(i -> ITensors.dim(canon_inds[i]), length(canon_inds))
-                    if get(ENV, "DEBUG_HINT", "0") == "1"
+                    if false  # DEBUG_HINT removed 2026-06 — flip to true here for debug output
                         println(" HINT (kernel) canon output order: ", canon_inds)
                     end
                 end
@@ -1148,7 +1158,7 @@ function wrapped_contract_aliased(
                 end
 
                 @timeit TIMER "contract_aliased_dense_to_dense" begin
-                    contract_aliased_dense_to_dense!(C_canon, canon_labels, Arep_a, labelsA_a, Brep_a, labelsB_a)
+                    contract_aliased_dense_to_dense!(C_canon, canon_labels, Arep_a, labelsA_a, Brep_a, labelsB_a; in_position=in_position)
                 end
 
                 @timeit TIMER "wrap_output" begin
@@ -1176,22 +1186,26 @@ function wrapped_contract_aliased(
                 # dicts-of-positions, wrapper, or densify of the md-sized operands.
                 # Gated by SB_ALIASED_NATIVE_DOT; falls back to dense materialisation
                 # for partial reductions / non-aligned labels / gate off.
-                if get(ENV, "SB_ALIASED_NATIVE_DOT", "0") == "1" && length(indsC) == 0
-                    s = _aliased_lean_scalar_dot(Arep, labelsA_vec, Brep, labelsB_vec)
-                    if s !== nothing
-                        _NATIVE_DOT_HITS[] += 1
-                        sc = convert(TC, s)
-                        if get(ENV, "SB_ALIASED_DOT_CHECK", "0") == "1"
-                            refC = ITensors.contract(ITensors.ITensor(to_dense(Arep), indsA...),
-                                                    ITensors.ITensor(to_dense(Brep), indsB...))
-                            aerr = abs(sc - refC[])
-                            if aerr > _DOT_CHECK_MAXABS[]
-                                _DOT_CHECK_MAXABS[] = aerr; _DOT_CHECK_MAXMAG[] = abs(refC[])
-                            end
-                        end
-                        return ITensors.ITensor(sc)
-                    end
-                end
+                # Retired 2026-06 — SB_ALIASED_NATIVE_DOT/SB_ALIASED_DOT_CHECK,
+                # both default OFF, never exercised. Native scalar-dot fast path
+                # (_aliased_lean_scalar_dot call) commented out below; densify
+                # fallback right after this block is the live path.
+                # if get(ENV, "SB_ALIASED_NATIVE_DOT", "0") == "1" && length(indsC) == 0
+                #     s = _aliased_lean_scalar_dot(Arep, labelsA_vec, Brep, labelsB_vec)
+                #     if s !== nothing
+                #         _NATIVE_DOT_HITS[] += 1
+                #         sc = convert(TC, s)
+                #         if get(ENV, "SB_ALIASED_DOT_CHECK", "0") == "1"
+                #             refC = ITensors.contract(ITensors.ITensor(to_dense(Arep), indsA...),
+                #                                     ITensors.ITensor(to_dense(Brep), indsB...))
+                #             aerr = abs(sc - refC[])
+                #             if aerr > _DOT_CHECK_MAXABS[]
+                #                 _DOT_CHECK_MAXABS[] = aerr; _DOT_CHECK_MAXMAG[] = abs(refC[])
+                #             end
+                #         end
+                #         return ITensors.ITensor(sc)
+                #     end
+                # end
                 _DENSIFY_DOT_HITS[] += 1
                 tmpA = ITensors.ITensor(to_dense(Arep), indsA...)
                 tmpB = ITensors.ITensor(to_dense(Brep), indsB...)
@@ -1202,9 +1216,9 @@ function wrapped_contract_aliased(
             if Arep_bs isa NewBlockSparseSorted && Brep_bs isa NewBlockSparseSorted
                 contract_bs_bs_to_dense!(C_data, labelsC_vec, Arep_bs, labelsA_vec, Brep_bs, labelsB_vec)
             elseif Arep_bs isa NewBlockSparseSorted && Brep_bs isa AbstractArray
-                contract_bs_dense_to_dense!(C_data, labelsC_vec, Arep_bs, labelsA_vec, Brep_bs, labelsB_vec)
+                contract_bs_dense_to_dense!(C_data, labelsC_vec, Arep_bs, labelsA_vec, Brep_bs, labelsB_vec; in_position=in_position)
             elseif Arep_bs isa AbstractArray && Brep_bs isa NewBlockSparseSorted
-                contract_bs_dense_to_dense!(C_data, labelsC_vec, Brep_bs, labelsB_vec, Arep_bs, labelsA_vec)
+                contract_bs_dense_to_dense!(C_data, labelsC_vec, Brep_bs, labelsB_vec, Arep_bs, labelsA_vec; in_position=in_position)
             else
                 C_bs = NewBlockSparseSorted{TC, length(indsC), length(indsC)}(dimsC)
                 contract!(C_bs, labelsC_vec, Arep_bs, labelsA_vec, Brep_bs, labelsB_vec)
@@ -1242,7 +1256,7 @@ function wrapped_contract_aliased(
     end
 
     @timeit TIMER "contract_aliased" begin
-        if get(ENV, "SB_ALIASED_TRACE", "0") == "1"
+        if ALIASED_TRACE[]
             A_class = if Arep isa AliasedBlockSparse
                 "Aliased{N=$(ndims(Arep)),P=$(length(Arep.dims)-prod(size(Arep))÷Arep.blksize == 0 ? 0 : 0)}"
             else
@@ -1278,23 +1292,28 @@ function wrapped_contract_aliased(
         # this measures whether the relayout is reducible or just moves. recast_to_phi
         # realigns the final output to φ ⇒ correctness preserved regardless.
         _os_natural = get(ENV, "SB_OUTSTAT_NATURAL", "0") == "1"
-        # SB_OUTSTAT_NRED=1 (Phase 1+2): request the permute-minimizing order — sparse
-        # prefix + keepB sorted reduced-next-last, keepA grouping preserved. keepB order
-        # is realized by the cheap permB (out_dense_perm stays identity); next permA is
-        # identity except the terminal carried-keepA residual.
-        if _pref_align === nothing && get(ENV, "SB_OUTSTAT_NRED", "0") == "1" && next_op !== nothing
+        # NRED permute-minimizing output order (HARDENED 2026-07, was the SB_OUTSTAT_NRED
+        # env gate — now unconditional whenever a next_op is available): sparse prefix +
+        # keepB sorted reduced-next-last, keepA grouping preserved. keepB order is realized
+        # by the cheap permB (out_dense_perm stays identity); next permA is identity except
+        # the terminal carried-keepA residual. Only fires for aliased contractions (this is
+        # the aliased kernel); bit-identical E, ~2.2x faster matvec vs the old _canon_by_rank
+        # order (kills the reduction-stationary scatter/accum path). See memory
+        # project_nred_output_ordering.
+        if _pref_align === nothing && next_op !== nothing
             _pref_align = _canon_keepB_red(indsA, indsC, denseLinksC, next_op)
         end
-        if _pref_align === nothing && !_os_natural
-            _pref_align = _static_output_pref(indsC)
+        if _pref_align === nothing && !_os_natural && output_perm !== nothing &&
+           length(output_perm) == length(indsC)
+            _pref_align = indsC[output_perm]
         end
         if _pref_align === nothing && !_os_natural && remaining_ops !== nothing
             _pref_align = _canon_by_rank(indsC, denseLinksC, remaining_ops)
-            if get(ENV, "SB_PERM_CAPTURE", "0") == "1"
+            if _roofline_on()   # was SB_PERM_CAPTURE; folded into the roofline switch
                 _ic = collect(indsC)
                 _perm = Int[findfirst(==(_pref_align[i]), _ic) for i in 1:length(_ic)]
                 println("[PERMCAP] bondtype=", get(ENV, "SB_BONDTYPE", "?"),
-                        " step=", get(ENV, "SB_STEP", "?"),
+                        " step=", CURRENT_STEP[],
                         " ndims=", length(_ic), " Pc=", length(_ic) - denseLinksC,
                         " perm=", _perm)
             end
@@ -1313,7 +1332,7 @@ function wrapped_contract_aliased(
                     return Cc
                 catch e
                     _ALIGN_FALLBACK[] += 1   # kernel couldn't honor order; default below
-                    if get(ENV, "SB_ALIASED_ALIGN_DBG", "0") == "1" && _ALIGN_DBG_N[] < 4
+                    if false && _ALIGN_DBG_N[] < 4  # SB_ALIASED_ALIGN_DBG removed 2026-06 — flip to true here for debug output
                         _ALIGN_DBG_N[] += 1
                         _tg(I) = (ITensors.dim(I), string(ITensors.tags(I)), ITensors.plev(I))
                         println("[ALIGN FALLBACK #", _ALIGN_DBG_N[], "] Pc=", length(indsC)-denseLinksC,
@@ -1349,10 +1368,13 @@ function contract(A::WrappedAliasedBlockSparse, B::WrappedTensorTypes;
                   output_inds_hint::Union{Nothing,AbstractSet}=nothing,
                   next_op=nothing,
                   remaining_ops=nothing,
+                  output_perm::Union{Nothing,Vector{Int}}=nothing,
+                  in_position::Bool=false,
                   kwargs...)
     return wrapped_contract_aliased(A, B; preserve_bs_output, preferred_output_labels,
                                     output_inds_hint=output_inds_hint, next_op=next_op,
-                                    remaining_ops=remaining_ops)
+                                    remaining_ops=remaining_ops, output_perm=output_perm,
+                                    in_position=in_position)
 end
 
 function contract(A::WrappedTensorTypes, B::WrappedAliasedBlockSparse;
@@ -1361,10 +1383,13 @@ function contract(A::WrappedTensorTypes, B::WrappedAliasedBlockSparse;
                   output_inds_hint::Union{Nothing,AbstractSet}=nothing,
                   next_op=nothing,
                   remaining_ops=nothing,
+                  output_perm::Union{Nothing,Vector{Int}}=nothing,
+                  in_position::Bool=false,
                   kwargs...)
     return wrapped_contract_aliased(A, B; preserve_bs_output, preferred_output_labels,
                                     output_inds_hint=output_inds_hint, next_op=next_op,
-                                    remaining_ops=remaining_ops)
+                                    remaining_ops=remaining_ops, output_perm=output_perm,
+                                    in_position=in_position)
 end
 
 function contract(A::WrappedAliasedBlockSparse, B::WrappedAliasedBlockSparse;
@@ -1373,10 +1398,13 @@ function contract(A::WrappedAliasedBlockSparse, B::WrappedAliasedBlockSparse;
                   output_inds_hint::Union{Nothing,AbstractSet}=nothing,
                   next_op=nothing,
                   remaining_ops=nothing,
+                  output_perm::Union{Nothing,Vector{Int}}=nothing,
+                  in_position::Bool=false,
                   kwargs...)
     return wrapped_contract_aliased(A, B; preserve_bs_output, preferred_output_labels,
                                     output_inds_hint=output_inds_hint, next_op=next_op,
-                                    remaining_ops=remaining_ops)
+                                    remaining_ops=remaining_ops, output_perm=output_perm,
+                                    in_position=in_position)
 end
 
 """
@@ -1515,18 +1543,47 @@ function ITensors.dag(es::ITensors.ExternalStorage{<:WrappedAliasedBlockSparse};
     return ITensors._itensor_from_external_storage(newdata)
 end
 
-LinearAlgebra.norm(w::WrappedAliasedBlockSparse) = begin
-    # norm = sqrt(sum_i scalars[i]^2 * ||template[alias_ids[i]]||^2)
-    s = zero(real(eltype(w.aliased.templates)))
-    A = w.aliased
-    for i in eachindex(A.keys)
-        α    = A.scalars[i]
-        toff = (A.alias_ids[i] - 1) * A.blksize
-        @inbounds for j in 1:A.blksize
-            s += abs2(α * A.templates[toff + j])
+# norm = sqrt(sum_i scalars[i]^2 * ||template[alias_ids[i]]||^2)
+# FUNCTION BARRIER (2026-07-05): the loop MUST run in a function dispatched on the
+# CONCRETE AliasedBlockSparse type. The wrapper WrappedAliasedBlockSparse{T,N,N2,P}
+# drops the key/alias-id type params {K,AI}, so `w.aliased` is only partially
+# inferred → `alias_ids[i]` is an abstract Integer → `toff = (alias_ids[i]-1)*blksize`
+# is abstractly typed → every `toff + j` in the inner loop BOXES. Measured: the
+# inlined version allocated 8.76 GiB / 9.44 s across a 3-sweep N=12 md40 run. Passing
+# `w.aliased` through this barrier makes the loop concrete + allocation-free (mirrors
+# the _alias_inner fastpath; see project_inplace_add_redherring for the same class of bug).
+@inline function _alias_norm(A::AliasedBlockSparse{T}) where {T}
+    s = zero(real(T))
+    tpl = A.templates; sc = A.scalars; aid = A.alias_ids; bs = A.blksize
+    @inbounds for i in eachindex(A.keys)
+        α    = sc[i]
+        toff = (Int(aid[i]) - 1) * bs
+        @simd for j in 1:bs
+            s += abs2(α * tpl[toff + j])
         end
     end
     return sqrt(s)
+end
+LinearAlgebra.norm(w::WrappedAliasedBlockSparse) = @timeit TIMER "vecop.norm" _alias_norm(w.aliased)
+
+# Recycle a DEAD aliased ITensor's template buffer back into the `pending` pool
+# (:aliased_ws_pending, keyed by element type — same slot the aliased×dense kernel
+# pops for its output) so the next contract reuses its capacity instead of growing a
+# fresh result-sized buffer from empty. Used ONLY for consumed matvec intermediates
+# in the dense-H aliased-ψ chain (caller guards `_Hv_prev !== v` so the input Krylov
+# vector, owned by KrylovKit, is never recycled). Numerics unchanged: the next
+# contract resize!s + overwrites (β=0) this buffer exactly as it would a fresh one.
+# SAFETY: caller must guarantee `w` is dead (no live refs); the kernel's zero-copy
+# finalize hands each output a DISTINCT buffer, so a consumed operand's buffer never
+# aliases the live result.
+function recycle_aliased_pending!(w::ITensors.ITensor)
+    ITensors.has_external_storage(w) || return nothing
+    ext = ITensors.get_external_storage(w)
+    ext isa WrappedAliasedBlockSparse || return nothing
+    buf = ext.aliased.templates
+    isempty(buf) && return nothing
+    task_local_storage((:aliased_ws_pending, eltype(buf)), buf)
+    return nothing
 end
 
 function _apply_elementwise!(
@@ -1553,6 +1610,7 @@ end
 
 # ── Scalar multiply (preserves schema exactly by scaling `scalars`) ─────────
 function Base.:*(α::Number, w::WrappedAliasedBlockSparse{T,N,N2,P}) where {T,N,N2,P}
+  @timeit TIMER "vecop.scale" begin
     A = w.aliased
     new_scalars = T(α) .* A.scalars
     Kt = eltype(eltype(A.keys))
@@ -1562,6 +1620,7 @@ function Base.:*(α::Number, w::WrappedAliasedBlockSparse{T,N,N2,P}) where {T,N,
         copy(A.keys), copy(A.alias_ids), new_scalars,
     )
     return WrappedAliasedBlockSparse{T,N,N2,P}(new_ali, w.inds)
+  end
 end
 Base.:*(w::WrappedAliasedBlockSparse, α::Number) = α * w
 
@@ -1590,6 +1649,48 @@ end
 # In that case C[i] = scalars[i] * (templates_A[a[i]] + templates_B[a[i]]), so
 # the sum's schema is the same and templates_C = templates_A + templates_B.
 # Otherwise we can't stay aliased — error per user policy.
+# FUNCTION BARRIER for the Base.:+ / Base.:- MERGE tiers (2026-07-05 audit, same
+# boxing class as norm/inner/axpby): those methods dispatch on the wrapper
+# {T,N,N2,P} which drops {K,AI}, so `wA.aliased` is UnionAll-abstract and the inline
+# merge loop's `toff = (alias_ids[i]-1)*blksize` boxes every element. This kernel
+# takes the concrete field Vectors so the loop specializes (allocation-free).
+# sgnB = +1 for `+`, -1 for `-`. Cold in dense-H aliased-ψ (all Krylov adds go
+# through the in-place axpby barrier), but hot in both-aliased runs where
+# cross-schema merges dominate (see project_aliased_lanczos_cross_schema_merge).
+# ⚠ TODO: mechanical extraction of the former inline Base.:+/:- merge loops
+# (equivalent by construction; compiles + dense-H bit-identical). NOT yet exercised
+# end-to-end — the merge tier is cold in dense-H, and the both-aliased run that
+# hits it dies first on a pre-existing UInt8 alias-id overflow. Validate in the
+# separate aliased-H / aliased-ψ runs.
+@inline function _merge_add!(new_templates::Vector{T}, all_keys::AbstractVector,
+        a_lookup, b_lookup,
+        tA::Vector{T}, aidA::AbstractVector, sA::Vector{T},
+        tB::Vector{T}, aidB::AbstractVector, sB::Vector{T},
+        bs::Int, sgnB::T) where {T}
+    @inbounds for (idx, k) in enumerate(all_keys)
+        off = (idx - 1) * bs
+        i_a = get(a_lookup, k, 0)
+        i_b = get(b_lookup, k, 0)
+        if i_a > 0
+            αa = sA[i_a]; ta = (Int(aidA[i_a]) - 1) * bs
+            @simd for j in 1:bs
+                new_templates[off + j] = αa * tA[ta + j]
+            end
+        else
+            @simd for j in 1:bs
+                new_templates[off + j] = zero(T)
+            end
+        end
+        if i_b > 0
+            αb = sB[i_b]; tb = (Int(aidB[i_b]) - 1) * bs
+            @simd for j in 1:bs
+                new_templates[off + j] += sgnB * αb * tB[tb + j]
+            end
+        end
+    end
+    return nothing
+end
+
 function Base.:+(wA::WrappedAliasedBlockSparse{T,N,N2,P},
                  wB::WrappedAliasedBlockSparse{T,N,N2,P}) where {T,N,N2,P}
     # Align B's axis order to A's via Index identity (handles cases where the
@@ -1636,12 +1737,12 @@ function Base.:+(wA::WrappedAliasedBlockSparse{T,N,N2,P},
     # Merge via key union with one template per resulting block (trivial dedup,
     # no template-level compression but storage stays aliased so the result
     # can keep flowing through aliased kernels).
-    if get(ENV, "SB_ALIASED_TRACE", "0") == "1" && _CROSS_SCHEMA_TRACE_COUNT[] < 10
+    if ALIASED_TRACE[] && _CROSS_SCHEMA_TRACE_COUNT[] < 10
         _CROSS_SCHEMA_TRACE_COUNT[] += 1
         println("[DEEP cross-schema merge #$(_CROSS_SCHEMA_TRACE_COUNT[])]  A=Aliased{N=$(ndims(A)),nb=$(length(A.keys)),nt=$(A.n_templates)}  B=Aliased{nb=$(length(B.keys)),nt=$(B.n_templates)}")
     end
     A.dims != B.dims && return _add_aliased_via_dense(wA, wB)
-    if get(ENV, "SB_ADD_STACK", "0") == "1" && _ADD_PLUS_MERGE[] < 2
+    if false && _ADD_PLUS_MERGE[] < 2  # SB_ADD_STACK removed 2026-06 — flip to true here for debug output
         println("\n[ADD_STACK] Base.:+ aliased merge caller stack:")
         for fr in stacktrace()[1:min(end,22)]; println("    ", fr); end
         flush(stdout)
@@ -1664,29 +1765,9 @@ function Base.:+(wA::WrappedAliasedBlockSparse{T,N,N2,P},
     # width through the merge.
     new_alias_ids = _alias_id_range(promote_type(eltype(A.alias_ids), eltype(B.alias_ids)), nb)
     new_scalars   = ones(T, nb)
-    @inbounds for (idx, k) in enumerate(all_keys)
-        off = (idx - 1) * blksize
-        i_a = get(a_lookup, k, 0)
-        i_b = get(b_lookup, k, 0)
-        if i_a > 0
-            αa = A.scalars[i_a]
-            ta = (A.alias_ids[i_a] - 1) * A.blksize
-            for j in 1:blksize
-                new_templates[off + j] = αa * A.templates[ta + j]
-            end
-        else
-            for j in 1:blksize
-                new_templates[off + j] = zero(T)
-            end
-        end
-        if i_b > 0
-            αb = B.scalars[i_b]
-            tb = (B.alias_ids[i_b] - 1) * B.blksize
-            for j in 1:blksize
-                new_templates[off + j] += αb * B.templates[tb + j]
-            end
-        end
-    end
+    _merge_add!(new_templates, all_keys, a_lookup, b_lookup,
+        A.templates, A.alias_ids, A.scalars, B.templates, B.alias_ids, B.scalars,
+        blksize, one(T))
     new_ali = AliasedBlockSparse{T,N,N2,P,Kt}(
         A.dims, blksize,
         new_templates, nb,
@@ -1699,17 +1780,19 @@ end
 const _CROSS_SCHEMA_TRACE_COUNT = Ref(0)
 const _ADD_DENSE_TRACE_COUNT = Ref(0)
 
-# ── Add-operand dump (gated SB_ADD_OPERAND_DUMP=1) ────────────────────────────
+# ── Add-operand dump (was gated SB_ADD_OPERAND_DUMP=1, flip _ADD_OPERAND_DUMP
+# below to true to re-enable) ─────────────────────────────────────────────────
 # Dumps the schema (key → alias_id [scalar], + template value-hash) of BOTH
 # operands of an aliased Base.:+ — i.e. the actual vectors the Lanczos eigsolve
 # is adding (the M^{±1/2}-dressed Krylov vectors). Then classifies why they did
 # (or didn't) match: same key-SET? same key-ORDER? same key→template-VALUE map?
 # This is the decisive datum for "can the add keep dedup". Latched to the first
-# SB_ADD_OPERAND_DUMP_MAX (default 4) calls.
+# 4 calls (was SB_ADD_OPERAND_DUMP_MAX, default 4).
+const _ADD_OPERAND_DUMP = false
 const _ADD_OPERAND_DUMP_COUNT = Ref(0)
 function _dump_add_operands(tier::String, A, B; max_blocks::Int=24)
-    get(ENV, "SB_ADD_OPERAND_DUMP", "0") == "1" || return
-    _ADD_OPERAND_DUMP_COUNT[] < parse(Int, get(ENV, "SB_ADD_OPERAND_DUMP_MAX", "4")) || return
+    _ADD_OPERAND_DUMP || return
+    _ADD_OPERAND_DUMP_COUNT[] < 4 || return
     _ADD_OPERAND_DUMP_COUNT[] += 1
     n = _ADD_OPERAND_DUMP_COUNT[]
     _vh(X, tid) = (off = (tid - 1) * X.blksize; string(hash(@view X.templates[(off+1):(off+X.blksize)]), base=16)[1:6])
@@ -1787,7 +1870,7 @@ function _alias_inplace_axpby!(aw::WrappedAliasedBlockSparse{T},
                                α::Number, β::Number) where {T}
     A = aw.aliased; B = bw.aliased
     nb = length(A.keys)
-    _dbg = get(ENV, "SB_INPLACE_DBG", "0") == "1" && _ADD_INPLACE_FAIL[] < 3
+    _dbg = false && _ADD_INPLACE_FAIL[] < 3  # SB_INPLACE_DBG removed 2026-06 — flip to true here for debug output
     if !(A.dims == B.dims && A.blksize == B.blksize && length(B.keys) == nb)
         _dbg && println("[INPLACE_FAIL] dims/blksize/nb: A.dims=$(A.dims) B.dims=$(B.dims) A.bs=$(A.blksize) B.bs=$(B.blksize) nbA=$nb nbB=$(length(B.keys))")
         return false
@@ -1877,7 +1960,7 @@ end
 function _add_aliased_via_dense(wA::WrappedAliasedBlockSparse,
                                  wB::WrappedAliasedBlockSparse)
     _ADD_PLUS_DENSE[] += 1
-    if get(ENV, "SB_ALIASED_TRACE", "0") == "1" && _ADD_DENSE_TRACE_COUNT[] < 10
+    if ALIASED_TRACE[] && _ADD_DENSE_TRACE_COUNT[] < 10
         _ADD_DENSE_TRACE_COUNT[] += 1
         println("[DEEP _add_aliased_via_dense #$(_ADD_DENSE_TRACE_COUNT[])]  A=$(typeof(wA.aliased))  B=$(typeof(wB.aliased))  A.dims=$(wA.aliased.dims)  B.dims=$(wB.aliased.dims)  → DENSE")
     end
@@ -1936,7 +2019,7 @@ function Base.:-(wA::WrappedAliasedBlockSparse{T,N,N2,P},
         return WrappedAliasedBlockSparse{T,N,N2,P}(new_ali, wA.inds)
     end
     # Same dims, mismatched schema → key-union merge (one template per block).
-    if get(ENV, "SB_ALIASED_TRACE", "0") == "1" && _CROSS_SCHEMA_TRACE_COUNT[] < 10
+    if ALIASED_TRACE[] && _CROSS_SCHEMA_TRACE_COUNT[] < 10
         _CROSS_SCHEMA_TRACE_COUNT[] += 1
         println("[DEEP cross-schema merge (sub) #$(_CROSS_SCHEMA_TRACE_COUNT[])]  A=Aliased{N=$(ndims(A)),nb=$(length(A.keys)),nt=$(A.n_templates)}  B=Aliased{nb=$(length(B.keys)),nt=$(B.n_templates)}")
     end
@@ -1957,29 +2040,9 @@ function Base.:-(wA::WrappedAliasedBlockSparse{T,N,N2,P},
     # width through the merge.
     new_alias_ids = _alias_id_range(promote_type(eltype(A.alias_ids), eltype(B.alias_ids)), nb)
     new_scalars   = ones(T, nb)
-    @inbounds for (idx, k) in enumerate(all_keys)
-        off = (idx - 1) * blksize
-        i_a = get(a_lookup, k, 0)
-        i_b = get(b_lookup, k, 0)
-        if i_a > 0
-            αa = A.scalars[i_a]
-            ta = (A.alias_ids[i_a] - 1) * A.blksize
-            for j in 1:blksize
-                new_templates[off + j] = αa * A.templates[ta + j]
-            end
-        else
-            for j in 1:blksize
-                new_templates[off + j] = zero(T)
-            end
-        end
-        if i_b > 0
-            αb = B.scalars[i_b]
-            tb = (B.alias_ids[i_b] - 1) * B.blksize
-            for j in 1:blksize
-                new_templates[off + j] -= αb * B.templates[tb + j]
-            end
-        end
-    end
+    _merge_add!(new_templates, all_keys, a_lookup, b_lookup,
+        A.templates, A.alias_ids, A.scalars, B.templates, B.alias_ids, B.scalars,
+        blksize, -one(T))
     new_ali = AliasedBlockSparse{T,N,N2,P,Kt}(
         A.dims, blksize,
         new_templates, nb,
@@ -1992,7 +2055,7 @@ end
 function _subtract_aliased_via_dense(wA::WrappedAliasedBlockSparse,
                                      wB::WrappedAliasedBlockSparse)
     _ADD_PLUS_DENSE[] += 1
-    if get(ENV, "SB_ALIASED_TRACE", "0") == "1" && _ADD_DENSE_TRACE_COUNT[] < 10
+    if ALIASED_TRACE[] && _ADD_DENSE_TRACE_COUNT[] < 10
         _ADD_DENSE_TRACE_COUNT[] += 1
         println("[DEEP _subtract_aliased_via_dense #$(_ADD_DENSE_TRACE_COUNT[])]  A=$(typeof(wA.aliased))  B=$(typeof(wB.aliased))  → DENSE")
     end
@@ -2034,7 +2097,7 @@ function ITensors._add(
     es_A::ITensors.NDTensors.Tensor,
     es_B::ITensors.ExternalStorage{<:WrappedAliasedBlockSparse},
 )
-    if get(ENV, "SB_ALIASED_TRACE", "0") == "1"
+    if ALIASED_TRACE[]
         println("[DEEP _add(Dense, Aliased)] DENSIFY — Dense+Aliased mixed")
     end
     B_dense_T = _aliased_to_dense_itensor(es_B)
@@ -2046,7 +2109,7 @@ function ITensors._add(
     es_A::ITensors.ExternalStorage{<:WrappedAliasedBlockSparse},
     es_B::ITensors.NDTensors.Tensor,
 )
-    if get(ENV, "SB_ALIASED_TRACE", "0") == "1"
+    if ALIASED_TRACE[]
         println("[DEEP _add(Aliased, Dense)] DENSIFY — Aliased+Dense mixed")
     end
     A_dense_T = _aliased_to_dense_itensor(es_A)
@@ -2071,7 +2134,7 @@ function ITensors._subtract(
     es_A::ITensors.NDTensors.Tensor,
     es_B::ITensors.ExternalStorage{<:WrappedAliasedBlockSparse},
 )
-    if get(ENV, "SB_ALIASED_TRACE", "0") == "1"
+    if ALIASED_TRACE[]
         println("[DEEP _subtract(Dense, Aliased)] DENSIFY — Dense-Aliased mixed")
     end
     B_dense_T = _aliased_to_dense_itensor(es_B)
@@ -2083,7 +2146,7 @@ function ITensors._subtract(
     es_A::ITensors.ExternalStorage{<:WrappedAliasedBlockSparse},
     es_B::ITensors.NDTensors.Tensor,
 )
-    if get(ENV, "SB_ALIASED_TRACE", "0") == "1"
+    if ALIASED_TRACE[]
         println("[DEEP _subtract(Aliased, Dense)] DENSIFY — Aliased-Dense mixed")
     end
     A_dense_T = _aliased_to_dense_itensor(es_A)

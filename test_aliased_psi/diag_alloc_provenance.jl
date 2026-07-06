@@ -11,8 +11,9 @@
 #   cd /home/ritvik/temp/temp/edited_packages
 #   taskset -c 0,2,4,6,8,10 env OPENBLAS_NUM_THREADS=6 OMP_NUM_THREADS=6 \
 #     SB_ALIASED_PERCM_CAP=0 SB_USE_QR=1 SB_BALANCED_OWNERSHIP=1 SB_ADAPTIVE_RANK=1 \
-#     SB_ALIASED_NATIVE_FISSION=1 BMF_BOP_PROJECT=1 BMF_MINV_RTOL=1e-2 \
-#     VN=12 VMD=40 julia --project=. --threads=1 test_aliased_psi/diag_alloc_provenance.jl
+#     BMF_BOP_PROJECT=1 BMF_MINV_RTOL=1e-2 \
+#     julia --project=. --threads=1 test_aliased_psi/diag_alloc_provenance.jl
+#   (N/MD below are hardcoded consts now, not VN/VMD env vars — edit directly to change)
 
 using SparseBackends, ITensors, ITensorMPS
 using LinearAlgebra, Random, Printf
@@ -41,9 +42,9 @@ function build_setup(N::Int, psign::Int, spin::Int)
     return H, psi
 end
 
-const N  = parse(Int, get(ENV, "VN", "12"))
-const MD = parse(Int, get(ENV, "VMD", "40"))
-const SR = parse(Float64, get(ENV, "ALLOC_SAMPLE_RATE", "0.01"))
+const N  = 12
+const MD = 40
+const SR = 0.01   # was ALLOC_SAMPLE_RATE env var; edit directly to change
 
 println("=== ALLOC PROVENANCE  N=$N md=$MD  sample_rate=$SR  BLAS=", BLAS.get_num_threads(), " ===")
 H, psi = build_setup(N, -1, 3)

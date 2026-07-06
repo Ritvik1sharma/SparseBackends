@@ -95,7 +95,7 @@ end
             # Same template → just add scalars (stays aliased)
             key_to_alias[ckey] = (tid_prev, α_prev + scalar)
         else
-            if get(ENV, "SB_TRACE", "0") == "1"
+            if false  # SB_TRACE — flip to true here for debug output
               println("[SB_TRACE]   _aliased_contribute! demotion @ ckey=", ckey,
                       "  prev_tid=", tid_prev, "  new_tid=", combined_tid)
             end

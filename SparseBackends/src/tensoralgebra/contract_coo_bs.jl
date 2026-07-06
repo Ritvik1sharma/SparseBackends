@@ -26,7 +26,7 @@ function contract!(
   # @assert PB >= 0 && PC >= 0
   # r must be in B's PREFIX axes for this kernel
   axisBr = mapB[rlab]
-  if get(ENV, "SB_TRACE", "0") == "1"
+  if false  # SB_TRACE — flip to true here for debug output
     println("[SB_TRACE] contract_coo_bs.contract!  COO(nnz=", length(A.keys),
             ", dims=", A.dims, ") × BS(blocks=", length(B.keys),
             ", PB=", PB, ", N2=", N2, ")  axisBr=", axisBr,

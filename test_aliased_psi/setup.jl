@@ -137,7 +137,7 @@ function print_iso(label, psi)
     end
 end
 
-# ── Schema-invariance check (SB_SCHEMA_TRACK=1) ────────────────────────────
+# ── Schema-invariance check (see _SCHEMA_TRACK_ON in the calling script) ──
 
 # ψ_aliased ≡ P·ψ_dense, so the alias SCHEMA — keys (which prefix blocks are
 # nonzero, set by P's sparsity), the key→template partition (alias_ids, set by

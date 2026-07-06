@@ -316,21 +316,23 @@ function blocksparse_svd_right_binned(
             end
         end
     end
-    if get(ENV, "SPARSE_SVD_CAP_DIAG", "0") == "1"
-        println(stdout, "[CAP_DIAG_RB] ortho=right maxdim=$maxdim n_active=$n_active_chan mult_cap=$mult_cap n_new_d_natural=$n_new_d_natural n_new_d=$n_new_d eff_bond=$(n_active_chan*n_new_d) dropped_svs=$dropped_by_cap"); flush(stdout)
+    # SPARSE_SVD_CAP_DIAG debug print, disabled; flip to `true` + uncomment body to re-enable.
+    if false
+        # println(stdout, "[CAP_DIAG_RB] ortho=right maxdim=$maxdim n_active=$n_active_chan mult_cap=$mult_cap n_new_d_natural=$n_new_d_natural n_new_d=$n_new_d eff_bond=$(n_active_chan*n_new_d) dropped_svs=$dropped_by_cap"); flush(stdout)
     end
     new_sp_of_bi = Dict(bi => j for (j, bi) in enumerate(surviving))
     # Pad if caller requested a specific sparse dim (boundary preservation).
     n_new_sp = target_n_new_sp > n_new_sp_nat ? target_n_new_sp : n_new_sp_nat
-    if get(ENV, "SPARSE_SVD_DIAG", "0") == "1"
+    # SPARSE_SVD_DIAG debug print, disabled; flip to `true` + uncomment body to re-enable.
+    if false
         # Per-bin (rows, cols, nat_rank, kept) so we can see whether mult is
         # clamped by (a) tiny M_i, (b) cutoff, or (c) maxdim.
-        bin_info = String[]
-        for bi in eachindex(block_svds)
-            (_, U_i, S_i, Vt_i, l_list, col_list) = block_svds[bi]
-            push!(bin_info, "($(size(U_i,1))x$(size(Vt_i,2)) rk=$(length(S_i)) kept=$(k_kept[bi]) smax=$(isempty(S_i) ? 0.0 : round(S_i[1]; digits=4)) smin=$(isempty(S_i) ? 0.0 : round(S_i[end]; digits=4)))")
-        end
-        println(stdout, "[SVD_DIAG_RB] ortho=$ortho nls=$nls nrs=$nrs n_bin=$n_bin d_left=$d_left d_right=$d_right n_bins=$(length(block_svds)) n_new_sp_nat=$n_new_sp_nat n_new_d=$n_new_d keep_count=$keep_count maxdim=$maxdim total_svs=$(length(all_svs)) bins=[$(join(bin_info, ", "))]"); flush(stdout)
+        # bin_info = String[]
+        # for bi in eachindex(block_svds)
+        #     (_, U_i, S_i, Vt_i, l_list, col_list) = block_svds[bi]
+        #     push!(bin_info, "($(size(U_i,1))x$(size(Vt_i,2)) rk=$(length(S_i)) kept=$(k_kept[bi]) smax=$(isempty(S_i) ? 0.0 : round(S_i[1]; digits=4)) smin=$(isempty(S_i) ? 0.0 : round(S_i[end]; digits=4)))")
+        # end
+        # println(stdout, "[SVD_DIAG_RB] ortho=$ortho nls=$nls nrs=$nrs n_bin=$n_bin d_left=$d_left d_right=$d_right n_bins=$(length(block_svds)) n_new_sp_nat=$n_new_sp_nat n_new_d=$n_new_d keep_count=$keep_count maxdim=$maxdim total_svs=$(length(all_svs)) bins=[$(join(bin_info, ", "))]"); flush(stdout)
     end
 
     # Output format matches blocksparse_svd:
@@ -561,10 +563,12 @@ function blocksparse_svd_channel_aware_fixed(
             end
         end
 
-        # Partition: argmax over channels (current behavior).
-        # Alternative: round-robin (preserves all template channels even if
-        # V† is concentrated). Env-flag SB_PARTITION_RR=1.
-        rr_mode = (get(ENV, "SB_PARTITION_RR", "0") == "1")
+        # Partition: argmax over channels (current behavior). Round-robin
+        # alternative (preserves all template channels even if V† is
+        # concentrated) deleted 2026-06 — this whole function
+        # (blocksparse_svd_channel_aware_fixed) has zero callers anywhere in
+        # the tree, so the flag was already unreachable.
+        rr_mode = false
         col_to_ki = Vector{Int}(undef, n_U_cols)
         for j in 1:n_U_cols
             if rr_mode
@@ -582,28 +586,30 @@ function blocksparse_svd_channel_aware_fixed(
             end
         end
 
-        if get(ENV, "SB_GROUP_DIAG", "0") == "1"
-            top5 = string([round(Float64(S_G[k]); sigdigits=3) for k in 1:min(5, r_total)])
-            # How concentrated is V† mass per column? Report mean(max_ki W[j,ki] / sum_ki W[j,ki])
-            conc = 0.0; cnt = 0
-            for j in 1:min(r_total, n_U_cols)
-                tot = sum(W[j, :])
-                if tot > 0
-                    conc += maximum(view(W, j, :)) / tot
-                    cnt += 1
-                end
-            end
-            conc_avg = cnt > 0 ? conc / cnt : 0.0
-            # Per-channel: # cols assigned and total SV² assigned
-            per_chan = String[]
-            for (ki, k) in enumerate(ks_in_g)
-                ass = count(==(ki), col_to_ki)
-                sv2 = sum(j -> col_to_ki[j] == ki && j <= r_total ? Float64(S_G[j])^2 : 0.0, 1:n_U_cols)
-                push!(per_chan, "c=$k:cols=$ass,sv²=$(round(sv2; sigdigits=3))")
-            end
-            partition_str = join(per_chan, " | ")
-            println(stdout, "[GROUP_DIAG] ortho=$ortho g=$g ks=$ks_in_g m_g=$(n_Lg * d_left) cols=$total_cols r=$r_total topSV=$top5 V†_conc_max/sum=$(round(conc_avg; digits=2)) partition: $partition_str"); flush(stdout)
-        end
+        # SB_GROUP_DIAG deleted 2026-06 (was print-only V†-concentration/partition
+        # report) — this whole function has zero callers, so it was unreachable.
+        # if get(ENV, "SB_GROUP_DIAG", "0") == "1"
+        #     top5 = string([round(Float64(S_G[k]); sigdigits=3) for k in 1:min(5, r_total)])
+        #     # How concentrated is V† mass per column? Report mean(max_ki W[j,ki] / sum_ki W[j,ki])
+        #     conc = 0.0; cnt = 0
+        #     for j in 1:min(r_total, n_U_cols)
+        #         tot = sum(W[j, :])
+        #         if tot > 0
+        #             conc += maximum(view(W, j, :)) / tot
+        #             cnt += 1
+        #         end
+        #     end
+        #     conc_avg = cnt > 0 ? conc / cnt : 0.0
+        #     # Per-channel: # cols assigned and total SV² assigned
+        #     per_chan = String[]
+        #     for (ki, k) in enumerate(ks_in_g)
+        #         ass = count(==(ki), col_to_ki)
+        #         sv2 = sum(j -> col_to_ki[j] == ki && j <= r_total ? Float64(S_G[j])^2 : 0.0, 1:n_U_cols)
+        #         push!(per_chan, "c=$k:cols=$ass,sv²=$(round(sv2; sigdigits=3))")
+        #     end
+        #     partition_str = join(per_chan, " | ")
+        #     println(stdout, "[GROUP_DIAG] ortho=$ortho g=$g ks=$ks_in_g m_g=$(n_Lg * d_left) cols=$total_cols r=$r_total topSV=$top5 V†_conc_max/sum=$(round(conc_avg; digits=2)) partition: $partition_str"); flush(stdout)
+        # end
 
         for (ki, k) in enumerate(ks_in_g)
             rl    = r_list_of_k[k]
@@ -684,34 +690,40 @@ function blocksparse_svd_channel_aware_fixed(
             end
         end
     end
-    if get(ENV, "SPARSE_SVD_CAP_DIAG", "0") == "1"
-        n_chan_possible = n_new_sp
-        println(stdout, "[CAP_DIAG] ortho=$ortho maxdim=$maxdim n_chan_possible=$n_chan_possible n_active_chan=$n_active_chan mult_cap=$mult_cap n_new_d_natural=$n_new_d_natural n_new_d=$n_new_d eff_bond=$(n_active_chan * n_new_d) dropped_by_cap_svs=$dropped_by_cap"); flush(stdout)
+    # SPARSE_SVD_CAP_DIAG / SPARSE_SVD_DIAG debug prints, disabled; this occurrence
+    # is inside blocksparse_svd_channel_aware_fixed, which has zero callers anywhere
+    # (already unreachable). Flip to `true` (and restore the two checks below) to
+    # re-enable.
+    if false
     end
-    if get(ENV, "SPARSE_SVD_DIAG", "0") == "1"
-        cap_fired = mult_cap < n_new_d_natural
-        println(stdout, "[SVD_DIAG] ortho=$ortho bond_sp=$bond_sparse_dim fac=$bond_factor_dims d_left=$d_left d_right=$d_right n_active_chan=$n_active_chan mult_cap=$mult_cap n_new_d_natural=$n_new_d_natural n_new_d=$n_new_d cap_fired=$cap_fired maxdim=$maxdim keep_count=$keep_count eff_bond=$(n_active_chan * n_new_d)"); flush(stdout)
-        # Per-channel breakdown: shows where the aggregation asymmetry comes from.
-        # For each new-bond channel c_new: rows × cols of its SVD matrix, the
-        # number of (c_L, c_R) pairs aggregated into that channel, the natural
-        # rank, and how many SVs were kept post-truncation.
-        for bi in eachindex(block_svds)
-            c_new = block_svds[bi][1]
-            U_i   = block_svds[bi][2]
-            S_i   = block_svds[bi][3]
-            Vt_i  = block_svds[bi][4]
-            l_lst = block_svds[bi][5]
-            r_lst = block_svds[bi][6]
-            n_combos_left  = length(l_lst)
-            n_combos_right = length(r_lst)
-            m_c = size(U_i, 1)
-            n_c = size(Vt_i, 2)
-            natural_rank = min(m_c, n_c)
-            max_sv_chan = isempty(S_i) ? 0.0 : Float64(maximum(S_i))
-            min_sv_chan = isempty(S_i) ? 0.0 : Float64(minimum(S_i))
-            println(stdout, "  [SVD_DIAG]   c_new=$c_new  m_c=$m_c (= $n_combos_left lk × $d_left)  n_c=$n_c (= $n_combos_right rk × $d_right)  natural_rank=$natural_rank  k_kept=$(k_kept[bi])  SV_range=[$(round(min_sv_chan,sigdigits=3)), $(round(max_sv_chan,sigdigits=3))]"); flush(stdout)
-        end
-    end
+    # if get(ENV, "SPARSE_SVD_CAP_DIAG", "0") == "1"
+    #     n_chan_possible = n_new_sp
+    #     println(stdout, "[CAP_DIAG] ortho=$ortho maxdim=$maxdim n_chan_possible=$n_chan_possible n_active_chan=$n_active_chan mult_cap=$mult_cap n_new_d_natural=$n_new_d_natural n_new_d=$n_new_d eff_bond=$(n_active_chan * n_new_d) dropped_by_cap_svs=$dropped_by_cap"); flush(stdout)
+    # end
+    # if get(ENV, "SPARSE_SVD_DIAG", "0") == "1"
+    #     cap_fired = mult_cap < n_new_d_natural
+    #     println(stdout, "[SVD_DIAG] ortho=$ortho bond_sp=$bond_sparse_dim fac=$bond_factor_dims d_left=$d_left d_right=$d_right n_active_chan=$n_active_chan mult_cap=$mult_cap n_new_d_natural=$n_new_d_natural n_new_d=$n_new_d cap_fired=$cap_fired maxdim=$maxdim keep_count=$keep_count eff_bond=$(n_active_chan * n_new_d)"); flush(stdout)
+    #     # Per-channel breakdown: shows where the aggregation asymmetry comes from.
+    #     # For each new-bond channel c_new: rows × cols of its SVD matrix, the
+    #     # number of (c_L, c_R) pairs aggregated into that channel, the natural
+    #     # rank, and how many SVs were kept post-truncation.
+    #     for bi in eachindex(block_svds)
+    #         c_new = block_svds[bi][1]
+    #         U_i   = block_svds[bi][2]
+    #         S_i   = block_svds[bi][3]
+    #         Vt_i  = block_svds[bi][4]
+    #         l_lst = block_svds[bi][5]
+    #         r_lst = block_svds[bi][6]
+    #         n_combos_left  = length(l_lst)
+    #         n_combos_right = length(r_lst)
+    #         m_c = size(U_i, 1)
+    #         n_c = size(Vt_i, 2)
+    #         natural_rank = min(m_c, n_c)
+    #         max_sv_chan = isempty(S_i) ? 0.0 : Float64(maximum(S_i))
+    #         min_sv_chan = isempty(S_i) ? 0.0 : Float64(minimum(S_i))
+    #         println(stdout, "  [SVD_DIAG]   c_new=$c_new  m_c=$m_c (= $n_combos_left lk × $d_left)  n_c=$n_c (= $n_combos_right rk × $d_right)  natural_rank=$natural_rank  k_kept=$(k_kept[bi])  SV_range=[$(round(min_sv_chan,sigdigits=3)), $(round(max_sv_chan,sigdigits=3))]"); flush(stdout)
+    #     end
+    # end
     # Re-truncate per-channel kept count so each k_kept[bi] ≤ n_new_d.
     if n_new_d < n_new_d_natural
         for bi in eachindex(k_kept)
@@ -728,18 +740,23 @@ function blocksparse_svd_channel_aware_fixed(
         end
     end
 
-    if get(ENV, "SB_SV_REPORT", "0") == "1"
-        println(stdout, "[SV_REPORT_GROUPED] ortho=$ortho  maxdim=$maxdim  n_new_d=$n_new_d  mult_cap=$mult_cap  bond_sparse_dim=$bond_sparse_dim  n_active_chan=$n_active_chan")
-        for bi in eachindex(block_svds)
-            c_new = block_svds[bi][1]
-            S_i   = block_svds[bi][3]
-            k     = k_kept[bi]
-            kept_str    = (k > 0 && k <= length(S_i)) ? string(S_i[k])   : "-"
-            dropped_str = (k+1 <= length(S_i))        ? string(S_i[k+1]) : "-"
-            println(stdout, "  cM=$c_new: kept $k/$(length(S_i))  smallest_kept=$kept_str  largest_dropped=$dropped_str")
-        end
-        flush(stdout)
+    # SB_SV_REPORT debug print, disabled; this occurrence is inside
+    # blocksparse_svd_channel_aware_fixed, which has zero callers anywhere (already
+    # unreachable). Flip to `true` (and restore the check below) to re-enable.
+    if false
     end
+    # if get(ENV, "SB_SV_REPORT", "0") == "1"
+    #     println(stdout, "[SV_REPORT_GROUPED] ortho=$ortho  maxdim=$maxdim  n_new_d=$n_new_d  mult_cap=$mult_cap  bond_sparse_dim=$bond_sparse_dim  n_active_chan=$n_active_chan")
+    #     for bi in eachindex(block_svds)
+    #         c_new = block_svds[bi][1]
+    #         S_i   = block_svds[bi][3]
+    #         k     = k_kept[bi]
+    #         kept_str    = (k > 0 && k <= length(S_i)) ? string(S_i[k])   : "-"
+    #         dropped_str = (k+1 <= length(S_i))        ? string(S_i[k+1]) : "-"
+    #         println(stdout, "  cM=$c_new: kept $k/$(length(S_i))  smallest_kept=$kept_str  largest_dropped=$dropped_str")
+    #     end
+    #     flush(stdout)
+    # end
 
     NU  = (nls + 1) + (nld + 1)
     NSV = (1 + nrs) + (1 + nrd)
@@ -1000,34 +1017,38 @@ function blocksparse_svd_channel_aware(
             end
         end
     end
-    if get(ENV, "SPARSE_SVD_CAP_DIAG", "0") == "1"
-        n_chan_possible = n_new_sp
-        println(stdout, "[CAP_DIAG] ortho=$ortho maxdim=$maxdim n_chan_possible=$n_chan_possible n_active_chan=$n_active_chan mult_cap=$mult_cap n_new_d_natural=$n_new_d_natural n_new_d=$n_new_d eff_bond=$(n_active_chan * n_new_d) dropped_by_cap_svs=$dropped_by_cap"); flush(stdout)
+    # SPARSE_SVD_CAP_DIAG / SPARSE_SVD_DIAG debug prints, disabled; flip to `true`
+    # (and restore the two `if get(ENV,...)` checks below) to re-enable.
+    if false
     end
-    if get(ENV, "SPARSE_SVD_DIAG", "0") == "1"
-        cap_fired = mult_cap < n_new_d_natural
-        println(stdout, "[SVD_DIAG] ortho=$ortho bond_sp=$bond_sparse_dim fac=$bond_factor_dims d_left=$d_left d_right=$d_right n_active_chan=$n_active_chan mult_cap=$mult_cap n_new_d_natural=$n_new_d_natural n_new_d=$n_new_d cap_fired=$cap_fired maxdim=$maxdim keep_count=$keep_count eff_bond=$(n_active_chan * n_new_d)"); flush(stdout)
-        # Per-channel breakdown: shows where the aggregation asymmetry comes from.
-        # For each new-bond channel c_new: rows × cols of its SVD matrix, the
-        # number of (c_L, c_R) pairs aggregated into that channel, the natural
-        # rank, and how many SVs were kept post-truncation.
-        for bi in eachindex(block_svds)
-            c_new = block_svds[bi][1]
-            U_i   = block_svds[bi][2]
-            S_i   = block_svds[bi][3]
-            Vt_i  = block_svds[bi][4]
-            l_lst = block_svds[bi][5]
-            r_lst = block_svds[bi][6]
-            n_combos_left  = length(l_lst)
-            n_combos_right = length(r_lst)
-            m_c = size(U_i, 1)
-            n_c = size(Vt_i, 2)
-            natural_rank = min(m_c, n_c)
-            max_sv_chan = isempty(S_i) ? 0.0 : Float64(maximum(S_i))
-            min_sv_chan = isempty(S_i) ? 0.0 : Float64(minimum(S_i))
-            println(stdout, "  [SVD_DIAG]   c_new=$c_new  m_c=$m_c (= $n_combos_left lk × $d_left)  n_c=$n_c (= $n_combos_right rk × $d_right)  natural_rank=$natural_rank  k_kept=$(k_kept[bi])  SV_range=[$(round(min_sv_chan,sigdigits=3)), $(round(max_sv_chan,sigdigits=3))]"); flush(stdout)
-        end
-    end
+    # if get(ENV, "SPARSE_SVD_CAP_DIAG", "0") == "1"
+    #     n_chan_possible = n_new_sp
+    #     println(stdout, "[CAP_DIAG] ortho=$ortho maxdim=$maxdim n_chan_possible=$n_chan_possible n_active_chan=$n_active_chan mult_cap=$mult_cap n_new_d_natural=$n_new_d_natural n_new_d=$n_new_d eff_bond=$(n_active_chan * n_new_d) dropped_by_cap_svs=$dropped_by_cap"); flush(stdout)
+    # end
+    # if get(ENV, "SPARSE_SVD_DIAG", "0") == "1"
+    #     cap_fired = mult_cap < n_new_d_natural
+    #     println(stdout, "[SVD_DIAG] ortho=$ortho bond_sp=$bond_sparse_dim fac=$bond_factor_dims d_left=$d_left d_right=$d_right n_active_chan=$n_active_chan mult_cap=$mult_cap n_new_d_natural=$n_new_d_natural n_new_d=$n_new_d cap_fired=$cap_fired maxdim=$maxdim keep_count=$keep_count eff_bond=$(n_active_chan * n_new_d)"); flush(stdout)
+    #     # Per-channel breakdown: shows where the aggregation asymmetry comes from.
+    #     # For each new-bond channel c_new: rows × cols of its SVD matrix, the
+    #     # number of (c_L, c_R) pairs aggregated into that channel, the natural
+    #     # rank, and how many SVs were kept post-truncation.
+    #     for bi in eachindex(block_svds)
+    #         c_new = block_svds[bi][1]
+    #         U_i   = block_svds[bi][2]
+    #         S_i   = block_svds[bi][3]
+    #         Vt_i  = block_svds[bi][4]
+    #         l_lst = block_svds[bi][5]
+    #         r_lst = block_svds[bi][6]
+    #         n_combos_left  = length(l_lst)
+    #         n_combos_right = length(r_lst)
+    #         m_c = size(U_i, 1)
+    #         n_c = size(Vt_i, 2)
+    #         natural_rank = min(m_c, n_c)
+    #         max_sv_chan = isempty(S_i) ? 0.0 : Float64(maximum(S_i))
+    #         min_sv_chan = isempty(S_i) ? 0.0 : Float64(minimum(S_i))
+    #         println(stdout, "  [SVD_DIAG]   c_new=$c_new  m_c=$m_c (= $n_combos_left lk × $d_left)  n_c=$n_c (= $n_combos_right rk × $d_right)  natural_rank=$natural_rank  k_kept=$(k_kept[bi])  SV_range=[$(round(min_sv_chan,sigdigits=3)), $(round(max_sv_chan,sigdigits=3))]"); flush(stdout)
+    #     end
+    # end
     # Re-truncate per-channel kept count so each k_kept[bi] ≤ n_new_d.
     if n_new_d < n_new_d_natural
         for bi in eachindex(k_kept)
@@ -1044,18 +1065,22 @@ function blocksparse_svd_channel_aware(
         end
     end
 
-    if get(ENV, "SB_SV_REPORT", "0") == "1"
-        println(stdout, "[SV_REPORT_GROUPED] ortho=$ortho  maxdim=$maxdim  n_new_d=$n_new_d  mult_cap=$mult_cap  bond_sparse_dim=$bond_sparse_dim  n_active_chan=$n_active_chan")
-        for bi in eachindex(block_svds)
-            c_new = block_svds[bi][1]
-            S_i   = block_svds[bi][3]
-            k     = k_kept[bi]
-            kept_str    = (k > 0 && k <= length(S_i)) ? string(S_i[k])   : "-"
-            dropped_str = (k+1 <= length(S_i))        ? string(S_i[k+1]) : "-"
-            println(stdout, "  cM=$c_new: kept $k/$(length(S_i))  smallest_kept=$kept_str  largest_dropped=$dropped_str")
-        end
-        flush(stdout)
+    # SB_SV_REPORT debug print, disabled; flip to `true` (and restore the check
+    # below) to re-enable.
+    if false
     end
+    # if get(ENV, "SB_SV_REPORT", "0") == "1"
+    #     println(stdout, "[SV_REPORT_GROUPED] ortho=$ortho  maxdim=$maxdim  n_new_d=$n_new_d  mult_cap=$mult_cap  bond_sparse_dim=$bond_sparse_dim  n_active_chan=$n_active_chan")
+    #     for bi in eachindex(block_svds)
+    #         c_new = block_svds[bi][1]
+    #         S_i   = block_svds[bi][3]
+    #         k     = k_kept[bi]
+    #         kept_str    = (k > 0 && k <= length(S_i)) ? string(S_i[k])   : "-"
+    #         dropped_str = (k+1 <= length(S_i))        ? string(S_i[k+1]) : "-"
+    #         println(stdout, "  cM=$c_new: kept $k/$(length(S_i))  smallest_kept=$kept_str  largest_dropped=$dropped_str")
+    #     end
+    #     flush(stdout)
+    # end
 
     NU  = (nls + 1) + (nld + 1)
     NSV = (1 + nrs) + (1 + nrd)
@@ -1251,9 +1276,13 @@ function blocksparse_svd_left_binned(
             end
         end
     end
-    if get(ENV, "SPARSE_SVD_CAP_DIAG", "0") == "1"
-        println(stdout, "[CAP_DIAG_LB] ortho=left maxdim=$maxdim n_active=$n_active_chan mult_cap=$mult_cap n_new_d_natural=$n_new_d_natural n_new_d=$n_new_d eff_bond=$(n_active_chan*n_new_d) dropped_svs=$dropped_by_cap"); flush(stdout)
+    # SPARSE_SVD_CAP_DIAG debug print, disabled; flip to `true` (and restore the
+    # check below) to re-enable.
+    if false
     end
+    # if get(ENV, "SPARSE_SVD_CAP_DIAG", "0") == "1"
+    #     println(stdout, "[CAP_DIAG_LB] ortho=left maxdim=$maxdim n_active=$n_active_chan mult_cap=$mult_cap n_new_d_natural=$n_new_d_natural n_new_d=$n_new_d eff_bond=$(n_active_chan*n_new_d) dropped_svs=$dropped_by_cap"); flush(stdout)
+    # end
     new_sp_of_bi = Dict(bi => j for (j, bi) in enumerate(surviving))
     # Pad the new bond's sparse dim up to the caller's target if requested.
     # Extra slots have no blocks scattered into them — they exist on the axis

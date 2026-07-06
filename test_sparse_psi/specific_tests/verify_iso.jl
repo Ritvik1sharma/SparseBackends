@@ -109,9 +109,8 @@ let
             continue
         end
         try
-            factor_fn = if get(ENV, "SB_USE_OWNED_SVD", "0") == "1"
-                SparseBackends.itensor_blocksparse_svd_owned_channel_aware
-            elseif get(ENV, "SB_USE_QR", "0") == "1"
+            # Owned-SVD variant disabled (see mps.jl:1577) — commented out there too.
+            factor_fn = if get(ENV, "SB_USE_QR", "0") == "1"
                 SparseBackends.itensor_blocksparse_qr_channel_aware
             else
                 SparseBackends.itensor_blocksparse_svd_channel_aware
