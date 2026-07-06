@@ -489,10 +489,13 @@ function contract_preserve_bs(A::ITensors.ITensor, B::ITensors.ITensor;
                               output_inds_hint::Union{Nothing,AbstractSet}=nothing,
                               preferred_output_labels::Union{Nothing,AbstractVector}=nothing,
                               next_op=nothing,
-                              remaining_ops=nothing)
+                              remaining_ops=nothing,
+                              output_perm::Union{Nothing,Vector{Int}}=nothing,
+                              in_position::Bool=false)
  @timeit TIMER "contract_preserve_bs" begin
   # Both inputs plain dense → no BS storage to preserve; standard contract.
   if !ITensors.has_external_storage(A) && !ITensors.has_external_storage(B)
+    output_perm !== nothing && error("contract_preserve_bs: output_perm given but both operands are dense — the static output-permutation table only applies to the aliased/BS-preserving path")
     return ITensors.contract(A, B)
   end
   if ITensors.has_external_storage(A)
@@ -507,9 +510,10 @@ function contract_preserve_bs(A::ITensors.ITensor, B::ITensors.ITensor;
   end
   # Auto-derive hint from template if caller didn't supply one (template's
   # dense_inds is exactly the set of axes that should be dense in the output).
-  # GATED: requires BMF_USE_HINT=1 because the in-kernel hint path is not yet
-  # implemented (without kernel support, hint causes correctness errors).
-  if get(ENV, "BMF_USE_HINT", "0") == "1" &&
+  # UNSAFE, kept hardcoded off: the in-kernel hint path is not yet implemented
+  # (without kernel support, hint causes correctness errors). Do not flip this
+  # to true (was BMF_USE_HINT, default-off knob, never safe to enable).
+  if false &&
      output_inds_hint === nothing && template !== nothing &&
      ITensors.has_external_storage(template) &&
      ITensors.get_external_storage(template) isa WrappedBlockSparse
@@ -528,7 +532,8 @@ function contract_preserve_bs(A::ITensors.ITensor, B::ITensors.ITensor;
     output_inds_hint = dense_inds(ITensors.get_external_storage(template))
   end
   template_for_filter = nothing
-  if get(ENV, "BMF_USE_HINT", "0") == "1" && template !== nothing &&
+  # UNSAFE, kept hardcoded off: see BMF_USE_HINT note above.
+  if false && template !== nothing &&
      ITensors.has_external_storage(template) &&
      ITensors.get_external_storage(template) isa WrappedBlockSparse
     template_for_filter = ITensors.get_external_storage(template)::WrappedBlockSparse
@@ -540,7 +545,11 @@ function contract_preserve_bs(A::ITensors.ITensor, B::ITensors.ITensor;
   # Caller-provided ordered output labels (e.g. the dense-chain next-step hint)
   # take precedence; otherwise derive from the aliased template (recast-align).
   _pref_order = preferred_output_labels
-  if _pref_order === nothing && get(ENV, "SB_ALIASED_ALIGN_OUTPUT", "0") == "1" &&
+  # Hardened 2026-06 — always try to align to the template's own axis order
+  # when one is available (was SB_ALIASED_ALIGN_OUTPUT, default-off knob); the
+  # kernel already falls back gracefully (_ALIGN_FALLBACK) when it can't honor
+  # the request, so this is a pure win when it succeeds and a no-op otherwise.
+  if _pref_order === nothing &&
      template !== nothing && ITensors.has_external_storage(template) &&
      ITensors.get_external_storage(template) isa WrappedAliasedBlockSparse
     _pref_order = collect(ITensors.inds(template))
@@ -548,11 +557,13 @@ function contract_preserve_bs(A::ITensors.ITensor, B::ITensors.ITensor;
   Cw = if _pref_order !== nothing
     @timeit TIMER "cpb.contract" contract(Aw, Bw; preserve_bs_output=true,
         output_inds_hint=output_inds_hint, template_for_filter=template_for_filter,
-        preferred_output_labels=_pref_order, next_op=next_op, remaining_ops=remaining_ops)
+        preferred_output_labels=_pref_order, next_op=next_op, remaining_ops=remaining_ops,
+        output_perm=output_perm, in_position=in_position)
   else
     @timeit TIMER "cpb.contract" contract(Aw, Bw; preserve_bs_output=true,
         output_inds_hint=output_inds_hint, template_for_filter=template_for_filter,
-        next_op=next_op, remaining_ops=remaining_ops)
+        next_op=next_op, remaining_ops=remaining_ops,
+        output_perm=output_perm, in_position=in_position)
   end
   Cw isa ITensors.ITensor && return Cw
 
@@ -1156,7 +1167,7 @@ function _sparse_inner_fastpath(y::ITensors.ITensor, x::ITensors.ITensor)
     # faster); returns nothing → standard contraction only when not applicable.
     yw = _alias_storage(y); xw = _alias_storage(x)
     (yw !== nothing && xw !== nothing) || return nothing
-    return _alias_inner(yw, xw)
+    return @timeit TIMER "vecop.inner" _alias_inner(yw, xw)
 end
 
 # Task-local contract-label scratch. Previously `_scratch[Threads.threadid()]`,
@@ -1224,7 +1235,8 @@ function wrapped_contract(A::WrappedTensorTypes{TA,NA},
                           output_backend::Symbol=:blocksparse,
                           preserve_bs_output::Bool=false,
                           output_inds_hint::Union{Nothing,AbstractSet}=nothing,
-                          template_for_filter::Union{Nothing,WrappedBlockSparse}=nothing) where {TA,TB,NA,NB}
+                          template_for_filter::Union{Nothing,WrappedBlockSparse}=nothing,
+                          in_position::Bool=false) where {TA,TB,NA,NB}
   # `preserve_bs_output=true` is an opt-in pathway that forces the result of
   # a BlockSparse-involving contraction to remain WrappedBlockSparse, even
   # when the natural output has no sparse axes (P_C = 0) or shares only
@@ -1241,7 +1253,7 @@ function wrapped_contract(A::WrappedTensorTypes{TA,NA},
       denseA = dense_inds(A)
       denseB = dense_inds(B)
     end
-    if get(ENV, "SB_TRACE", "0") == "1"
+    if false  # SB_TRACE — flip to true here for debug output
       println("[SB_TRACE] wrapped_contract  A=", _backend(A), "{T=", TA, ",N=", NA, "}",
               "  B=", _backend(B), "{T=", TB, ",N=", NB, "}",
               "  → C=", infer_C_backend(A, B))
@@ -1278,12 +1290,12 @@ function wrapped_contract(A::WrappedTensorTypes{TA,NA},
             elseif Arep isa NewBlockSparseSorted && Brep isa AbstractArray
               @timeit TIMER "kern.bs_dense_to_dense" begin
                 SparseBackends.contract_bs_dense_to_dense!(
-                    C_data, labelsC_vec, Arep, labelsA_vec, Brep, labelsB_vec)
+                    C_data, labelsC_vec, Arep, labelsA_vec, Brep, labelsB_vec; in_position=in_position)
               end
             elseif Arep isa AbstractArray && Brep isa NewBlockSparseSorted
               @timeit TIMER "kern.bs_dense_to_dense" begin
                 SparseBackends.contract_bs_dense_to_dense!(
-                    C_data, labelsC_vec, Brep, labelsB_vec, Arep, labelsA_vec)
+                    C_data, labelsC_vec, Brep, labelsB_vec, Arep, labelsA_vec; in_position=in_position)
               end
             else
               @timeit TIMER "kern.dense_dense_einsum" begin
@@ -1325,7 +1337,8 @@ function wrapped_contract(A::WrappedTensorTypes{TA,NA},
           # end
         end
 
-        _trace = get(ENV, "SB_TRACE_ONE", "0") == "1"
+        # SB_TRACE_ONE removed 2026-06 — was a fire-once debug trace; hardcoded off.
+        _trace = false
         if output_backend === :dense
           if _trace
             println("\n[TRACE] wrapped_contract bs×dense path")
@@ -1362,7 +1375,7 @@ function wrapped_contract(A::WrappedTensorTypes{TA,NA},
             else Brep isa AbstractArray
               @timeit TIMER "kern.bs_dense_to_dense" begin
                 SparseBackends.contract_bs_dense_to_dense!(
-                    C_data, labelsC_vec, Arep, labelsA_vec, Brep, labelsB_vec)
+                    C_data, labelsC_vec, Arep, labelsA_vec, Brep, labelsB_vec; in_position=in_position)
               end
             end
           end
@@ -2219,7 +2232,8 @@ function itensor_blocksparse_qr_channel_aware(
         push!(right_template, (ch, NTuple{nrs,Kt}(rk)))
     end
 
-    if get(ENV, "SB_QR_DIAG", "0") == "1"
+    # SB_QR_DIAG removed 2026-06 — flip to true here for debug output.
+    if false
         phi_keys = collect(bs_p.keys)
         println(stdout, "[QR_WRAP] phi sparse-keys (n=$(length(phi_keys))): ", phi_keys)
         println(stdout, "[QR_WRAP] left_template (M_b, n=$(length(left_template))): ", left_template)
@@ -2235,7 +2249,7 @@ function itensor_blocksparse_qr_channel_aware(
         left_template, right_template,
         bond_sparse_dim = bond_sp_dim,
         ortho, maxdim, mindim, cutoff,
-        verbose = (get(ENV, "SB_QR_DIAG", "0") == "1"))
+        verbose = false)
 
     new_sp  = bond_sparse
     n_new_d = U_bs.dims[nls + 1 + nld + 1]
@@ -2261,120 +2275,124 @@ function itensor_blocksparse_qr_channel_aware(
 
     return L_it, R_it, spec
 end
-# Channel-aware SVD with primary-ownership, NO Gram-Schmidt. Designed for
-# Path B (BMF_ISO_PATH=0). Lossless reconstruction via primary-ownership,
-# relaxed iso across channels (M-correction in geneigsolve absorbs slack).
-function itensor_blocksparse_svd_owned_channel_aware(
-    phi::ITensors.ITensor,
-    M_b::ITensors.ITensor,
-    M_b1::ITensors.ITensor;
-    ortho::String   = "left",
-    maxdim::Int     = typemax(Int),
-    mindim::Int     = 1,
-    cutoff::Float64 = 0.0,
-)
-    @assert ITensors.has_external_storage(phi) "phi must be block-sparse"
-    @assert ITensors.has_external_storage(M_b) "M_b must be block-sparse"
-    @assert ITensors.has_external_storage(M_b1) "M_b1 must be block-sparse"
-    w_phi = ITensors.get_external_storage(phi)::WrappedBlockSparse
-    w_b   = ITensors.get_external_storage(M_b)::WrappedBlockSparse
-    w_b1  = ITensors.get_external_storage(M_b1)::WrappedBlockSparse
+# DISABLED 2026-06: itensor_blocksparse_svd_owned_channel_aware is no longer called
+# from anywhere (its only dispatch site, mps.jl:1577, is commented out; SB_USE_OWNED_SVD
+# was never exercised by any script). Commented out rather than deleted; uncomment this
+# block + the dispatch branch in mps.jl (and verify_iso.jl) to re-enable.
+# # Channel-aware SVD with primary-ownership, NO Gram-Schmidt. Designed for
+# # Path B (BMF_ISO_PATH=0). Lossless reconstruction via primary-ownership,
+# # relaxed iso across channels (M-correction in geneigsolve absorbs slack).
+# function itensor_blocksparse_svd_owned_channel_aware(
+#     phi::ITensors.ITensor,
+#     M_b::ITensors.ITensor,
+#     M_b1::ITensors.ITensor;
+#     ortho::String   = "left",
+#     maxdim::Int     = typemax(Int),
+#     mindim::Int     = 1,
+#     cutoff::Float64 = 0.0,
+# )
+#     @assert ITensors.has_external_storage(phi) "phi must be block-sparse"
+#     @assert ITensors.has_external_storage(M_b) "M_b must be block-sparse"
+#     @assert ITensors.has_external_storage(M_b1) "M_b1 must be block-sparse"
+#     w_phi = ITensors.get_external_storage(phi)::WrappedBlockSparse
+#     w_b   = ITensors.get_external_storage(M_b)::WrappedBlockSparse
+#     w_b1  = ITensors.get_external_storage(M_b1)::WrappedBlockSparse
 
-    shared      = collect(ITensors.commoninds(M_b, M_b1))
-    dense_b     = dense_inds(w_b)
-    bond_sparse = first(I for I in shared if !(I in dense_b))
-    bond_mult   = first(I for I in shared if  (I in dense_b))
-    bond_sp_dim = ITensors.dim(bond_sparse)
+#     shared      = collect(ITensors.commoninds(M_b, M_b1))
+#     dense_b     = dense_inds(w_b)
+#     bond_sparse = first(I for I in shared if !(I in dense_b))
+#     bond_mult   = first(I for I in shared if  (I in dense_b))
+#     bond_sp_dim = ITensors.dim(bond_sparse)
 
-    indsMb = [I for I in ITensors.inds(M_b) if !(I in shared)]
+#     indsMb = [I for I in ITensors.inds(M_b) if !(I in shared)]
 
-    phi_inds_all = collect(w_phi.inds)
-    dense_set    = Set(dense_inds(w_phi))
-    in_U   = Set(filter(i -> i ∈ phi_inds_all, indsMb))
-    U_legs = filter(i ->  i ∈ in_U, phi_inds_all)
-    V_legs = filter(i -> !(i ∈ in_U), phi_inds_all)
-    U_spL, U_spN, U_d = reorder_invariant(U_legs, dense_set)
-    V_spL, V_spN, V_d = reorder_invariant(V_legs, dense_set)
-    nls = length(U_spL) + length(U_spN)
-    nrs = length(V_spL) + length(V_spN)
-    nld = length(U_d)
-    nrd = length(V_d)
+#     phi_inds_all = collect(w_phi.inds)
+#     dense_set    = Set(dense_inds(w_phi))
+#     in_U   = Set(filter(i -> i ∈ phi_inds_all, indsMb))
+#     U_legs = filter(i ->  i ∈ in_U, phi_inds_all)
+#     V_legs = filter(i -> !(i ∈ in_U), phi_inds_all)
+#     U_spL, U_spN, U_d = reorder_invariant(U_legs, dense_set)
+#     V_spL, V_spN, V_d = reorder_invariant(V_legs, dense_set)
+#     nls = length(U_spL) + length(U_spN)
+#     nrs = length(V_spL) + length(V_spN)
+#     nld = length(U_d)
+#     nrd = length(V_d)
 
-    desired = (U_spL..., U_spN..., V_spL..., V_spN..., U_d..., V_d...)
-    phi_p   = permute(phi, desired...; allow_alias = true)
-    bs_p    = ITensors.get_external_storage(phi_p).blocksparse
+#     desired = (U_spL..., U_spN..., V_spL..., V_spN..., U_d..., V_d...)
+#     phi_p   = permute(phi, desired...; allow_alias = true)
+#     bs_p    = ITensors.get_external_storage(phi_p).blocksparse
 
-    L_phi_sparse = (U_spL..., U_spN...)
-    R_phi_sparse = (V_spL..., V_spN...)
+#     L_phi_sparse = (U_spL..., U_spN...)
+#     R_phi_sparse = (V_spL..., V_spN...)
 
-    M_b_inds        = collect(w_b.inds)
-    M_b1_inds       = collect(w_b1.inds)
-    dense_b1        = dense_inds(w_b1)
-    M_b_sparse_pos  = [i for i in 1:length(M_b_inds)  if !(M_b_inds[i]  in dense_b)]
-    M_b1_sparse_pos = [i for i in 1:length(M_b1_inds) if !(M_b1_inds[i] in dense_b1)]
+#     M_b_inds        = collect(w_b.inds)
+#     M_b1_inds       = collect(w_b1.inds)
+#     dense_b1        = dense_inds(w_b1)
+#     M_b_sparse_pos  = [i for i in 1:length(M_b_inds)  if !(M_b_inds[i]  in dense_b)]
+#     M_b1_sparse_pos = [i for i in 1:length(M_b1_inds) if !(M_b1_inds[i] in dense_b1)]
 
-    bond_pos_in_b  = findfirst(p -> M_b_inds[p]  == bond_sparse, M_b_sparse_pos)
-    bond_pos_in_b1 = findfirst(p -> M_b1_inds[p] == bond_sparse, M_b1_sparse_pos)
+#     bond_pos_in_b  = findfirst(p -> M_b_inds[p]  == bond_sparse, M_b_sparse_pos)
+#     bond_pos_in_b1 = findfirst(p -> M_b1_inds[p] == bond_sparse, M_b1_sparse_pos)
 
-    non_bond_b_pos  = [p for (i, p) in enumerate(M_b_sparse_pos)  if i != bond_pos_in_b]
-    non_bond_b1_pos = [p for (i, p) in enumerate(M_b1_sparse_pos) if i != bond_pos_in_b1]
-    perm_b  = [findfirst(I -> I == M_b_inds[p],  L_phi_sparse) for p in non_bond_b_pos]
-    perm_b1 = [findfirst(I -> I == M_b1_inds[p], R_phi_sparse) for p in non_bond_b1_pos]
-    @assert all(!isnothing, perm_b)
-    @assert all(!isnothing, perm_b1)
+#     non_bond_b_pos  = [p for (i, p) in enumerate(M_b_sparse_pos)  if i != bond_pos_in_b]
+#     non_bond_b1_pos = [p for (i, p) in enumerate(M_b1_sparse_pos) if i != bond_pos_in_b1]
+#     perm_b  = [findfirst(I -> I == M_b_inds[p],  L_phi_sparse) for p in non_bond_b_pos]
+#     perm_b1 = [findfirst(I -> I == M_b1_inds[p], R_phi_sparse) for p in non_bond_b1_pos]
+#     @assert all(!isnothing, perm_b)
+#     @assert all(!isnothing, perm_b1)
 
-    Kt = eltype(eltype(w_b.blocksparse.keys))
-    LTupT = NTuple{nls, Kt}
-    RTupT = NTuple{nrs, Kt}
+#     Kt = eltype(eltype(w_b.blocksparse.keys))
+#     LTupT = NTuple{nls, Kt}
+#     RTupT = NTuple{nrs, Kt}
 
-    left_template = Tuple{LTupT, Kt}[]
-    for key in w_b.blocksparse.keys
-        vals     = [key[p] for p in M_b_sparse_pos]
-        ch       = Kt(vals[bond_pos_in_b])
-        non_bond = [vals[i] for i in 1:length(vals) if i != bond_pos_in_b]
-        lk       = Vector{Kt}(undef, nls)
-        for (s, d) in enumerate(perm_b); lk[d] = Kt(non_bond[s]); end
-        push!(left_template, (NTuple{nls,Kt}(lk), ch))
-    end
-    right_template = Tuple{Kt, RTupT}[]
-    for key in w_b1.blocksparse.keys
-        vals     = [key[p] for p in M_b1_sparse_pos]
-        ch       = Kt(vals[bond_pos_in_b1])
-        non_bond = [vals[i] for i in 1:length(vals) if i != bond_pos_in_b1]
-        rk       = Vector{Kt}(undef, nrs)
-        for (s, d) in enumerate(perm_b1); rk[d] = Kt(non_bond[s]); end
-        push!(right_template, (ch, NTuple{nrs,Kt}(rk)))
-    end
+#     left_template = Tuple{LTupT, Kt}[]
+#     for key in w_b.blocksparse.keys
+#         vals     = [key[p] for p in M_b_sparse_pos]
+#         ch       = Kt(vals[bond_pos_in_b])
+#         non_bond = [vals[i] for i in 1:length(vals) if i != bond_pos_in_b]
+#         lk       = Vector{Kt}(undef, nls)
+#         for (s, d) in enumerate(perm_b); lk[d] = Kt(non_bond[s]); end
+#         push!(left_template, (NTuple{nls,Kt}(lk), ch))
+#     end
+#     right_template = Tuple{Kt, RTupT}[]
+#     for key in w_b1.blocksparse.keys
+#         vals     = [key[p] for p in M_b1_sparse_pos]
+#         ch       = Kt(vals[bond_pos_in_b1])
+#         non_bond = [vals[i] for i in 1:length(vals) if i != bond_pos_in_b1]
+#         rk       = Vector{Kt}(undef, nrs)
+#         for (s, d) in enumerate(perm_b1); rk[d] = Kt(non_bond[s]); end
+#         push!(right_template, (ch, NTuple{nrs,Kt}(rk)))
+#     end
 
-    U_bs, SV_bs, svs_kept, spec = blocksparse_svd_owned_channel_aware(bs_p;
-        n_left_sparse = nls,
-        n_left_dense  = nld,
-        left_template, right_template,
-        bond_sparse_dim = bond_sp_dim,
-        ortho, maxdim, mindim, cutoff,
-        verbose = (get(ENV, "SB_QR_DIAG", "0") == "1"))
+#     U_bs, SV_bs, svs_kept, spec = blocksparse_svd_owned_channel_aware(bs_p;
+#         n_left_sparse = nls,
+#         n_left_dense  = nld,
+#         left_template, right_template,
+#         bond_sparse_dim = bond_sp_dim,
+#         ortho, maxdim, mindim, cutoff,
+#         verbose = (get(ENV, "SB_QR_DIAG", "0") == "1"))
 
-    new_sp  = bond_sparse
-    n_new_d = U_bs.dims[nls + 1 + nld + 1]
-    new_d   = ITensors.Index(n_new_d; tags = ITensors.tags(bond_mult))
+#     new_sp  = bond_sparse
+#     n_new_d = U_bs.dims[nls + 1 + nld + 1]
+#     new_d   = ITensors.Index(n_new_d; tags = ITensors.tags(bond_mult))
 
-    U_inds_storage  = (U_spL..., U_spN..., new_sp, U_d..., new_d)
-    SV_inds_storage = (new_sp, V_spL..., V_spN..., new_d, V_d...)
+#     U_inds_storage  = (U_spL..., U_spN..., new_sp, U_d..., new_d)
+#     SV_inds_storage = (new_sp, V_spL..., V_spN..., new_d, V_d...)
 
-    @assert ntuple(i -> ITensors.dim(U_inds_storage[i]),  length(U_inds_storage)) ==
-            U_bs.dims  "U inds/storage dim mismatch"
-    @assert ntuple(i -> ITensors.dim(SV_inds_storage[i]), length(SV_inds_storage)) ==
-            SV_bs.dims "SV inds/storage dim mismatch"
+#     @assert ntuple(i -> ITensors.dim(U_inds_storage[i]),  length(U_inds_storage)) ==
+#             U_bs.dims  "U inds/storage dim mismatch"
+#     @assert ntuple(i -> ITensors.dim(SV_inds_storage[i]), length(SV_inds_storage)) ==
+#             SV_bs.dims "SV inds/storage dim mismatch"
 
-    L_it = ITensors._itensor_from_external_storage(WrappedBlockSparse(U_bs,  U_inds_storage))
-    R_it = ITensors._itensor_from_external_storage(WrappedBlockSparse(SV_bs, SV_inds_storage))
+#     L_it = ITensors._itensor_from_external_storage(WrappedBlockSparse(U_bs,  U_inds_storage))
+#     R_it = ITensors._itensor_from_external_storage(WrappedBlockSparse(SV_bs, SV_inds_storage))
 
-    U_dense_set  = Set([U_d..., new_d])
-    SV_dense_set = Set([V_d..., new_d])
-    L_spL, L_spN, L_d = reorder_invariant(collect(U_inds_storage),  U_dense_set)
-    R_spL, R_spN, R_d = reorder_invariant(collect(SV_inds_storage), SV_dense_set)
-    L_it = permute(L_it, L_spL..., L_spN..., L_d...; allow_alias = true)
-    R_it = permute(R_it, R_spL..., R_spN..., R_d...; allow_alias = true)
+#     U_dense_set  = Set([U_d..., new_d])
+#     SV_dense_set = Set([V_d..., new_d])
+#     L_spL, L_spN, L_d = reorder_invariant(collect(U_inds_storage),  U_dense_set)
+#     R_spL, R_spN, R_d = reorder_invariant(collect(SV_inds_storage), SV_dense_set)
+#     L_it = permute(L_it, L_spL..., L_spN..., L_d...; allow_alias = true)
+#     R_it = permute(R_it, R_spL..., R_spN..., R_d...; allow_alias = true)
 
-    return L_it, R_it, spec
-end
+#     return L_it, R_it, spec
+# end

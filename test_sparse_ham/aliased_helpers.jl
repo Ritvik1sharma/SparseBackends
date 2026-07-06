@@ -257,25 +257,30 @@ end
 #
 # Return: (dmrg_result_tuple, wall_seconds_excluding_jit)
 # ─────────────────────────────────────────────────────────────────────────────
-function run_dmrg_ground(label, H, psi0; nsweeps, maxdim, mindim, cutoff, kwargs...)
+function run_dmrg_ground(label, H, psi0; nsweeps, maxdim, mindim, cutoff, roofline::Bool=false, kwargs...)
     println("[warmup pass: 1 JIT sweep, results discarded]")
-    ENV["SB_IN_WARMUP"] = "1"   # gate TRACE_BOND so the latch fires on the real run, not warmup
     try
         dmrg(H, deepcopy(psi0); nsweeps=1, maxdim=10, mindim=10, cutoff=1e-12,
              outputlevel=0, use_early_exit=false)
     catch e
         println("  warmup failed: ", sprint(showerror, e))
-    finally
-        ENV["SB_IN_WARMUP"] = "0"
     end
     reset_timer!(SparseBackends.TIMER)
     reset_timer!(ITensorMPS.PROJMPO_TIMER)
-    get(ENV, "SB_FLOP_COUNT", "0") == "1" && SparseBackends.reset_flops!()
+    # Zero the roofline/flop accumulators once before the (single, non-warmup)
+    # timed dmrg call below — was gated on SB_FLOP_COUNT env var.
+    SparseBackends.reset_roofline!(roofline); SparseBackends.reset_flops!(roofline)
     GC.gc(); GC.gc()
     wall = @elapsed begin
-        result = dmrg(H, psi0; nsweeps, maxdim, mindim, cutoff, use_early_exit=false, kwargs...)
+        result = dmrg(H, psi0; nsweeps, maxdim, mindim, cutoff, use_early_exit=false, roofline=roofline, kwargs...)
     end
-    get(ENV, "SB_FLOP_COUNT", "0") == "1" && SparseBackends.report_flops(label)
+    if roofline
+        SparseBackends.report_flops(label)
+        SparseBackends.show_roofline()
+        SparseBackends.show_cas_stats()
+        ITensorMPS.print_env_footprint()
+        SparseBackends.show_gemm_dims_hist()
+    end
     println("\n========== TIMER REPORT: $label  (wall = $(round(wall; digits=3)) s, JIT excluded) ==========")
     println("\n--- ProjMPO matvec breakdown ---")
     print_timer(ITensorMPS.PROJMPO_TIMER; sortby=:firstexec)

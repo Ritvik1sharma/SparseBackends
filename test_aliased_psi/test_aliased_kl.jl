@@ -36,10 +36,10 @@ using Printf
 # KrylovKit threading is a SEPARATE knob from the aliased-kernel threading
 # (SB_ALIASED_NTHREADS). KrylovKit's __init__ defaults its count to Threads.nthreads(),
 # so launching `julia --threads=N` would silently turn on its threaded orthogonalization
-# (and confound a kernel-threading A/B). Pin it explicitly here; default 1 = serial,
-# matching every prior single-Julia-thread run. Set SB_KK_NTHREADS>1 to opt in.
+# (and confound a kernel-threading A/B). Hardened 2026-06 to the default serial
+# count (was SB_KK_NTHREADS, default-on knob, never varied off 1).
 import KrylovKit
-KrylovKit.set_num_threads(parse(Int, get(ENV, "SB_KK_NTHREADS", "1")))
+KrylovKit.set_num_threads(1)
 println("[KrylovKit threads = ", KrylovKit.get_num_threads(),
         "   Julia threads = ", Threads.nthreads(), "]")
 
@@ -48,6 +48,12 @@ include("../test_aliased_psi/setup.jl")
 
 # Schema for the initial aliased ψ (frozen across sweeps; only template numeric data updates). Used for invariance tracking.
 const _INIT_SCHEMA = Ref{Any}(nothing)
+
+# Debug toggles (were SB_SCHEMA_DBG / SB_SCHEMA_TRACK env vars) — flip to true
+# manually here to enable; SparseBackends.schema_dbg has its own independent
+# _SCHEMA_DBG const in tensor_wrappers_aliased.jl for its internal dumps.
+const _SCHEMA_DBG_ON = false
+const _SCHEMA_TRACK_ON = false
 
 
 function parse_command_line()
@@ -81,6 +87,14 @@ function parse_command_line()
             help = "Eigensolve pathway: bop_aliased (default, no densify) or bop_densify (env-dressed densified seed)."
             arg_type = String
             default = "bop_aliased"
+        "--roofline"
+            help = "Enable the consolidated roofline/flop-count/env-footprint/perm-capture/GEMM-histogram instrumentation."
+            arg_type = Bool
+            default = false
+        "--minv-from-p"
+            help = "minv_from_p kwarg: true (DEFAULT, matches dmrg) → M^{±1/2}=c^{∓…}·Lgram (from-P, skips eigendecomposition); false → eigen path."
+            arg_type = Bool
+            default = true
     end
     return parse_args(s)
 end
@@ -115,6 +129,23 @@ function build_setup(N::Int, psign::Int, spin::Int)
     function mulMPO(A, B); Bp = prime(B, "Site"); replaceprime(contract(A, Bp, :coo, :coo), 2 => 1); end
     P_sparse = ConsOps1[1]; for j in 2:length(ConsOps1); P_sparse = mulMPO(P_sparse, ConsOps1[j]); end
     H        = MPO(os, sites)
+    # Pre-order each BULK H site tensor ONCE at construction to the matvec's EXACT
+    # permB-canonical layout [Site(ket,plev0), left-link, Site(bra,plev1), right-link],
+    # so the aliased matvec's permB on the H steps (2,3) is IDENTITY — no runtime
+    # reorder. Direction-independent: the matvec chain is always Lenv→H[b]→H[b+1]→Renv,
+    # so H[b] always contracts its LEFT link (measured permB uniformly [1,2,4,3] across
+    # all bulk bonds AND both sweep directions). Correctness is name-based (position! +
+    # matvec contract by index name) → E bit-identical. Bulk only (edges differ).
+    for s in 2:(length(H) - 1)
+        Is    = collect(inds(H[s]))
+        ket   = [I for I in Is if ITensors.plev(I) == 0 && ITensors.hastags(I, "Site")]
+        bra   = [I for I in Is if ITensors.plev(I) == 1 && ITensors.hastags(I, "Site")]
+        left  = ITensors.commonind(H[s], H[s - 1])
+        right = ITensors.commonind(H[s], H[s + 1])
+        (length(ket) == 1 && length(bra) == 1 && left !== nothing && right !== nothing) || continue
+        tgt = [ket[1], left, bra[1], right]
+        Is != tgt && (H[s] = permute(H[s], tgt...))
+    end
     psi0     = random_mps(sites)
     # KEY: ψ is ALIASED (vs BS in test_sparse_kl.jl). denseLinksB=0 keeps site +
     # both bond axes in the sparse prefix. DMRG runs on the bare H (above).
@@ -124,12 +155,12 @@ end
 
 
 
-function run_sweeps(H, psi0, n_sweeps::Int, maxdim::Int; cutoff=1e-10, mindim=1, target_E=NaN, label="ALI", run_mode::Symbol=:bop_aliased)
+function run_sweeps(H, psi0, n_sweeps::Int, maxdim::Int; cutoff=1e-10, mindim=1, target_E=NaN, label="ALI", run_mode::Symbol=:bop_aliased, roofline::Bool=false, minv_from_p=nothing)
     psi = psi0
-    # SB_SCHEMA_DBG: print the P-classification (sparse keys vs dense tail) of the
+    # _SCHEMA_DBG_ON: print the P-classification (sparse keys vs dense tail) of the
     # freshly-constructed aliased ψ at each site — the reference schema that the
     # DMRG operations (orthogonalize/eigsolve/replacebond/add) should preserve.
-    if get(ENV, "SB_SCHEMA_DBG", "0") == "1"
+    if _SCHEMA_DBG_ON
         for k in 1:length(psi); SparseBackends.schema_dbg("CONSTRUCT site $k", psi[k]); end
     end
     E = NaN
@@ -137,11 +168,19 @@ function run_sweeps(H, psi0, n_sweeps::Int, maxdim::Int; cutoff=1e-10, mindim=1,
     target_reached_sweep = 0; target_reached_cum = NaN; target_reached_cum_excl1 = NaN
     for i in 1:n_sweeps
         sw = Sweeps(1); setmaxdim!(sw, maxdim); setmindim!(sw, mindim); setcutoff!(sw, cutoff)
-        t = @elapsed (E, psi, _esw, terr) = dmrg(H, psi, sw; outputlevel=0, use_early_exit=false, run_mode=run_mode)
+        _st = @timed (E, psi, _esw, terr) = dmrg(H, psi, sw; outputlevel=0, use_early_exit=false, run_mode=run_mode, roofline=roofline, minv_from_p=minv_from_p)
+        t = _st.time; _gct = _st.gctime
         cum += t; if i > 1; cum_excl1 += t; end
-        @printf("  [%s sweep %2d] t=%8.3fs  E=%.12f  maxtruncerr=%.3e\n", label, i, t, E, terr)
+        @printf("  [%s sweep %2d] t=%8.3fs  gc=%7.3fs (%.0f%%)  E=%.12f  maxtruncerr=%.3e\n", label, i, t, _gct, 100*_gct/t, E, terr)
+        # Reset timers AFTER sweep 1 (JIT/compilation) so the printed breakdown
+        # reflects STEADY-STATE only (sweeps 2..n), not JIT-polluted totals.
+        if i == 1
+            reset_timer!(ITensorMPS.PROJMPO_TIMER)
+            reset_timer!(SparseBackends.TIMER)
+            roofline && SparseBackends.reset_roofline!(roofline)
+        end
         check_aliased_invariant(psi; label="after sweep $i")
-        if get(ENV, "SB_SCHEMA_TRACK", "0") == "1" && _INIT_SCHEMA[] !== nothing
+        if _SCHEMA_TRACK_ON && _INIT_SCHEMA[] !== nothing
             _compare_schema(_INIT_SCHEMA[], _schema_fingerprint(psi); label="after sweep $i vs init")
         end
         flush(stdout)
@@ -161,6 +200,7 @@ let
     n_sweeps = parsed_args["n-sweeps"]
     maxdim   = parsed_args["maxdim"]
     target_E = parsed_args["target-energy"]
+    roofline = parsed_args["roofline"]
 
     println("=== KL benchmark — ALIASED ψ (Path-B) ===")
     println("run_mode=:$(parsed_args["run-mode"])  (Path-B: B = M⁻¹ᐟ²·H_eff·M⁻¹ᐟ²; aliased=no-densify seed, densify=env-dressed densified seed)")
@@ -172,22 +212,7 @@ let
     t_setup = @elapsed (H, psi_ali) = build_setup(N_plaq, psign, spin)
     println("Setup time: $(round(t_setup, digits=1))s.  System: $(length(psi_ali)) sites.")
     report_state("initial psi_ali", psi_ali, maxdim; verbose=true)
-    if get(ENV, "SB_INSPECT_PHI", "0") == "1"
-        println("\n========== φ index classification (per site) ==========")
-        for (i, T) in enumerate(psi_ali)
-            s = try ITensors.get_external_storage(T) catch _; nothing end
-            s isa SparseBackends.WrappedAliasedBlockSparse || continue
-            ali = s.aliased
-            NN = ndims(T); P = typeof(ali).parameters[4]; N2 = typeof(ali).parameters[3]
-            idxinfo = [(string(ITensors.tags(I)), ITensors.dim(I), ITensors.plev(I)) for I in s.inds]
-            println("site $i: N=$NN P(prefix)=$P N2(densetail)=$N2 dims=$(ali.dims) blksize=$(ali.blksize)")
-            println("   prefix axes 1:$P = ", idxinfo[1:P])
-            println("   dense  axes $(P+1):$NN = ", idxinfo[P+1:NN])
-        end
-        println("======================================================\n")
-        exit(0)
-    end
-    if get(ENV, "SB_SCHEMA_TRACK", "0") == "1"
+    if _SCHEMA_TRACK_ON
         _INIT_SCHEMA[] = _schema_fingerprint(psi_ali)
         println("  [init] captured alias schema fingerprint (keys/partition/scalars) for invariance tracking")
     end
@@ -197,9 +222,10 @@ let
     reset_timer!(ITensorMPS.PROJMPO_TIMER)
     reset_timer!(SparseBackends.TIMER)
     SparseBackends.reset_cas_stats!()
-    SparseBackends.reset_roofline!()  # self-gates on SB_ROOFLINE (the single timing flag)
+    SparseBackends.reset_roofline!(roofline)  # zero accumulators once before the sweep loop below
     println("\n=== RUN ($n_sweeps sweeps at maxdim=$maxdim; sweep 1 = JIT) ===")
-    res = run_sweeps(H, psi_ali, n_sweeps, maxdim; target_E=target_E, run_mode=Symbol(parsed_args["run-mode"]))
+    res = run_sweeps(H, psi_ali, n_sweeps, maxdim; target_E=target_E, run_mode=Symbol(parsed_args["run-mode"]), roofline=roofline,
+                     minv_from_p=(parsed_args["minv-from-p"] ? true : nothing))
     E_prof = res.E; psi_prof = res.psi
 
     avg_excl1 = n_sweeps > 1 ? res.total_excl1 / (n_sweeps - 1) : NaN
@@ -242,15 +268,19 @@ let
         println("    Datastructure regression, NOT mere overhead — diagnose before any fix (hypothesis-tag it).")
     end
 
-    # SB_ROOFLINE=1 is the ONE switch for the full kernel timing breakdown: the
+    # --roofline true is the ONE switch for the full kernel timing breakdown: the
     # per-phase roofline (GEMM-only vs A-permute / Bconv / accum / prepass /
-    # finalize+sortperm / loop bookkeeping), the CAS redundancy counters, AND the
-    # PROJMPO/SparseBackends TimerOutputs trees. Off by default — a normal run prints
+    # finalize+sortperm / loop bookkeeping), the CAS redundancy counters, the
+    # flop counter, env footprint, GEMM-dims histogram, AND the PROJMPO/
+    # SparseBackends TimerOutputs trees. Off by default — a normal run prints
     # only the per-sweep energies and the regression verdict.
-    if get(ENV, "SB_ROOFLINE", "0") == "1"
+    if roofline
         print_roofline_ceilings()
-        println("\n========== kernel roofline (SB_ROOFLINE) =========="); SparseBackends.show_roofline()
+        println("\n========== kernel roofline =========="); SparseBackends.show_roofline()
         println("\n========== CAS redundancy stats =========="); SparseBackends.show_cas_stats()
+        SparseBackends.report_flops("ALI")
+        ITensorMPS.print_env_footprint()
+        SparseBackends.show_gemm_dims_hist()
         println("\n========== ITensorMPS.PROJMPO_TIMER ==========")
         print_timer(ITensorMPS.PROJMPO_TIMER)
         println("\n========== SparseBackends.TIMER ==========")

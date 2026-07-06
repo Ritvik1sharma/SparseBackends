@@ -135,7 +135,7 @@ function contract!(
     rlab
 ) where {TC,NC,N2C,TA,NA,N2A,TB,NB,N2B,PA,PB,PC}
   axisBr = mapB[rlab]
-  if get(ENV, "SB_TRACE", "0") == "1"
+  if false  # SB_TRACE — flip to true here for debug output
     println("[SB_TRACE] contract_bs_bs.contract!  BS(blocks=", length(A.keys),
             ", PA=", PA, ", N2A=", N2A, ") × BS(blocks=", length(B.keys),
             ", PB=", PB, ", N2B=", N2B, ")  axisBr=", axisBr,

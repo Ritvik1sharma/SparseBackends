@@ -79,7 +79,7 @@ end
     s.unique_tidA += length(seen)
     s.total_MKN   += nb * M * K * N
 end
-@inline _add_dbg_enabled() = get(ENV, "SB_ALIASED_DEBUG", "0") == "1"
+@inline _add_dbg_enabled() = false  # SB_ALIASED_DEBUG removed 2026-06 — flip to true here for debug output
 @inline _add_dbg_max()     = parse(Int, get(ENV, "SB_ALIASED_DEBUG_MAX", "12"))
 
 # Linear-search position lookup. For N ≤ 8 labels this beats Dict-build +
@@ -117,7 +117,7 @@ Base.:(==)(a::_PermSig, b::_PermSig) =
     a.n_sp == b.n_sp && a.n_rd == b.n_rd && a.n_keepA == b.n_keepA &&
     a.n_keepB == b.n_keepB && a.n_cpfx == b.n_cpfx
 const _PERM_PROFILE = Dict{_PermSig, Int}()
-# Per-matvec-step permB tally (keyed by ENV["SB_STEP"]): value = [calls, permB_fired].
+# Per-matvec-step permB tally (keyed by CURRENT_STEP[]): value = [calls, permB_fired].
 # Only populated when SB_PERM_PROFILE=1. Answers "which step permutes".
 const _PERMB_STEP = Dict{String, Vector{Int}}()
 function _reset_perm_profile!()
@@ -161,7 +161,8 @@ function contract_aliased_dense_to_dense!(
     A        :: AliasedBlockSparse{TA,NA,NA2,PA},
     labelsA  :: AbstractVector{Label},
     B        :: AbstractArray{TB,NB},
-    labelsB  :: AbstractVector{Label},
+    labelsB  :: AbstractVector{Label};
+    in_position::Bool=false,
 ) where {TC,TA,NA,NA2,PA,TB,NB}
     NC = ndims(C)
     if isempty(A.keys)
@@ -210,7 +211,7 @@ function contract_aliased_dense_to_dense!(
             if _perm_profile_enabled() &&
                _PERMB_DBG_COUNT[] < parse(Int, get(ENV, "SB_PERMB_DBG_MAX", "12"))
                 _PERMB_DBG_COUNT[] += 1
-                println("\n[permB #", _PERMB_DBG_COUNT[], "] permute_B firing  (SB_STEP=", get(ENV, "SB_STEP", "?"), ")")
+                println("\n[permB #", _PERMB_DBG_COUNT[], "] permute_B firing  (step=", CURRENT_STEP[], ")")
                 println("  labelsA = ", labelsA, "  (PA = ", PA, ")")
                 println("  labelsB = ", labelsB)
                 println("  labelsC = ", labelsC)
@@ -262,12 +263,12 @@ function contract_aliased_dense_to_dense!(
         canon_labels = vcat(keepA, keepB, c_prefix)
         perm_C       = [_posin(l, labelsC) for l in canon_labels]
         if _flop_count_enabled()
-            add_reshuffle!(permB != collect(1:NB), perm_C != collect(1:NC))
+            add_reshuffle!(permB != collect(1:NB), perm_C != collect(1:NC), in_position)
         end
         if _perm_profile_enabled()
             sig = _PermSig(copy(permB), copy(perm_C), n_sp, n_rd, n_keepA, n_keepB, n_cpfx)
             _PERM_PROFILE[sig] = get(_PERM_PROFILE, sig, 0) + 1
-            _st = get(ENV, "SB_STEP", "?")
+            _st = string(CURRENT_STEP[])
             _v  = get!(_PERMB_STEP, _st, Int[0, 0])
             _v[1] += 1
             (permB != collect(1:NB)) && (_v[2] += 1)
@@ -391,7 +392,7 @@ function contract_aliased_dense_to_dense!(
         SP   = n_sp   == 0 ? 1 : prod(size(B, _posin(l, labelsB)) for l in shared_prefix)
         Cpfx = n_cpfx == 0 ? 1 : prod(A.dims[c_prefix_pos_in_A[j]] for j in 1:n_cpfx)
         denseequiv_macs = M * K * N * SP * Cpfx
-        add_aliased_macs!(actual_macs, denseequiv_macs)
+        add_aliased_macs!(actual_macs, denseequiv_macs, in_position)
     end
 
     # Lean per-block path: one fused mul!(C_slice, A_mat, B_mat, α, 1) per
@@ -409,11 +410,15 @@ function contract_aliased_dense_to_dense!(
     KN = K * N
     MN = M * N
     @timeit TIMER "add.main_loop" begin
-      if direct_rows != :none && !direct_strided
-        # Contiguous fast path: the reshR×reshCcols slice is a contiguous MN
-        # block at flat offset `base` (c_prefix trails the kept groups).
+      if direct_rows != :none
+        # Direct fused-write paths (contiguous GAP==1 or strided GAP>1): one GEMM
+        # per block straight into C's (possibly strided) slice via the SHARED
+        # `_fused_block_gemm!` helper — no permute_back. `C4` is the 4-region
+        # reshape used only on the strided path (built once here).
         row_is_B = direct_rows == :keepB
         C_vec = vec(C)
+        C4    = direct_strided ? reshape(C, reshR, reshGAP, reshCcols, reshTAIL) : C
+        RGC   = reshR * reshGAP * reshCcols
         @inbounds for ii in 1:nA
           akey = A.keys[ii]
           α    = convert(TC, A.scalars[ii])
@@ -424,38 +429,8 @@ function contract_aliased_dense_to_dense!(
           Boff = sp_lin * KN
           Bmat = reshape(view(Bp_vec, Boff + 1 : Boff + KN), K, N)
           Amat = reshape(_aliased_template_view(A, A.alias_ids[ii]), M, K)
-          Cmat = reshape(view(C_vec, base + 1 : base + MN), reshR, reshCcols)
-          if row_is_B
-            mul!(Cmat, transpose(Bmat), transpose(Amat), α, one(TC))   # N×M = Bᵀ·Aᵀ
-          else
-            mul!(Cmat, Amat, Bmat, α, one(TC))                         # M×N
-          end
-        end
-      elseif direct_rows != :none
-        # Strided direct path: a c_prefix axis sits between the kept groups, so
-        # the slice has a uniform column stride reshR·reshGAP > reshR. Still one
-        # GEMM per block — into the strided view(C4,:,g,:,t) of the pre-zeroed C.
-        row_is_B = direct_rows == :keepB
-        C4  = reshape(C, reshR, reshGAP, reshCcols, reshTAIL)
-        RGC = reshR * reshGAP * reshCcols
-        @inbounds for ii in 1:nA
-          akey = A.keys[ii]
-          α    = convert(TC, A.scalars[ii])
-          sp_lin = 0
-          for t in 1:n_sp; sp_lin += (akey[join_posA[t]] - 1) * sp_stride[t]; end
-          base = 0
-          for j in 1:n_cpfx; base += (akey[c_prefix_pos_in_A[j]] - 1) * cpfx_strideC[j]; end
-          g = (base ÷ reshR) % reshGAP
-          t = base ÷ RGC
-          Boff = sp_lin * KN
-          Bmat = reshape(view(Bp_vec, Boff + 1 : Boff + KN), K, N)
-          Amat = reshape(_aliased_template_view(A, A.alias_ids[ii]), M, K)
-          Cmat = view(C4, :, g + 1, :, t + 1)   # reshR×reshCcols, col stride reshR·reshGAP
-          if row_is_B
-            mul!(Cmat, transpose(Bmat), transpose(Amat), α, one(TC))
-          else
-            mul!(Cmat, Amat, Bmat, α, one(TC))
-          end
+          _fused_block_gemm!(C_vec, C4, base, direct_strided,
+                             reshR, reshGAP, reshCcols, RGC, MN, Amat, Bmat, α, row_is_B)
         end
       else
         Ctgt_vec = vec(Ctgt)

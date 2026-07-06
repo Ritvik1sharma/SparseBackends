@@ -15,7 +15,8 @@ export TIMER
 # (eigsolve) AND the position! environment rebuilds — so the aliased PHP path
 # can be compared FLOP-for-FLOP against the dense PHP path on the SAME workload.
 #
-# Two phases are tracked separately (via the SB_IN_POSITION flag dmrg.jl sets):
+# Two phases are tracked separately (via the `in_position` argument each
+# caller passes explicitly, e.g. from dmrg.jl's position! call):
 #   matvec   — contractions inside product() / eigsolve.
 #   position — contractions inside _makeL!/_makeR! env rebuilds.
 # and within each phase, by which backend did the work:
@@ -45,9 +46,12 @@ mutable struct _FlopCounter
     po_pB_fire :: Int;  po_pBack_fire :: Int
 end
 const FLOP_COUNTER = _FlopCounter(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-@inline _flop_count_enabled() = get(ENV, "SB_FLOP_COUNT", "0") == "1"
-@inline _flop_in_position()   = get(ENV, "SB_IN_POSITION", "0") == "1"
-function reset_flops!()
+# Cached value set by reset_flops!'s `roofline` argument (was SB_FLOP_COUNT env
+# var) — cheap Ref check at each accumulation call site in the hot matvec path.
+const _FLOP_COUNT_ON = Ref(false)
+@inline _flop_count_enabled() = _FLOP_COUNT_ON[]
+function reset_flops!(roofline::Bool=false)
+    _FLOP_COUNT_ON[] = roofline
     f = FLOP_COUNTER
     f.mv_dense_steps = 0; f.mv_dense_macs = 0
     f.mv_ali_steps = 0; f.mv_ali_macs = 0; f.mv_ali_de_macs = 0
@@ -57,28 +61,30 @@ function reset_flops!()
     return f
 end
 # Record whether the aliased kernel's permute_B / permute_back actually fired
-# (non-identity) on this call. Split matvec vs position via SB_IN_POSITION.
-@inline function add_reshuffle!(pB_fired::Bool, pBack_fired::Bool)
+# (non-identity) on this call. Split matvec vs position via the explicit
+# `in_position` argument (was SB_IN_POSITION env var — every caller now
+# passes its own known phase directly).
+@inline function add_reshuffle!(pB_fired::Bool, pBack_fired::Bool, in_position::Bool)
     f = FLOP_COUNTER
-    if _flop_in_position()
+    if in_position
         f.po_pB_fire += pB_fired; f.po_pBack_fire += pBack_fired
     else
         f.mv_pB_fire += pB_fired; f.mv_pBack_fire += pBack_fired
     end
     return nothing
 end
-@inline function add_dense_macs!(macs::Integer)
+@inline function add_dense_macs!(macs::Integer, in_position::Bool)
     f = FLOP_COUNTER
-    if _flop_in_position()
+    if in_position
         f.po_dense_steps += 1; f.po_dense_macs += macs
     else
         f.mv_dense_steps += 1; f.mv_dense_macs += macs
     end
     return nothing
 end
-@inline function add_aliased_macs!(actual_macs::Integer, denseequiv_macs::Integer)
+@inline function add_aliased_macs!(actual_macs::Integer, denseequiv_macs::Integer, in_position::Bool)
     f = FLOP_COUNTER
-    if _flop_in_position()
+    if in_position
         f.po_ali_steps += 1; f.po_ali_macs += actual_macs; f.po_ali_de_macs += denseequiv_macs
     else
         f.mv_ali_steps += 1; f.mv_ali_macs += actual_macs; f.mv_ali_de_macs += denseequiv_macs
@@ -181,7 +187,11 @@ include("tensoralgebra/contract_aliased_dense_to_dense.jl") # AliasedBS × Dense
 
 include("ops_factorize.jl")
 include("ops_factorize_qr.jl")
-include("ops_factorize_svd_owned.jl")
+# ops_factorize_svd_owned.jl (blocksparse_svd_owned_channel_aware) disabled 2026-06:
+# its only caller, itensor_blocksparse_svd_owned_channel_aware, is commented out in
+# tensor_wrappers.jl (owned-SVD variant never exercised by any script). Uncomment
+# this include + that wrapper + the mps.jl/verify_iso.jl dispatch branches to re-enable.
+# include("ops_factorize_svd_owned.jl")
 include("tensor_wrappers.jl")
 include("tensor_index.jl")
 include("tensor_contraction.jl")

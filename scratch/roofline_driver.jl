@@ -1,10 +1,12 @@
 # ROOFLINE driver (no HW counters — WSL2 has no uncore IMC PMU).
 #   Ceilings : peak ZGEMM GFLOP/s + STREAM-triad GB/s (Julia microbenchmarks).
-#   Kernel   : SB_ROOFLINE=1 accumulates exact Σ8·M·N·K FLOPs + compulsory bytes
-#              in contract_shared! (covers H-matvec AND M⁻¹ apply). Kernel time
-#              comes from SparseBackends.TIMER (printed). achieved GFLOP/s =
-#              FLOPs / kernel_contract_time;  AI = FLOPs / bytes.
-ENV["SB_ROOFLINE"]  = "1"   # single timing flag: also reports CAS redundancy stats
+#   Kernel   : dmrg(...; roofline=true) accumulates exact Σ8·M·N·K FLOPs +
+#              compulsory bytes in contract_shared! (covers H-matvec AND M⁻¹
+#              apply). Kernel time comes from SparseBackends.TIMER (printed).
+#              achieved GFLOP/s = FLOPs / kernel_contract_time; AI = FLOPs / bytes.
+# This script's whole purpose is roofline analysis, so roofline is hardcoded
+# true below rather than exposed as its own toggle.
+const ROOFLINE = true
 
 using SparseBackends, ITensors, ITensorMPS
 using LinearAlgebra, Random, Printf
@@ -47,8 +49,9 @@ function stream_triad_gbs(N=50_000_000, reps=5)
 end
 
 let
-    N=parse(Int,get(ENV,"VN","12")); md=parse(Int,get(ENV,"VMD","80")); nsw=parse(Int,get(ENV,"VSW","4"))
-    ps = get(ENV,"VPS","-1")=="-1" ? -1 : 1
+    # Were VN / VMD / VSW / VPS env vars — hardcoded, edit directly to change.
+    N = 12; md = 80; nsw = 4
+    ps = -1
     println("=== ROOFLINE  N=$N md=$md sweeps=$nsw  BLAS_threads=", BLAS.get_num_threads(), " ===")
     println("SB_ALIASED_PERCM_CAP=", get(ENV,"SB_ALIASED_PERCM_CAP","0"),
             "  (0=UNCAPPED hbd=channel×maxdim [default/benchmarked]; 1=capped hbd≤maxdim)")
@@ -59,14 +62,14 @@ let
     @printf("roofline ridge (AI*)= %.3f FLOP/byte  (peak/BW)\n", pk/bw)
 
     H, psi = build_setup(N, ps, 3)
-    SparseBackends.reset_roofline!(); SparseBackends.reset_cas_stats!()
+    SparseBackends.reset_roofline!(ROOFLINE); SparseBackends.reset_flops!(ROOFLINE); SparseBackends.reset_cas_stats!()
     reset_timer!(SparseBackends.TIMER)
     reset_timer!(ITensorMPS.PROJMPO_TIMER)
     E=NaN
     dmrg_stats = @timed begin
         for i in 1:nsw
             sw=Sweeps(1); setmaxdim!(sw,md); setmindim!(sw,1); setcutoff!(sw,1e-10)
-            (E,psi,_,_)=dmrg(H,psi,sw; outputlevel=0, use_early_exit=false)
+            (E,psi,_,_)=dmrg(H,psi,sw; outputlevel=0, use_early_exit=false, roofline=ROOFLINE)
             @printf("  [sweep %d] E=%.10f\n", i, E)
         end
     end
@@ -74,9 +77,12 @@ let
             dmrg_stats.time, dmrg_stats.gctime,
             100.0 * dmrg_stats.gctime / max(dmrg_stats.time, 1e-9),
             dmrg_stats.bytes / 2^30)
-    println("\n--- kernel FLOP/byte (SB_ROOFLINE) ---")
+    println("\n--- kernel FLOP/byte ---")
     SparseBackends.show_roofline()
     SparseBackends.show_cas_stats()
+    SparseBackends.report_flops("ROOFLINE")
+    ITensorMPS.print_env_footprint()
+    SparseBackends.show_gemm_dims_hist()
     println("\n--- SparseBackends.TIMER (for kernel contract time) ---")
     print_timer(SparseBackends.TIMER; sortby=:time)
     println("\n--- ITensorMPS.PROJMPO_TIMER ---")

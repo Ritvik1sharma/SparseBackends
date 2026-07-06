@@ -34,6 +34,10 @@ function parse_command_line()
             help = "If set, log the first sweep at which E ≤ target (does not early-exit)."
             arg_type = Float64
             default = NaN
+        "--roofline"
+            help = "Enable the consolidated roofline/flop-count/env-footprint/perm-capture/GEMM-histogram instrumentation."
+            arg_type = Bool
+            default = false
     end
     return parse_args(s)
 end
@@ -250,7 +254,7 @@ function report_state(label, psi, E=nothing; verbose=false)
 end
 
 function run_sweeps(H, psi0, n_sweeps::Int, maxdim::Int;
-                     cutoff=1e-10, mindim=1, target_E=NaN)
+                     cutoff=1e-10, mindim=1, target_E=NaN, roofline::Bool=false)
     psi = psi0
     E = NaN
     sweep_times = Float64[]
@@ -263,7 +267,7 @@ function run_sweeps(H, psi0, n_sweeps::Int, maxdim::Int;
     for i in 1:n_sweeps
         sw = Sweeps(1)
         setmaxdim!(sw, maxdim); setmindim!(sw, mindim); setcutoff!(sw, cutoff)
-        t = @elapsed (E, psi, _esw, terr) = dmrg(H, psi, sw; outputlevel=0, use_early_exit=false, run_mode=:iso)
+        t = @elapsed (E, psi, _esw, terr) = dmrg(H, psi, sw; outputlevel=0, use_early_exit=false, run_mode=:iso, roofline=roofline)
         push!(sweep_times, t); push!(sweep_energies, E)
         cum += t
         if i > 1; cum_excl1 += t; end
@@ -285,6 +289,7 @@ let
     n_sweeps = parsed_args["n-sweeps"]
     maxdim_target = parsed_args["maxdim"]
     target_E = parsed_args["target-energy"]
+    roofline = parsed_args["roofline"]
 
     println("run_mode = :iso  (standard eigsolve, no M⁻¹ wrap)")
     println("Projector sign = $psign  (P = ∏(I", psign > 0 ? "+" : "-", "C)/2)")
@@ -297,7 +302,7 @@ let
     reset_timer!(ITensorMPS.PROJMPO_TIMER)
     reset_timer!(SparseBackends.TIMER)
     println("\n=== RUN ($n_sweeps sweeps at maxdim=$maxdim_target; sweep 1 = JIT) ===")
-    res = run_sweeps(H_sp, psi_sp, n_sweeps, maxdim_target; target_E=target_E)
+    res = run_sweeps(H_sp, psi_sp, n_sweeps, maxdim_target; target_E=target_E, roofline=roofline)
     E_prof = res.E; psi_prof = res.psi
 
     avg_excl1 = n_sweeps > 1 ? res.total_excl1 / (n_sweeps - 1) : NaN
@@ -324,7 +329,7 @@ let
     print_timer(ITensorMPS.PROJMPO_TIMER)
     println("\n========== SparseBackends.TIMER ==========")
     print_timer(SparseBackends.TIMER)
-    if get(ENV, "GEMM_DIMS_HIST", "0") == "1"
+    if roofline
         SparseBackends.show_gemm_dims_hist()
     end
 end

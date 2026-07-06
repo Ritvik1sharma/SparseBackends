@@ -4,9 +4,29 @@
 #   (b) block-sparse/structured? → |M| text heatmap (zeros vs nonzeros)
 #   (c) how rank compares to φ's n_keys / dedup (the "rank ≈ n_c/dedup" hypothesis)
 #
-# Run:  DIAG_N_PLAQ=1 DIAG_MAXDIM=10 julia --project=.. diag_gram_structure.jl
+# Run:  julia --project=.. diag_gram_structure.jl --N-plaq 1 --maxdim 10
 using SparseBackends, ITensors, ITensorMPS, LinearAlgebra, Printf, Random
+using ArgParse
 include("../test_sparse_psi/utils.jl")
+
+function parse_command_line()
+    s = ArgParseSettings()
+    @add_arg_table s begin
+        "--N-plaq"
+            help = "Number of plaquettes (N)"
+            arg_type = Int
+            default = 1
+        "--maxdim"
+            help = "Bond-dimension cap"
+            arg_type = Int
+            default = 10
+        "--n-sweeps"
+            help = "DMRG sweeps (0 = skip DMRG, gram-structure only)"
+            arg_type = Int
+            default = 2
+    end
+    return parse_args(s)
+end
 
 function build_setup(N, psign, spin)
     Random.seed!(42)
@@ -68,9 +88,11 @@ function show_matrix(nm, G)
     println("    → separable channel⊗mult (rank-1)? ", r2 < 1e-6, "   (σ₂/σ₁=$(round(r2; sigdigits=3)))")
 end
 
-N  = parse(Int, get(ENV, "DIAG_N_PLAQ", "1"))
-md = parse(Int, get(ENV, "DIAG_MAXDIM", "10"))
-nsw = parse(Int, get(ENV, "DIAG_NSWEEPS", "2"))
+# Was DIAG_N_PLAQ / DIAG_MAXDIM / DIAG_NSWEEPS env vars.
+_args = parse_command_line()
+N   = _args["N-plaq"]
+md  = _args["maxdim"]
+nsw = _args["n-sweeps"]
 H, psi = build_setup(N, -1, 3)
 println("N_plaq=$N  n_sites=$(length(psi))  maxdim=$md")
 if nsw > 0

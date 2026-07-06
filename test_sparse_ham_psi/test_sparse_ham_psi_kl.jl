@@ -25,9 +25,10 @@
 # NOT the iso path — Path-B is dmrg()'s default run_mode=:bop_aliased, so no
 # explicit run_mode is needed here. The validated aliased-ψ recipe is the 5-gate
 # fix from ../test_aliased_psi/README.md ("RESOLVED"):
-#   BMF_BOP_PROJECT=1  BMF_MINV_RTOL=1e-2  SB_ALIASED_NATIVE_FISSION=1
+#   BMF_BOP_PROJECT=1  BMF_MINV_RTOL=1e-2
 #   SB_ALIASED_PERCM_CAP=1  SB_USE_QR=1  SB_BALANCED_OWNERSHIP=1  SB_ADAPTIVE_RANK=1
-# (SB_ALIASED_MINV_HINT dropped 2026-06: now hardcoded on unconditionally.)
+# (SB_ALIASED_MINV_HINT, SB_ALIASED_NATIVE_FISSION, SB_ALIASED_MINV_WRAP dropped
+# 2026-06: now hardcoded on unconditionally.)
 # These are defaulted ON below (overridable from the environment).
 #
 # ⚠ STATUS: this aliased-ψ × aliased-PHP combination is NEW and was NOT validated
@@ -44,7 +45,6 @@
 # ── Default the aliased-ψ Path-B gate set ON (all overridable). ────────────────
 ENV["BMF_BOP_PROJECT"]          = get(ENV, "BMF_BOP_PROJECT", "1")      # B = M⁻¹ᐟ²·H_eff·M⁻¹ᐟ², range(M) projection.
 ENV["BMF_MINV_RTOL"]            = get(ENV, "BMF_MINV_RTOL", "1e-2")     # aggressive pseudo-inverse cutoff.
-ENV["SB_ALIASED_NATIVE_FISSION"]= get(ENV, "SB_ALIASED_NATIVE_FISSION", "1")# dedup-preserving fission.
 ENV["SB_ALIASED_PERCM_CAP"]     = get(ENV, "SB_ALIASED_PERCM_CAP", "1")     # honest BD ≤ maxdim.
 ENV["SB_USE_QR"]                = get(ENV, "SB_USE_QR", "1")
 ENV["SB_BALANCED_OWNERSHIP"]    = get(ENV, "SB_BALANCED_OWNERSHIP", "1")
@@ -54,17 +54,7 @@ ENV["SB_ADAPTIVE_RANK"]         = get(ENV, "SB_ADAPTIVE_RANK", "1")
 # (2 sites + 2 fused links) + 2 dense structure, and the env/matvec reductions
 # act on single shared links. Required for the both-aliased path.
 ENV["SB_FUSE_LINKS"]            = get(ENV, "SB_FUSE_LINKS", "1")
-# Keep the matvec environment aliased (both-aliased run) so its multiplicity
-# axes stay dense and the union hint avoids the prefix/dense crossover.
-ENV["SB_ALIASED_AA_ENV"]        = get(ENV, "SB_ALIASED_AA_ENV", "1")
-ENV["SB_ALIASED_AA_HINT"]       = get(ENV, "SB_ALIASED_AA_HINT", "1")
-# Relayout the M^{−1/2} factors as aliased (φ's channel→prefix / mult→dense
-# split) so the pre-H M⁻¹ apply stays canonical without forced fission. This is
-# the case-4 fix for the md=16 prefix/dense crossover (the dense factor parked
-# the output channel in the dense tail). Threaded both_aliased gate in dmrg.jl
-# keeps case 2 (dense H) on dense factors ⇒ byte-identical.
-ENV["SB_ALIASED_MINV_WRAP"]     = get(ENV, "SB_ALIASED_MINV_WRAP", "1")
-
+# SB_ALIASED_AA_ENV / SB_ALIASED_AA_HINT hardened 2026-06 — always on now.
 using SparseBackends, ITensors, ITensorMPS
 using TimerOutputs: reset_timer!, print_timer
 using LinearAlgebra: I as eye, norm, BLAS
@@ -233,12 +223,11 @@ end
 # ── Per-sweep DMRG with the alias invariant checked after every sweep. ────────
 function run_sweeps(H, psi0, n_sweeps::Int, maxdim::Int; cutoff=1e-10, mindim=1,
                     target_E=NaN, label="ALI", check_alias=true)
-    ENV["SB_RUN_LABEL"] = label   # tags env-footprint snapshots (SB_ENV_FOOTPRINT)
     psi = psi0; E = NaN; cum = 0.0; cum_excl1 = 0.0
     tr_sweep = 0; tr_cum = NaN; tr_cum_excl1 = NaN
     for i in 1:n_sweeps
         sw = Sweeps(1); setmaxdim!(sw, maxdim); setmindim!(sw, mindim); setcutoff!(sw, cutoff)
-        t = @elapsed (E, psi) = dmrg(H, psi, sw; outputlevel=0, use_early_exit=false)
+        t = @elapsed (E, psi) = dmrg(H, psi, sw; outputlevel=0, use_early_exit=false, run_label=label)
         cum += t; if i > 1; cum_excl1 += t; end
         @printf("  [%s sweep %2d] t=%8.3fs  E=%.12f\n", label, i, t, E)
         check_alias && check_aliased_invariant(psi; label="$label after sweep $i")
@@ -263,8 +252,7 @@ let
 
     println("=== KL benchmark — ALIASED ψ × ALIASED PHP (Path-B) ===")
     println("BMF_BOP_PROJECT=", ENV["BMF_BOP_PROJECT"], "  BMF_MINV_RTOL=", ENV["BMF_MINV_RTOL"])
-    println("SB_ALIASED_NATIVE_FISSION=", ENV["SB_ALIASED_NATIVE_FISSION"],
-            "  SB_ALIASED_PERCM_CAP=", ENV["SB_ALIASED_PERCM_CAP"])
+    println("SB_ALIASED_PERCM_CAP=", ENV["SB_ALIASED_PERCM_CAP"])
     println("Projector sign = $psign  (P = ∏(I", psign > 0 ? "+" : "-", "C)/2)")
     println("N_plaq=$N_plaq  spin=$spin  n_sweeps=$n_sweeps  maxdim=$maxdim  target_E=$(isnan(target_E) ? "—" : target_E)  dense_ref=$do_dense")
     println("⚠ NEW combination (aliased ψ × aliased PHP) — confidence LOW until the dense-ref |ΔE| check passes.")

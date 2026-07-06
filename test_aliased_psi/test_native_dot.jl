@@ -1,3 +1,14 @@
+# test_native_dot.jl — RETIRED 2026-06, entire file commented out.
+# This script A/B-tested SB_ALIASED_NATIVE_DOT (the native aliased scalar-dot
+# fast path) vs the densify fallback. That code path was retired and commented
+# out at its call site in tensor_wrappers_aliased.jl (SB_ALIASED_NATIVE_DOT is
+# no longer read anywhere), so this script now only ever exercises the
+# densify-fallback arm on both sides of the A/B — it is testing dead
+# functionality and its results are meaningless. Kept as reference; uncomment
+# both this file's body and the native-dot block in tensor_wrappers_aliased.jl
+# together if the native-dot path is ever revived.
+
+#=
 # test_native_dot.jl — correctness + fire-count for #1 (native aliased dot) and
 # #2 (Ffull scratch pool). Runs the SAME problem with the gates OFF then ON in
 # one process (gates are read per-call via ENV) and checks per-sweep energy is
@@ -8,11 +19,12 @@
 # Run (single job, pinned, no contention):
 #   cd /home/ritvik/temp/temp/edited_packages
 #   taskset -c 0,2,4,6,8,10 env OPENBLAS_NUM_THREADS=6 OMP_NUM_THREADS=6 \
-#     VN=12 VMD=40 VSW=4 julia --project=. --threads=1 test_aliased_psi/test_native_dot.jl
+#     julia --project=. --threads=1 test_aliased_psi/test_native_dot.jl
+#   (N/MD/NSW below are hardcoded consts now, not VN/VMD/VSW env vars)
 # standard aliased gates (match the benchmarked regime)
 for (k, v) in ("SB_ALIASED_PERCM_CAP"=>"0", "SB_USE_QR"=>"1", "SB_BALANCED_OWNERSHIP"=>"1",
                "SB_ADAPTIVE_RANK"=>"1",
-               "SB_ALIASED_NATIVE_FISSION"=>"1", "BMF_BOP_PROJECT"=>"1", "BMF_MINV_RTOL"=>"1e-2")
+               "BMF_BOP_PROJECT"=>"1", "BMF_MINV_RTOL"=>"1e-2")
     ENV[k] = v
 end
 
@@ -41,13 +53,12 @@ function build_setup(N::Int, psign::Int, spin::Int)
     return H, psi
 end
 
-const N  = parse(Int, get(ENV, "VN", "12"))
-const MD = parse(Int, get(ENV, "VMD", "40"))
-const NSW = parse(Int, get(ENV, "VSW", "4"))
+const N   = 12
+const MD  = 40
+const NSW = 4
 
-function runE(native_dot::Bool, kernel_pool::Bool, align::Bool=native_dot)
+function runE(native_dot::Bool, align::Bool=native_dot)
     ENV["SB_ALIASED_NATIVE_DOT"]   = native_dot ? "1" : "0"
-    ENV["SB_ALIASED_KERNEL_POOL"]  = kernel_pool ? "1" : "0"
     ENV["SB_ALIASED_ALIGN_OUTPUT"] = align ? "1" : "0"
     H, psi = build_setup(N, -1, 3)               # deterministic (seed 42)
     SparseBackends.reset_dot_hits!()
@@ -64,11 +75,11 @@ end
 
 println("=== test_native_dot  N=$N md=$MD sweeps=$NSW  BLAS=", BLAS.get_num_threads(), " ===")
 println("ISOLATION A/B: both arms run lean-dot + Ffull-pool; only ALIGN_OUTPUT differs.")
-println("--- run 1/3: warmup ---"); runE(true, true, false)
+println("--- run 1/3: warmup ---"); runE(true, false)
 println("--- run 2/3: baseline (lean+pool, ALIGN OFF) ---")
-Eoff, no, do_, gib_off, gc_off, t_off, rc_off, aok_off, afb_off = runE(true, true, false)
+Eoff, no, do_, gib_off, gc_off, t_off, rc_off, aok_off, afb_off = runE(true, false)
 println("--- run 3/3: treatment (lean+pool, ALIGN ON) ---")
-Eon, n1, d1, gib_on, gc_on, t_on, rc_on, aok_on, afb_on = runE(true, true, true)
+Eon, n1, d1, gib_on, gc_on, t_on, rc_on, aok_on, afb_on = runE(true, true)
 
 @printf("\nsweep        E_off                 E_on               |ΔE|\n")
 for i in 1:NSW
@@ -92,3 +103,4 @@ end
 @printf("  OFF: alloc=%.2f GiB  GC=%.2fs  wall=%.2fs\n", gib_off, gc_off, t_off)
 @printf("  ON : alloc=%.2f GiB  GC=%.2fs  wall=%.2fs   (Δalloc=%.2f GiB, %.1f%%)\n",
         gib_on, gc_on, t_on, gib_off-gib_on, 100*(gib_off-gib_on)/max(gib_off,1e-9))
+=#

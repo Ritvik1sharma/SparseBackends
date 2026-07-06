@@ -97,18 +97,39 @@ const _RF_SETUP_NS = Ref(0.0)
 # time + how often permA is non-identity (i.e. an actual permutedims fires).
 const _RF_PERMA_NS = Ref(0.0); const _RF_PERMA_HITS = Ref(0); const _RF_PERMA_CALLS = Ref(0)
 const _SETUP_DBG_N = Ref(0)   # SB_SETUP_DBG: one-shot dump of permA/permB index orderings
-reset_roofline!() = (_RF_ON[] = get(ENV,"SB_ROOFLINE","0")=="1"; _RF_FLOPS[]=0.0; _RF_BYTES[]=0.0; _RF_NGEMM[]=0; _RF_GEMM_NS[]=0.0;
+# Path the SparseBackends/ITensorMPS permute-profile writers append to when
+# roofline is on (was SB_PERMUTE_PROFILE=<path>; now a real reset_roofline!
+# argument, default value below, not a bare env-configurable path). The
+# NDTensors.jl writer is a separate, cross-package case — see its own file;
+# it still reads SB_PERMUTE_PROFILE from ENV since NDTensors cannot depend on
+# SparseBackends (dependency graph runs the other way) and dmrg() has no call
+# chain into that specific function to pass an argument.
+const _RF_PERMUTE_PATH = Ref{String}("roofline_permute_profile.tsv")
+reset_roofline!(roofline::Bool=false, permute_profile_path::String="roofline_permute_profile.tsv") =
+                    (_RF_ON[] = roofline; _RF_PERMUTE_PATH[] = permute_profile_path;
+                     _RF_FLOPS[]=0.0; _RF_BYTES[]=0.0; _RF_NGEMM[]=0; _RF_GEMM_NS[]=0.0;
                      _RF_CONV_NS[]=0.0; _RF_ACC_NS[]=0.0; _RF_PRE_NS[]=0.0; _RF_ALLOC_NS[]=0.0; _RF_FIN_NS[]=0.0; _RF_LOOP_NS[]=0.0;
                      _RF_BLAS_SWITCH_NS[]=0.0; _RF_SPAWN_NS[]=0.0; _RF_REDUCE_NS[]=0.0; _RF_SETUP_NS[]=0.0;
                      _RF_PERMA_NS[]=0.0; _RF_PERMA_HITS[]=0; _RF_PERMA_CALLS[]=0)
 
-# THE single timing/instrumentation switch. SB_ROOFLINE=1 is the ONLY env flag:
-# it turns on the per-phase _RF timers (GEMM-only vs A-permute / Bconv / accum /
-# prepass / finalize+sortperm / loop bookkeeping) AND the CAS redundancy counters,
-# and both are reported when it is set. There is no separate SB_CAS_STATS env var
-# (CAS counting is gated on this) and SB_FUSION_DIAG is removed for now (it built a
-# per-call dict that perturbed the path being measured).
-@inline _roofline_on() = get(ENV, "SB_ROOFLINE", "0") == "1"
+# Cheap on/off toggle that dmrg(...; roofline=...) calls on EVERY invocation —
+# unlike reset_roofline!()/reset_flops!() (which also zero the accumulators,
+# meant to be called once by a script before a multi-sweep loop so stats
+# accumulate across the whole run), this only flips the enabled flags so a
+# per-sweep dmrg() loop doesn't wipe earlier sweeps' accumulated counts.
+set_roofline!(roofline::Bool) = (_RF_ON[] = roofline; _FLOP_COUNT_ON[] = roofline)
+
+# THE single timing/instrumentation switch. `reset_roofline!`'s `roofline`
+# argument (was SB_ROOFLINE=1 env var) is the ONLY control: it turns on the
+# per-phase _RF timers (GEMM-only vs A-permute / Bconv / accum / prepass /
+# finalize+sortperm / loop bookkeeping) AND the CAS redundancy counters, AND
+# (via dmrg's roofline kwarg) SB_FLOP_COUNT/SB_ENV_FOOTPRINT/SB_PERM_CAPTURE/
+# GEMM_DIMS_HIST/the permute-profile TSV — all reported/written when it's on.
+# There is no separate SB_CAS_STATS flag (CAS counting is gated on this) and
+# SB_FUSION_DIAG is removed for now (it built a per-call dict that perturbed
+# the path being measured). `_RF_ON` is the cached value set by
+# `reset_roofline!` above — cheap to check in the hot GEMM path.
+@inline _roofline_on() = _RF_ON[]
 @inline function _rf_gemm!(M::Int, N::Int, K::Int)
     if _RF_ON[]
         _RF_FLOPS[] += 8.0*M*N*K
@@ -391,6 +412,32 @@ end
     mul!(C, transpose(B2), transpose(A))
 end
 
+# ── Shared FUSED strided block-write ─────────────────────────────────────────
+# Accumulate α·(Amat·Bmat) — or the transposed Bᵀ·Aᵀ for a keepB-leading output —
+# straight into the destination block's slice, in the REQUESTED axis layout, with
+# NO separate permutedims. Two placements, selected by `strided`:
+#   • contiguous: the M×N block is a flat run of length `MN` at offset `base`
+#     (reshape reshR×reshCcols; c_prefix / kept trailing).
+#   • strided:    a gap axis sits between the kept groups ⇒ the slice has a uniform
+#     column stride reshR·reshGAP ⇒ a view of the 4-region reshape `C4`
+#     (reshR, reshGAP, reshCcols, reshTAIL) at (g,t) decoded from `base`.
+# This is the per-block write lifted verbatim from contract_aliased_dense_to_dense!
+# so BOTH that kernel and the output-stationary aliased→aliased kernel share ONE
+# implementation (the reorder is folded into the write). `C_vec` = vec(dest);
+# `C4` = the 4-region reshape (only read when `strided`).
+@inline function _fused_block_gemm!(C_vec, C4, base::Int, strided::Bool,
+        reshR::Int, reshGAP::Int, reshCcols::Int, RGC::Int, MN::Int,
+        Amat, Bmat, α::TC, row_is_B::Bool) where {TC}
+    Cmat = strided ? view(C4, :, (base ÷ reshR) % reshGAP + 1, :, base ÷ RGC + 1) :
+                     reshape(view(C_vec, base + 1 : base + MN), reshR, reshCcols)
+    if row_is_B
+        mul!(Cmat, transpose(Bmat), transpose(Amat), α, one(TC))   # N×M = Bᵀ·Aᵀ
+    else
+        mul!(Cmat, Amat, Bmat, α, one(TC))                         # M×N
+    end
+    return nothing
+end
+
 function _iter_runs(f, A, join_posA, n_sp, sp_strides, Bp, NB, K, N, Nm)
     iA = firstindex(A.keys); nA = lastindex(A.keys)
     @inbounds while iA <= nA
@@ -414,14 +461,14 @@ end
 # Fused-GEMM output buffer Ffull holds ALL Nm moved-keepB slabs at once:
 # AthenB ⇒ (M, N·Nm), BthenA ⇒ (N·Nm, M). Backed by a task-local pool (default;
 # resize! ≈ no-op after warmup, and it's fully overwritten by each GEMM so reuse
-# is safe). SB_ALIASED_KERNEL_POOL=0 forces a fresh allocation per call.
+# is safe). Hardened 2026-06 — always pooled (was SB_ALIASED_KERNEL_POOL,
+# default-on knob); the fresh-allocation fallback is commented out below, not
+# deleted.
 function _alloc_ffull(::Type{TC}, M::Int, N::Int, Nm::Int, mode::Symbol) where {TC}
     frows, fcols = mode === :AthenB ? (M, N * Nm) : (N * Nm, M)
-    if get(ENV, "SB_ALIASED_KERNEL_POOL", "1") == "1"
-        fb = _ws_ffull(TC); resize!(fb, frows * fcols)
-        return reshape(fb, frows, fcols)          # dense-Vector reshape ⇒ Matrix{TC}
-    end
-    return Matrix{TC}(undef, frows, fcols)
+    fb = _ws_ffull(TC); resize!(fb, frows * fcols)
+    return reshape(fb, frows, fcols)          # dense-Vector reshape ⇒ Matrix{TC}
+    # return Matrix{TC}(undef, frows, fcols)  # SB_ALIASED_KERNEL_POOL=0 fallback (removed)
 end
 
 # Single-pass: cid for output key `ck`, assigned on first sight (in iteration
@@ -656,10 +703,9 @@ end
 #
 # Same call signature as _contract_dense_serial! (drop-in dispatch), plus a trailing
 # `out_dense_perm` (default nothing). Two regimes, selected by that arg:
-#   • out_dense_perm === nothing  (default / non-SB_OUTSTAT_SCHED path): unchanged behaviour
-#     — GEMM in the dispatcher-chosen `mode` (:AthenB/:BthenA), plain finalize. Byte-identical
-#     to before, so runs that don't opt in are unaffected.
-#   • out_dense_perm !== nothing  (SB_OUTSTAT_SCHED): the kernel OWNS every requested order.
+#   • out_dense_perm === nothing  (non-BLAS / generic fallback): unchanged behaviour
+#     — GEMM in the dispatcher-chosen `mode` (:AthenB/:BthenA), plain finalize.
+#   • out_dense_perm !== nothing  (the hardened always-on BLAS path): the kernel OWNS every requested order.
 #     It always GEMMs in natural :AthenB [keepA, keepB] order, then applies ONE `permutedims`
 #     phase (`out_dense_perm`, computed from labels in contract_shared!) to reach the requested
 #     order — AthenB→identity, BthenA→swap, interleaved→interleave. `permutedims` on the aliased
@@ -690,7 +736,7 @@ function _contract_dense_serial_outstat!(
     out_dense_perm = nothing,
 ) where {TC,NC,N2C,PC,TA,NA,N2A,PA}
 
-    # SB_OUTSTAT_SCHED path ⇔ out_dense_perm provided: own every order via a permute phase.
+    # Hardened always-on BLAS path ⇔ out_dense_perm provided: own every order via a permute phase.
     _use_perm = out_dense_perm !== nothing
 
     nkeys = length(A.keys)
@@ -1075,7 +1121,7 @@ function contract_shared!(
     out_dense_perm = Int[findfirst(==(Cdense[j]), _os_nat_dense) for j in 1:length(Cdense)]
     if get(ENV, "SB_PERM_DBG", "0") == "1"
         _isid = all(j -> out_dense_perm[j] == j, eachindex(out_dense_perm))
-        println("[PERM_DBG bond=", get(ENV, "SB_BONDTYPE", "?"), " step=", get(ENV, "SB_STEP", "?"),
+        println("[PERM_DBG bond=", get(ENV, "SB_BONDTYPE", "?"), " step=", CURRENT_STEP[],
                 "] mode=", mode, " identity=", _isid, " out_dense_perm=", out_dense_perm,
                 "\n    requested Cdense=", Cdense, "  natural[keepA;keepB]=", _os_nat_dense,
                 "  desired_keepA=", desired_keepA, " desired_keepB=", desired_keepB)
@@ -1100,10 +1146,10 @@ function contract_shared!(
     moved_keepA = [lab for lab in keepA0 if !(lab in desired_keepA_set)]
     moved_keepB = [lab for lab in keepB0 if !(lab in desired_keepB_set)]
     has_fission = !isempty(moved_keepA) || !isempty(moved_keepB) || allowed_keys_C !== nothing
-    # DIAGNOSTIC: force BS-delegation fallback to bypass native fission kernel.
-    # Toggle with SB_ALIASED_NATIVE_FISSION=1 to use native; default off (BS fallback).
-    if has_fission &&
-       (allowed_keys_C !== nothing || get(ENV, "SB_ALIASED_NATIVE_FISSION", "1") != "1")  # native fission default ON (hardened 2026-06)
+    # Native fission kernel hardened 2026-06 — always on (was
+    # SB_ALIASED_NATIVE_FISSION, default-on knob; the BS-delegation fallback
+    # below is now reached only when allowed_keys_C requires it).
+    if has_fission && allowed_keys_C !== nothing
         return _aliased_shared_via_bs_fission!(C, labelsC, A, labelsA, B, labelsB,
             mapA, mapB, shared_labels;
             output_inds_hint=output_inds_hint, allowed_keys_C=allowed_keys_C)
@@ -1123,7 +1169,7 @@ function contract_shared!(
             _RF_ON[] && (_RF_PERMA_HITS[] += 1)
             get(ENV, "SB_PERMA_DBG", "0") == "1" &&
                 println("[PERMA_FIRED bond=", get(ENV,"SB_BONDTYPE","?"),
-                        " step=", get(ENV,"SB_STEP","?"), "] permA=", permA)
+                        " step=", CURRENT_STEP[], "] permA=", permA)
             A       = permutedims(A, permA)
             labelsA = labelsA[permA]
             mapA    = Dict(l => i for (i, l) in enumerate(labelsA))
@@ -1141,6 +1187,12 @@ function contract_shared!(
         @assert length(permB) == NB "B perm length mismatch; labelsB must match B ndims"
         Bp = _is_identity_perm(permB) ? B :
             (@timeit TIMER "cas.permuteB" permutedims(B, permB))
+        # permB-fire probe (reuses SB_PERMA_DBG): shows per-step whether B's INPUT
+        # order already matches the desired [shared_prefix, red_dense, keepB] layout
+        # (identity ⇒ no permute) or differs (permB fires).
+        get(ENV, "SB_PERMA_DBG", "0") == "1" && !_is_identity_perm(permB) &&
+            println("[PERMB_FIRED bond=", get(ENV,"SB_BOND","?"),
+                    " step=", CURRENT_STEP[], "] permB=", permB)
 
         if get(ENV, "SB_SETUP_DBG", "0") == "1" &&
            _SETUP_DBG_N[] < parse(Int, get(ENV, "SB_SETUP_DBG_MAX", "9"))
@@ -1152,7 +1204,7 @@ function contract_shared!(
             arep = join([string(i<=PA ? "P" : "d", "[", A.dims[i], "]", rolA(labelsA[i])) for i in 1:NA], "  ")
             crep = join([string(i<=PC ? "P" : "d", "[", C.dims[i], "]") for i in 1:NC], "  ")
             println("[SETUP #", _SETUP_DBG_N[], "] bond=", get(ENV, "SB_BOND", "?"),
-                    " step=", get(ENV, "SB_STEP", "?"), "  PA=", PA, " NA=", NA, " → PC=", PC, " NC=", NC,
+                    " step=", CURRENT_STEP[], "  PA=", PA, " NA=", NA, " → PC=", PC, " NC=", NC,
                     "   permA=", permA, " (id? ", _is_identity_perm(permA), ")")
         end
     end
@@ -1267,10 +1319,11 @@ function contract_shared!(
     # Only the original loop uses combined_tid_map; only original+fusion-pending use the
     # key_to_alias/accum dicts → skip allocating them for the fast paths that don't.
     combined_tid_map = Dict{NTuple{4,Int}, Int}()
-    # Persistent (task-local) pending buffer when prealloc is on, so its capacity
-    # is reused across the many matvec calls (resize! ≈ no-op after warmup).
-    pending  = get(ENV, "SB_ALIASED_PREALLOC_BUF", "1") == "1" ?   # default ON (hardened 2026-06: bit-identical, −56% alloc / −35%/sweep)
-               (let p = _ws_pending(TC); empty!(p); p end) : TC[]
+    # Persistent (task-local) pending buffer, so its capacity is reused across
+    # the many matvec calls (resize! ≈ no-op after warmup). Hardened 2026-06 —
+    # always on (was SB_ALIASED_PREALLOC_BUF, default-on knob; bit-identical,
+    # −56% alloc / −35%/sweep).
+    pending  = (let p = _ws_pending(TC); empty!(p); p end)
 
     key_to_alias = Dict{NTuple{PC,Int}, Tuple{Int,TC}}()
     key_to_accum = Dict{NTuple{PC,Int}, Vector{TC}}()
@@ -1283,10 +1336,11 @@ function contract_shared!(
     Mmov_total = (n_movA == 0) ? 1 : Mmov
     Nmov_total = (n_movB == 0) ? 1 : Nmov
 
-    # Preallocated template buffer (SB_ALIASED_PREALLOC_BUF=1): GEMM into a
-    # reused scratch matrix and write the result directly into a preallocated
-    # `pending` buffer (resize! amortized geometric growth)
-    _prealloc_buf = get(ENV, "SB_ALIASED_PREALLOC_BUF", "1") == "1"   # default ON (hardened 2026-06)
+    # Preallocated template buffer: GEMM into a reused scratch matrix and write
+    # the result directly into a preallocated `pending` buffer (resize!
+    # amortized geometric growth). Hardened 2026-06 — always on (was
+    # SB_ALIASED_PREALLOC_BUF, default-on knob).
+    _prealloc_buf = true
     _cas_stats = _roofline_on()   # CAS redundancy counting is reported under SB_ROOFLINE (no separate env var)
     blksize = C.blksize
     # P1 (BS-mirrored, hardened 2026-06): pass the strided template/B slices straight
@@ -1319,45 +1373,23 @@ function contract_shared!(
             c_src_kind, c_src_idx, movA_dims_vec, movB_dims_vec, movA_strides, movB_strides,
             _kernel_nt, pending)
     else
-        # ── SB_OUTSTAT_SCHED=1: output-stationary OWNS every can_blas aliased×dense call ──
-        # (any requested order, realized by the kernel's permute phase via out_dense_perm).
-        # Additive + default OFF ⇒ runs that don't set it are byte-identical to before.
-        # (Mutual-exclusion check against the legacy A/B hook removed 2026-06 along with the
-        # hook itself — SB_ALIASED_LEGACY is retired, see below.)
-        _sched_on = get(ENV, "SB_OUTSTAT_SCHED", "0") == "1"
-        if _sched_on && can_blas
+        # ── OUTPUT-STATIONARY SCHED (HARDENED 2026-07, was the SB_OUTSTAT_SCHED env gate) ──
+        # Output-stationary OWNS every can_blas aliased×dense call: any requested output
+        # order is realized by the kernel's single permute phase via `out_dense_perm`
+        # (computed from labels), so there is no scatter, no `lmap`, and no reduction-
+        # stationary fallback for the BLAS case. Bit-identical E; kills the per-slab
+        # scatter/accum that the interleaved-lmap path paid. The only remaining call into
+        # the reduction-stationary kernel below is the non-BLAS (`!can_blas`) case.
+        if can_blas
             return @timeit TIMER "kbd.serial_outstat" _contract_dense_serial_outstat!(C, A, Bp, blksize, M, N, K, Nm, Mmov_total, Nmov_total,
                 n_sp, NB, join_posA, sp_strides, _bconv, _noconv, mode, can_blas,
                 c_src_kind, c_src_idx, movA_dims_vec, movB_dims_vec, movA_strides, movB_strides,
                 _fuse, _direct, _sp, _prealloc_buf, _cas_stats, _fusion_diag,
                 pending, key_to_alias, key_to_accum, combined_tid_map, Cscratch, _fgroups, nothing, out_dense_perm)
         end
-        # A/B HOOK (retired 2026-06, was SB_ALIASED_LEGACY=1): routed to the pre-session
-        # legacy reduction-stationary kernel (append!-copy finalize, from git HEAD) for
-        # back-to-back finalize-cost comparison against outstat. Settled — commented out
-        # in place, not deleted; contract_aliased_dense_legacy.jl stays included as
-        # reference code.
-        # if lmap === nothing && get(ENV, "SB_ALIASED_LEGACY", "0") == "1"
-        #     return @timeit TIMER "kbd.serial_legacy" _contract_dense_serial_legacy!(C, A, Bp, blksize, M, N, K, Nm, Mmov_total, Nmov_total,
-        #         n_sp, NB, join_posA, sp_strides, _bconv, _noconv, mode, can_blas,
-        #         c_src_kind, c_src_idx, movA_dims_vec, movB_dims_vec, movA_strides, movB_strides,
-        #         _fuse, _direct, _sp, _prealloc_buf, _cas_stats, _fusion_diag,
-        #         pending, key_to_alias, key_to_accum, combined_tid_map, Cscratch, _fgroups, lmap)
-        # end
-        # OUTPUT-STATIONARY kernel (always on when eligible): keep-grouped, GEMM-direct,
-        # no scatter/hash. Handles the BLAS non-interleaved case; interleaved (lmap) and
-        # non-BLAS fall through to the legacy reduction-stationary _contract_dense_serial!.
-        # Hardened 2026-06 — bit-identical (to ~1e-12) vs the legacy kernel; was
-        # SB_ALIASED_OUTSTAT, a default-on knob, now unconditional.
-        _outstat = can_blas && lmap === nothing
-        if _outstat
-            return @timeit TIMER "kbd.serial_outstat" _contract_dense_serial_outstat!(C, A, Bp, blksize, M, N, K, Nm, Mmov_total, Nmov_total,
-                n_sp, NB, join_posA, sp_strides, _bconv, _noconv, mode, can_blas,
-                c_src_kind, c_src_idx, movA_dims_vec, movB_dims_vec, movA_strides, movB_strides,
-                _fuse, _direct, _sp, _prealloc_buf, _cas_stats, _fusion_diag,
-                pending, key_to_alias, key_to_accum, combined_tid_map, Cscratch, _fgroups, lmap)
-        end
-        # kbd.serial_current: total time in the current (reduction-stationary) serial kernel.
+        # kbd.serial_current: reduction-stationary serial kernel — non-BLAS fallback only
+        # (can_blas already returned above via output-stationary). lmap is always nothing
+        # here (interleaved emission requires can_blas, gated in _canon_inds_for_next_A).
         return @timeit TIMER "kbd.serial_current" _contract_dense_serial!(C, A, Bp, blksize, M, N, K, Nm, Mmov_total, Nmov_total,
             n_sp, NB, join_posA, sp_strides, _bconv, _noconv, mode, can_blas,
             c_src_kind, c_src_idx, movA_dims_vec, movB_dims_vec, movA_strides, movB_strides,

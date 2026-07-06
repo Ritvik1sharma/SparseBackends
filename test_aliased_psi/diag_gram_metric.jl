@@ -21,10 +21,23 @@ using SparseBackends, ITensors, ITensorMPS
 using Random, Printf
 using LinearAlgebra
 using KrylovKit: eigsolve, InnerProductVec
+using ArgParse
 
 include("../test_sparse_psi/utils.jl")
 
-const N_PLAQ = parse(Int, get(ENV, "DIAG_N_PLAQ", "2"))
+function parse_command_line()
+    s = ArgParseSettings()
+    @add_arg_table s begin
+        "--N-plaq"
+            help = "Number of plaquettes (N)"
+            arg_type = Int
+            default = 2
+    end
+    return parse_args(s)
+end
+
+# Was DIAG_N_PLAQ env var.
+const N_PLAQ = parse_command_line()["N-plaq"]
 
 function build_setup(N::Int, psign::Int)
     Random.seed!(42)
@@ -95,23 +108,20 @@ function build_full_op(H, N)
     for k in 2:N; Hf = Hf * H[k]; end
     return Hf
 end
-# DIAG_GRAM_ONLY=1: skip the full-dense operator build (it OOMs for N≥4 — the
-# full H is 2^(2N+2)-dim). The gram/metric construction checks (Part A) don't
-# need it, so this lets us verify M's correctness at scale.
-const _GRAM_ONLY = get(ENV, "DIAG_GRAM_ONLY", "0") == "1"
-H_full = _GRAM_ONLY ? nothing : build_full_op(H, N)
+# Note: the full-dense operator build OOMs for N≥4 (full H is 2^(2N+2)-dim) —
+# this script is intended for small N. Was gated behind DIAG_GRAM_ONLY=1 to skip
+# this and the H-dependent parts below; that env var is retired, always runs now.
+H_full = build_full_op(H, N)
 function state_norm2(Ψ); return real(scalar(dag(Ψ) * Ψ)); end
 function state_energy(Ψ)
     Ψp = prime(Ψ, sites...)
     return real(scalar(dag(Ψp) * (H_full * Ψ)))
 end
-if !_GRAM_ONLY
-    nn_d   = state_norm2(Ψ_d);   ee_d   = state_energy(Ψ_d)
-    nn_ali = state_norm2(Ψ_ali); ee_ali = state_energy(Ψ_ali)
-    @printf("<Psi|Psi>:   dense=%.10f  ali=%.10f\n", nn_d, nn_ali)
-    @printf("<Psi|H|Psi>: dense=%.10f  ali=%.10f\n", ee_d, ee_ali)
-    @printf("Rayleigh E = <H>/<1>: dense=%.10f  ali=%.10f\n\n", ee_d/nn_d, ee_ali/nn_ali)
-end
+nn_d   = state_norm2(Ψ_d);   ee_d   = state_energy(Ψ_d)
+nn_ali = state_norm2(Ψ_ali); ee_ali = state_energy(Ψ_ali)
+@printf("<Psi|Psi>:   dense=%.10f  ali=%.10f\n", nn_d, nn_ali)
+@printf("<Psi|H|Psi>: dense=%.10f  ali=%.10f\n", ee_d, ee_ali)
+@printf("Rayleigh E = <H>/<1>: dense=%.10f  ali=%.10f\n\n", ee_d/nn_d, ee_ali/nn_ali)
 
 # ---------------------------------------------------------------------------
 # A. Gram-cache correctness.
@@ -124,11 +134,6 @@ for i in 1:N+1
     dr = diffnorm(gc_ali.R[i], gc_d.R[i])
     nl = norm(densify(gc_d.L[i])); nr = norm(densify(gc_d.R[i]))
     @printf("  i=%d  |dLgram|=%.3e (|L|=%.3e)   |dRgram|=%.3e (|R|=%.3e)\n", i, dl, nl, dr, nr)
-end
-if _GRAM_ONLY
-    println("\n[DIAG_GRAM_ONLY] gram/M-construction check complete; skipping H-dependent parts (full-dense op OOMs at N≥4).")
-    println("If all |dLgram|/|dRgram| above are ~0, the aliased gram/metric M is constructed correctly at this N.")
-    exit(0)
 end
 
 # ---------------------------------------------------------------------------

@@ -495,18 +495,22 @@ function blocksparse_qr_channel_aware(
         rg_info_str = join(rg_info, "|")
         println(stdout, "[QR_TRUNC] maxdim=$maxdim keep_count=$keep_count n_active=$n_active_chan mult_cap=$mult_cap n_new_d_natural=$n_new_d_natural n_new_d=$n_new_d  k_kept=$(sort(collect(k_kept)))  pre_trunc_chi_by_row_group=$rg_info_str  bond=$(bond_sparse_dim)x$(n_new_d)=$(bond_sparse_dim*n_new_d)")
     end
-    if get(ENV, "SB_SV_REPORT", "0") == "1"
-        println(stdout, "[SV_REPORT_QR] ortho=$ortho  maxdim=$maxdim  n_new_d=$n_new_d  mult_cap=$mult_cap  bond_sparse_dim=$bond_sparse_dim")
-        for cM in sort(collect(keys(cM_S)))
-            S = cM_S[cM]
-            k = k_kept[cM]
-            kept_str         = (k > 0 && k <= length(S)) ? string(S[k])   : "-"
-            global_drop_str  = (k+1 <= length(S))         ? string(S[k+1]) : "-"
-            cap_drop_str     = haskey(cM_S_full_max_dropped, cM) ? string(cM_S_full_max_dropped[cM]) : "-"
-            println(stdout, "  cM=$cM: kept $k/$(length(S))  smallest_kept=$kept_str  largest_dropped_global=$global_drop_str  largest_dropped_by_percM_cap=$cap_drop_str")
-        end
-        flush(stdout)
+    # SB_SV_REPORT debug print, disabled; flip to `true` (and restore the check
+    # below) to re-enable.
+    if false
     end
+    # if get(ENV, "SB_SV_REPORT", "0") == "1"
+    #     println(stdout, "[SV_REPORT_QR] ortho=$ortho  maxdim=$maxdim  n_new_d=$n_new_d  mult_cap=$mult_cap  bond_sparse_dim=$bond_sparse_dim")
+    #     for cM in sort(collect(keys(cM_S)))
+    #         S = cM_S[cM]
+    #         k = k_kept[cM]
+    #         kept_str         = (k > 0 && k <= length(S)) ? string(S[k])   : "-"
+    #         global_drop_str  = (k+1 <= length(S))         ? string(S[k+1]) : "-"
+    #         cap_drop_str     = haskey(cM_S_full_max_dropped, cM) ? string(cM_S_full_max_dropped[cM]) : "-"
+    #         println(stdout, "  cM=$cM: kept $k/$(length(S))  smallest_kept=$kept_str  largest_dropped_global=$global_drop_str  largest_dropped_by_percM_cap=$cap_drop_str")
+    #     end
+    #     flush(stdout)
+    # end
 
     # ---- Build output BS tensors ---------------------------------------------
     n_new_sp = bond_sparse_dim

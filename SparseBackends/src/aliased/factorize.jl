@@ -37,13 +37,13 @@ function itensor_aliased_factorize(
     phi_w  = ITensors.get_external_storage(phi)::WrappedAliasedBlockSparse
     M_b_w  = ITensors.get_external_storage(M_b)::WrappedAliasedBlockSparse
     M_b1_w = ITensors.get_external_storage(M_b1)::WrappedAliasedBlockSparse
-    if get(ENV, "SB_ALIASED_TRACE", "0") == "1"
+    if ALIASED_TRACE[]
         println("[SB_ALIASED_TRACE itensor_aliased_factorize] entered  ortho=$ortho")
     end
     L_R_spec = _aliased_alias_reduced_factorize(
         phi_w, M_b_w, M_b1_w;
         ortho, maxdim, mindim, cutoff)
-    if get(ENV, "SB_ALIASED_TRACE", "0") == "1"
+    if ALIASED_TRACE[]
         L_, R_, _ = L_R_spec
         println("[SB_ALIASED_TRACE itensor_aliased_factorize] L storage=", typeof(L_.tensor.data),
                 "  R storage=", typeof(R_.tensor.data))
@@ -496,29 +496,32 @@ function _aliased_alias_reduced_factorize(
     L_ali = _build_aliased_frozen_schema(M_b_w, templates_L, new_L_tail_dims, mp_b, mult_new, has_mu, Tel, new_mult_ind)
     R_ali = _build_aliased_frozen_schema(M_b1_w, templates_R, new_R_tail_dims, mp_b1, mult_new, has_mu, Tel, new_mult_ind)
 
-    # SB_FACT_DIAG=1: report the NEW bond's channel/multiplicity placement on each
-    # side. Canonical convention requires: channel in PREFIX (pos ≤ P), multiplicity
+    # Reports the NEW bond's channel/multiplicity placement on each side.
+    # Canonical convention requires: channel in PREFIX (pos ≤ P), multiplicity
     # in DENSE tail (pos > P), and channel BEFORE multiplicity ("sparse precedes
-    # dense"). Flag any violation — this is where a factorize would break the
-    # convention and seed the downstream prefix/dense crossover.
-    if get(ENV, "SB_FACT_DIAG", "0") == "1"
-        _tg(I) = (ITensors.dim(I), string(ITensors.tags(I)), ITensors.plev(I))
-        _ch_ok_L = cp_b <= P_b
-        _mu_ok_L = !has_mu || mp_b > P_b
-        _ord_L   = !has_mu || cp_b < mp_b
-        _ch_ok_R = cp_b1 <= P_b1
-        _mu_ok_R = !has_mu || mp_b1 > P_b1
-        _ord_R   = !has_mu || cp_b1 < mp_b1
-        bad = !(_ch_ok_L && _mu_ok_L && _ord_L && _ch_ok_R && _mu_ok_R && _ord_R)
-        println("[FACT_DIAG ortho=", ortho, " bond_ch=", _tg(M_b_w.inds[cp_b]),
-                has_mu ? string("  mult=", _tg(M_b_w.inds[mp_b])) : "  (no mult yet)", "]")
-        println("   L: P=$P_b  ch_pos=$cp_b(", _ch_ok_L ? "prefix✓" : "DENSE✗", ")  ",
-                has_mu ? "mu_pos=$mp_b(" * (_mu_ok_L ? "dense✓" : "PREFIX✗") * ")  ch<mu:" * (_ord_L ? "✓" : "✗") : "no-mu")
-        println("   R: P=$P_b1  ch_pos=$cp_b1(", _ch_ok_R ? "prefix✓" : "DENSE✗", ")  ",
-                has_mu ? "mu_pos=$mp_b1(" * (_mu_ok_R ? "dense✓" : "PREFIX✗") * ")  ch<mu:" * (_ord_R ? "✓" : "✗") : "no-mu")
-        bad && println("   ⚠ [FACT BREAKS CANON] this factorize emits a non-canonical bond classification")
-        flush(stdout)
+    # dense"). Flags any violation — this is where a factorize would break the
+    # convention and seed the downstream prefix/dense crossover. Debug-only,
+    # disabled; flip to `true` (and restore the body below) to re-enable.
+    if false
     end
+    # if get(ENV, "SB_FACT_DIAG", "0") == "1"
+    #     _tg(I) = (ITensors.dim(I), string(ITensors.tags(I)), ITensors.plev(I))
+    #     _ch_ok_L = cp_b <= P_b
+    #     _mu_ok_L = !has_mu || mp_b > P_b
+    #     _ord_L   = !has_mu || cp_b < mp_b
+    #     _ch_ok_R = cp_b1 <= P_b1
+    #     _mu_ok_R = !has_mu || mp_b1 > P_b1
+    #     _ord_R   = !has_mu || cp_b1 < mp_b1
+    #     bad = !(_ch_ok_L && _mu_ok_L && _ord_L && _ch_ok_R && _mu_ok_R && _ord_R)
+    #     println("[FACT_DIAG ortho=", ortho, " bond_ch=", _tg(M_b_w.inds[cp_b]),
+    #             has_mu ? string("  mult=", _tg(M_b_w.inds[mp_b])) : "  (no mult yet)", "]")
+    #     println("   L: P=$P_b  ch_pos=$cp_b(", _ch_ok_L ? "prefix✓" : "DENSE✗", ")  ",
+    #             has_mu ? "mu_pos=$mp_b(" * (_mu_ok_L ? "dense✓" : "PREFIX✗") * ")  ch<mu:" * (_ord_L ? "✓" : "✗") : "no-mu")
+    #     println("   R: P=$P_b1  ch_pos=$cp_b1(", _ch_ok_R ? "prefix✓" : "DENSE✗", ")  ",
+    #             has_mu ? "mu_pos=$mp_b1(" * (_mu_ok_R ? "dense✓" : "PREFIX✗") * ")  ch<mu:" * (_ord_R ? "✓" : "✗") : "no-mu")
+    #     bad && println("   ⚠ [FACT BREAKS CANON] this factorize emits a non-canonical bond classification")
+    #     flush(stdout)
+    # end
     # Discarded weight as a FRACTION of total spectral weight (∑ discarded sv² / ∑ sv²),
     # so it is directly comparable to ITensors' (dense/BS) normalized truncerr. (Previously
     # this reported the absolute ∑ discarded sv², which is NOT comparable across backends.)

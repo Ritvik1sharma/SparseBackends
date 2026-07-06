@@ -36,15 +36,16 @@ const _GEMM_DUMP_INIT  = Ref{Bool}(false)
 # --- Permute profile logger (env SB_PERMUTE_PROFILE=<path>) ---
 # Appends per-call records for the sparse BS×Dense kernel to the same file
 # that ITensorMPS appends matvec.denseH_denseV records to. Call site is taken
-# from ENV["SB_IN_POSITION"] which ITensorMPS sets around position! calls.
+# from the `in_position` argument threaded down from dmrg.jl's position! call.
 const _PERMUTE_PROFILE_IO_SB = Ref{Union{Nothing,IO}}(nothing)
 const _PERMUTE_PROFILE_INIT_SB = Ref{Bool}(false)
 function _permute_profile_io_sb()
     if !_PERMUTE_PROFILE_INIT_SB[]
         _PERMUTE_PROFILE_INIT_SB[] = true
-        path = get(ENV, "SB_PERMUTE_PROFILE", "")
-        if !isempty(path)
-            _PERMUTE_PROFILE_IO_SB[] = open(path, "a")
+        # Was SB_PERMUTE_PROFILE=<path>; now gated on _roofline_on(), opening
+        # the fixed _RF_PERMUTE_PATH set by reset_roofline!'s own argument.
+        if _roofline_on()
+            _PERMUTE_PROFILE_IO_SB[] = open(_RF_PERMUTE_PATH[], "a")
             atexit() do
                 io = _PERMUTE_PROFILE_IO_SB[]
                 if io !== nothing
@@ -237,7 +238,7 @@ function contract_prefix_outer_bd!(
   time5 = @elapsed begin
     α1 = one(TC)
 
-    if get(ENV, "SB_TRACE", "0") == "1"
+    if false  # SB_TRACE — flip to true here for debug output
       println("[SB_TRACE]   prefix_outer_bd  PA=$PA  PC=$PC  chunkA=$chunkA  chunkB=$chunkB  R=$R  nblocks(A)=$(length(A.keys))")
     end
 
@@ -255,7 +256,7 @@ function contract_prefix_outer_bd!(
       perm = sortperm(ckeys)   # O(n log n), n << 100 for typical DMRG
     end
 
-    if get(ENV, "SB_TRACE", "0") == "1"
+    if false  # SB_TRACE — flip to true here for debug output
       ngs = (nA == 0) ? 0 : sum(i == 1 || ckeys[perm[i]] != ckeys[perm[i-1]] for i in 1:nA)
       println("[SB_TRACE]   prefix_outer_bd: $ngs ckey-groups")
     end
@@ -355,7 +356,7 @@ function contract!(
   @assert haskey(mapB, rlab) "rlab not found in mapB"
 
   axisAr = mapA[rlab]
-  if get(ENV, "SB_TRACE", "0") == "1"
+  if false  # SB_TRACE — flip to true here for debug output
     println("[SB_TRACE] contract_bs_dense.contract!  BS(blocks=", length(A.keys),
             ", PA=", PA, ", N2A=", N2A, ") × Dense(dims=", size(B), ")",
             "  axisAr=", axisAr,
@@ -1055,7 +1056,7 @@ for bucket = bucket_count × n_in_run.
 """
 function show_gemm_dims_hist()
   if isempty(_GEMM_DIMS_HIST)
-    println("[GEMM_DIMS_HIST] (empty — set GEMM_DIMS_HIST=1)")
+    println("[GEMM_DIMS_HIST] (empty — run dmrg(...; roofline=true) to populate)")
     return
   end
   pairs = collect(_GEMM_DIMS_HIST)
@@ -1588,8 +1589,9 @@ function _contract_shared_hint_fast_movB!(
         println("[GEMM_DIMS] run of $n_in_run A-blocks: A_mat=$D_remA×$K  Bmat=$K×$N_full  C_chunk=$D_remA×$N_full  →  $n_in_run mul!s of ($D_remA × $K) · ($K × $N_full)")
       end
       # Histogram accumulator — tracks (M, K, N, n_in_run) frequency for ALL calls.
-      # Enable with GEMM_DIMS_HIST=1; print via show_gemm_dims_hist() at end.
-      if get(ENV, "GEMM_DIMS_HIST", "0") == "1"
+      # Folded into the roofline switch (was GEMM_DIMS_HIST=1); print via
+      # show_gemm_dims_hist() at end.
+      if _roofline_on()
         bucket = (D_remA, K, N_full, n_in_run)
         _GEMM_DIMS_HIST[bucket] = get(_GEMM_DIMS_HIST, bucket, 0) + 1
       end
@@ -1638,7 +1640,8 @@ function contract_bs_dense_to_dense!(
     A::NewBlockSparseSorted{TA,NA,NA2,PA},
     labelsA::AbstractVector{Label},
     B::AbstractArray{TB,NB},
-    labelsB::AbstractVector{Label},
+    labelsB::AbstractVector{Label};
+    in_position::Bool=false,
 ) where {TC,TA,NA,NA2,PA,TB,NB}
     NC = ndims(C)
     if isempty(A.keys)
@@ -1664,7 +1667,7 @@ function contract_bs_dense_to_dense!(
         n_cpfx  = length(c_prefix)
     end
 
-    _bdd_profile_active = haskey(ENV, "SB_PERMUTE_PROFILE") && !isempty(ENV["SB_PERMUTE_PROFILE"])
+    _bdd_profile_active = _roofline_on()
     _bdd_t_pA = 0.0
     _bdd_t_pB = 0.0
     @timeit TIMER "bdd.permute_A" begin
@@ -1834,10 +1837,10 @@ function contract_bs_dense_to_dense!(
     if _bdd_profile_active
         _pp_io = _permute_profile_io_sb()
         if _pp_io !== nothing
-            _pp_base = get(ENV, "SB_IN_POSITION", "0") == "1" ? "position" : "matvec"
-            _pp_run  = get(ENV, "SB_RUN_LABEL", "?")
+            _pp_base = in_position ? "position" : "matvec"
+            _pp_run  = CURRENT_RUN_LABEL[]
             _pp_bond = get(ENV, "SB_BOND", "-1")
-            _pp_step = get(ENV, "SB_STEP", "-1")
+            _pp_step = something(CURRENT_STEP[], -1)
             _pp_site = string(_pp_base, "|", _pp_run, "|", _pp_bond, "|", _pp_step)
             _pp_total = _bdd_t_pA + _bdd_t_pB + _bdd_t_gemm
             _pp_shared_pos_A = vcat([findfirst(==(l), labelsA) for l in shared_prefix],

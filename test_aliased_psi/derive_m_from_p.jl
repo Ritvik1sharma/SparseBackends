@@ -62,6 +62,11 @@ function analyze_gram(G; rtol=1e-1)
               unp, prm, dims=[ITensors.dim(I) for I in unp])
 end
 
+# NOTE: a "c from P alone" via an output-traced P†P contraction was tested and REMOVED —
+# no contraction of P's tensors reproduces c=2^env (it is off-shell: sums the full physical
+# space, picking up dim 3, not the on-shell Z2 factor 2). c=2^env is the analytical Z2-count
+# (base = involution order, verified below; exponent = #2-site rungs = ⌈env/2⌉).
+
 # Mult-rank-1 test: reshape Π's range to (channel, mult) and, per channel basis dir,
 # check the mult-component is (near) rank-1 = one signed direction. Needs the two
 # unpaired axes sorted as (channel=smaller-dim, mult=larger-OR-mult-tagged).
@@ -144,6 +149,22 @@ seed1 = args["seed"]; seed2 = args["seed2"]; bond = args["bond"]; psign = args["
 println("="^78)
 println("DERIVE M FROM P   N_plaq=$N  maxdim=$md  n_sweeps=$nsw  seeds=($seed1,$seed2)")
 println("="^78)
+
+# ── STRUCTURAL Z2-COUNT for c (base of c = 2^env, derived from P's structure) ──
+# c = (Z2 involution order)^(# 2-site rungs in env). The base is the order of the
+# constraint symmetry U_j: each Cons_j = ½(Id + psign·U_j) with U_j a product of
+# single-site π-rotations exp(iπS·). For integer spin S=1, exp(iπS)² = exp(2πiS) = Id,
+# so each is an involution ⇒ U_j² = Id ⇒ order 2 ⇒ base = 2. Verify structurally:
+let sts = siteinds("S=1", 1)
+    s = sts[1]; ip = prime(s)
+    Oy = Array(op("exp(i*pi*Sy)", s), ip, s); Ox = Array(op("exp(i*pi*Sx)", s), ip, s)
+    dy = norm(Oy * Oy - Matrix(LinearAlgebra.I, 3, 3))
+    dx = norm(Ox * Ox - Matrix(LinearAlgebra.I, 3, 3))
+    order = (dy < 1e-10 && dx < 1e-10) ? 2 : -1
+    @printf("STRUCTURAL Z2-COUNT: ||exp(iπSy)²−Id||=%.1e ||exp(iπSx)²−Id||=%.1e ⇒ involution order=%d ⇒ c-base=%d\n",
+            dy, dx, order, order)
+    println("  ⇒ c(env) = order^(#2-site rungs) = $order^⌈env/2⌉   (structural, from P's Z2 constraint)")
+end
 
 # Head-to-head: does single multi-sweep call converge to the same energy as the
 # per-sweep loop? (answers "is the incremental gram cache drifting across sweeps?")
