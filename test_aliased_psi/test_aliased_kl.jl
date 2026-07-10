@@ -192,6 +192,9 @@ function run_sweeps(H, psi0, n_sweeps::Int, maxdim::Int; cutoff=1e-10, mindim=1,
             target_reached_sweep, target_reached_cum, target_reached_cum_excl1)
 end
 
+# Guard: only run the benchmark when this file is the program entry point, so it
+# can be `include`d (e.g. by diagnostics) to reuse build_setup without auto-running.
+if abspath(PROGRAM_FILE) == @__FILE__
 let
     parsed_args = parse_command_line()
     N_plaq   = parsed_args["N-plaq"]
@@ -286,5 +289,6 @@ let
         println("\n========== SparseBackends.TIMER ==========")
         print_timer(SparseBackends.TIMER)
     end
+end
 end
 nothing

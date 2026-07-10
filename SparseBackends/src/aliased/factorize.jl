@@ -42,7 +42,8 @@ function itensor_aliased_factorize(
     end
     L_R_spec = _aliased_alias_reduced_factorize(
         phi_w, M_b_w, M_b1_w;
-        ortho, maxdim, mindim, cutoff)
+        ortho, maxdim, mindim, cutoff,
+        core_canonical = get(kwargs, :core_canonical, false))
     if ALIASED_TRACE[]
         L_, R_, _ = L_R_spec
         println("[SB_ALIASED_TRACE itensor_aliased_factorize] L storage=", typeof(L_.tensor.data),
@@ -100,7 +101,8 @@ function _aliased_alias_reduced_factorize(
     maxdim :: Int,
     mindim :: Int,
     cutoff :: Float64,
-)
+    core_canonical :: Bool = false,   # factor-core mode: skip the M^{1/2} whitening
+)                                     # ⇒ plain SVD of the core two-site ⇒ core-orthonormal split (metric I)
     am_b   = M_b_w.aliased
     am_b1  = M_b1_w.aliased
     am_phi = phi_w.aliased
@@ -344,28 +346,32 @@ function _aliased_alias_reduced_factorize(
         c  = am_b.keys[i_L][cp_b]
         wL_per_c[a, c] += abs2(am_b.scalars[i_L])
     end
-    wL = [sqrt(maximum(@view wL_per_c[a, :])) for a in 1:n_tL]
+    # core_canonical: wL=wR=1 ⇒ no M^{1/2} whitening ⇒ M_red is the raw core two-site
+    # matrix ⇒ its SVD is the plain core-orthonormal (metric-I) factorization.
+    wL = core_canonical ? ones(real(Tel), n_tL) :
+         [sqrt(maximum(@view wL_per_c[a, :])) for a in 1:n_tL]
     wR_per_c = zeros(real(Tel), n_tR, bond_ch_dim_b1)
     @inbounds for i_R in eachindex(am_b1.keys)
         a  = am_b1.alias_ids[i_R]
         c  = am_b1.keys[i_R][cp_b1]
         wR_per_c[a, c] += abs2(am_b1.scalars[i_R])
     end
-    wR = [sqrt(maximum(@view wR_per_c[a, :])) for a in 1:n_tR]
+    wR = core_canonical ? ones(real(Tel), n_tR) :
+         [sqrt(maximum(@view wR_per_c[a, :])) for a in 1:n_tR]
     # SB_WHITEN_DIAG: verify the whitening assumption that w[a,c]² is c-independent.
     # The whitening (wL = sqrt(max_c w[a,c]²)) and the channel-averaged M_red are only
     # EXACT if, for each template a, w[a,c]² is the same across all channels c it appears
     # in. If FP drift (or approximate aliasing) makes it vary, the SVD truncates a
     # distorted M_red → suboptimal energy. Report the worst relative c-spread.
     if get(ENV, "SB_WHITEN_DIAG", "0") == "1" && _WHITEN_BUDGET[] != 0
-        maxdev = 0.0
+        devL = 0.0; devR = 0.0
         @inbounds for a in 1:n_tL
             mn = Inf; mx = 0.0
             for c in 1:bond_ch_dim_b
                 v = wL_per_c[a, c]
                 v > 0 && (mn = min(mn, v); mx = max(mx, v))
             end
-            mx > 0 && mn < Inf && (maxdev = max(maxdev, (mx - mn) / mx))
+            mx > 0 && mn < Inf && (devL = max(devL, (mx - mn) / mx))
         end
         @inbounds for a in 1:n_tR
             mn = Inf; mx = 0.0
@@ -373,11 +379,13 @@ function _aliased_alias_reduced_factorize(
                 v = wR_per_c[a, c]
                 v > 0 && (mn = min(mn, v); mx = max(mx, v))
             end
-            mx > 0 && mn < Inf && (maxdev = max(maxdev, (mx - mn) / mx))
+            mx > 0 && mn < Inf && (devR = max(devR, (mx - mn) / mx))
         end
-        _WHITEN_MAXDEV[] = max(_WHITEN_MAXDEV[], maxdev)
-        println("[WHITEN_DIAG] max rel c-spread of w[a,c]² this call = ", maxdev,
-                "   (running max = ", _WHITEN_MAXDEV[], ")  0⇒c-constant (SVD exact); >>0⇒distorted")
+        _WHITEN_MAXDEV[] = max(_WHITEN_MAXDEV[], devL, devR)
+        println("[WHITEN_DIAG] ortho=", ortho, "  c-spread L=", round(devL, sigdigits=4),
+                "  R=", round(devR, sigdigits=4), "  n_tL=", n_tL, " n_tR=", n_tR,
+                " ch_b=", bond_ch_dim_b, " ch_b1=", bond_ch_dim_b1,
+                "   0⇒c-constant(clean gram); >>0⇒distorted(spread gram)")
         _WHITEN_BUDGET[] > 0 && (_WHITEN_BUDGET[] -= 1)
     end
     # Scale rows and columns of M_red by w_L and w_R (broadcast per alias group).
@@ -393,7 +401,14 @@ function _aliased_alias_reduced_factorize(
     # Per-cM cap (mirror of the BS Path-B factorize, ops_factorize_qr.jl:471).
     # The new bond is channel × multiplicity (doubled-link convention).
     mult_cap = maxdim
-    n_keep = min(length(sv), mult_cap)
+    # Relative-epsilon rank floor: ALWAYS drop numerical-zero singular values, even
+    # when cutoff=0 (as orthogonalize! passes). `sv` is sorted descending. Without this,
+    # cutoff=0 keeps machine-zero singular values (~1e-17..1e-49), inflating the bond
+    # past the true Schmidt rank → a spurious multiplicity and a non-projector (tail)
+    # gram. A dense SVD drops these by default; this matches the dense canonical form.
+    svmax = isempty(sv) ? zero(eltype(sv)) : sv[1]
+    n_rank = svmax > 0 ? count(s -> s > 1e-12 * svmax, sv) : length(sv)
+    n_keep = min(length(sv), mult_cap, n_rank)
     if cutoff > 0
         total = sum(s -> s*s, sv)
         running = 0.0
@@ -404,7 +419,13 @@ function _aliased_alias_reduced_factorize(
             end
         end
     end
-    n_keep = clamp(n_keep, mindim, length(sv))
+    # Cap the mindim floor at the available rank: you cannot keep more singular
+    # values than exist. Without the inner min(), mindim > length(sv) makes clamp
+    # (lo>hi) return mindim and the subsequent F.U[:,1:mult_new] slice overruns
+    # (BoundsError). NOTE: this means mindim is a SOFT floor — it will NOT fabricate
+    # rank by zero-padding (that would re-introduce the cutoff=0 rank inflation this
+    # file's epsilon-floor removed). A low-rank state (e.g. PXP) keeps its true rank.
+    n_keep = clamp(n_keep, min(mindim, length(sv)), length(sv))
     mult_new = max(n_keep, 1)
 
     Uk = F.U[:, 1:mult_new]

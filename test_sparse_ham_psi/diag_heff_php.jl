@@ -195,7 +195,7 @@ let
             if ITensors.has_external_storage(Hv) && ITensors.has_external_storage(phi_ali)
                 Tw = ITensors.get_external_storage(phi_ali); Cw = ITensors.get_external_storage(Hv)
                 if Cw isa SparseBackends.WrappedAliasedBlockSparse && Tw isa SparseBackends.WrappedAliasedBlockSparse
-                    return ITensors._itensor_from_external_storage(SparseBackends.recast_aliased_to_template(Cw, Tw))
+                    return ITensors._itensor_from_external_storage(SparseBackends.align_aliased_axes(Cw, Tw))
                 end
             end
             return Hv

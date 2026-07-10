@@ -58,12 +58,15 @@ matvec_size_info(w::WrappedBlockSparse) =
      length(w.blocksparse.keys) * w.blocksparse.blksize)
 matvec_size_info(::Any) = (0, 0, 0, 0)
 
-# Re-permute axes so the output's `inds` tuple matches `Tw`'s exactly.
-# Aliased analog of `recast_bs_to_template`. Both Cw and Tw must have the
-# same Set(inds); we just permute Cw's axes to align with Tw's order. The
-# alias schema (keys, alias_ids, scalars) is preserved by permutedims.
-function recast_aliased_to_template(Cw::WrappedAliasedBlockSparse{TC,N,N2c,Pc},
-                                     Tw::WrappedAliasedBlockSparse{TT,N,N2t,Pt}) where {TC,TT,N,N2c,Pc,N2t,Pt}
+# Pure axis PERMUTE: re-order Cw's axes so its `inds` tuple matches `Tw`'s
+# exactly. Aliased analog of `recast_bs_to_template`. Both Cw and Tw must have
+# the same Set(inds); the alias schema (keys, alias_ids, scalars, templates) is
+# preserved unchanged by permutedims — this does NOT drop keys or re-dedup.
+# Contrast `_snap_to_schema`, which rebuilds onto Tw's key-set (a lossy
+# projection). Renamed from `recast_aliased_to_template` (the old name read like
+# a projection); it is only an axis alignment.
+function align_aliased_axes(Cw::WrappedAliasedBlockSparse{TC,N,N2c,Pc},
+                            Tw::WrappedAliasedBlockSparse{TT,N,N2t,Pt}) where {TC,TT,N,N2c,Pc,N2t,Pt}
     c_inds = collect(Cw.inds)
     t_inds = collect(Tw.inds)
     if Set(c_inds) != Set(t_inds)
@@ -112,6 +115,16 @@ Base.eltype(::Type{ITensors.ExternalStorage{W}}) where {W<:WrappedAliasedBlockSp
 # output has the SAME (keys, alias_ids, scalars) as v, so subsequent
 # Aliased + Aliased adds fire the same-schema fast path (template+template)
 # instead of falling through to cross-schema merge / dense.
+# Public opt-in: value-dedup an aliased ITensor's templates (e.g. a ψ†ψ gram). Collapses
+# templates with equal block-values (the AA kernel only dedups by input-pair, so a gram's
+# group-difference duplicates persist). No-op on dense / non-aliased tensors. Mutates+returns.
+function compress_aliased_templates!(t::ITensors.ITensor; atol::Real=1e-12)
+    if ITensors.has_external_storage(t) && t.tensor.data isa WrappedAliasedBlockSparse
+        _dedup_templates_by_value!(t.tensor.data.aliased; atol=atol)
+    end
+    return t
+end
+
 function _snap_to_schema(Hv::WrappedAliasedBlockSparse{T,N,N2,P},
                           v_schema::WrappedAliasedBlockSparse{T,N,N2,P};
                           dbg::Bool=false) where {T,N,N2,P}
@@ -188,6 +201,40 @@ function _snap_to_schema(Hv::WrappedAliasedBlockSparse{T,N,N2,P},
     return WrappedAliasedBlockSparse{T,N,N2,P}(new_ali, v_schema.inds)
 end
 const _SNAP_DBG_COUNT = Ref(0)
+
+# Snap a *dense* ITensor onto an aliased template's schema — the dense→aliased
+# analogue of `_snap_to_schema` (which requires an already-aliased source).
+# Needed by the `rr_dense_iter` diagnostic: the RR local eigensolve runs fully
+# dense (dense φ, grams, H·v), so the Ritz vector comes out dense; there is no
+# aliased tensor for `recast_to_phi`/`_snap_to_schema` to act on. This rebuilds
+# the dense vector on `phi_ali`'s EXACT (keys, alias_ids, scalars, n_templates),
+# dropping any support outside φ's schema (the projection back onto P's frame).
+#
+# Reuses existing machinery rather than hand-extracting blocks:
+#   dense → blocksparse_from_dense (first P axes = keys, last N2 = dense blocks,
+#           the same convention as φ's storage) → trivially-aliased (one template
+#           per block) → `_snap_to_schema` against φ's schema.
+# The dense array is read in φ's storage axis order (`dw.inds`) so keys and the
+# per-block flatten match φ's exactly. No-op passthrough if φ is not aliased.
+function snap_dense_to_aliased(d::ITensors.ITensor, phi_ali::ITensors.ITensor; dbg::Bool=false)
+    ITensors.has_external_storage(phi_ali) || return d
+    dw = ITensors.get_external_storage(phi_ali)
+    dw isa WrappedAliasedBlockSparse || return d
+    return _snap_dense_to_aliased_impl(d, dw; dbg=dbg)
+end
+
+function _snap_dense_to_aliased_impl(d::ITensors.ITensor,
+                                     dw::WrappedAliasedBlockSparse{T,N,N2,P};
+                                     dbg::Bool=false) where {T,N,N2,P}
+    # Materialize d densely in φ's storage axis order (prefix axes first, dense
+    # tail last), so blocksparse_from_dense produces φ-consistent keys/blocks.
+    arr = Array(d, dw.inds...)
+    bs  = blocksparse_from_dense(arr, Val(N2))          # NewBlockSparseSorted{T,N,N2,P}
+    d_ali = _blocksparse_to_aliased(bs)                 # one template per block, scalar 1
+    d_ali_w = WrappedAliasedBlockSparse(d_ali, dw.inds)
+    snapped = _snap_to_schema(d_ali_w, dw; dbg=dbg)     # project onto φ's exact schema
+    return ITensors._itensor_from_external_storage(snapped)
+end
 
 # Drop blocks whose prefix key is NOT in `allowed`, keeping the tensor's OWN
 # dedup/template structure intact (templates + n_templates unchanged; kept
@@ -720,7 +767,7 @@ end
 # `ord` (ord[i] = position in `inds` of the axis that belongs at output position
 # i) or `nothing` if `preferred` doesn't cover `inds` exactly or would cross the
 # prefix/dense boundary. Used to make the native contract emit aligned output so
-# the downstream recast_aliased_to_template becomes a no-op.
+# the downstream align_aliased_axes becomes a no-op.
 # Match by id+dim, IGNORING plev: the contract output is aligned pre-replaceprime,
 # where Link axes are still primed (plev=1) relative to the unprimed template;
 # the subsequent replaceprime(1=>0) only flips plev (preserving id), so id+dim
@@ -1272,7 +1319,7 @@ function wrapped_contract_aliased(
         hint_labels = output_inds_hint === nothing ? nothing :
             Set(label_key_for_ind(I) for I in output_inds_hint)
         # #recast-kill (gated SB_ALIASED_ALIGN_OUTPUT): emit the output already in
-        # the template's axis order so the downstream recast_aliased_to_template is
+        # the template's axis order so the downstream align_aliased_axes is
         # a no-op. Reorders indsC/labelsC_vec within the prefix and dense blocks,
         # then lets contract! write in that order.
         # try/catch: if the kernel can't

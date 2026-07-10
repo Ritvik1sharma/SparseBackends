@@ -204,6 +204,42 @@ function _commit_aliased_dicts_lazy!(
     return C
 end
 
+# VALUE-dedup pass (opt-in; caller-gated). The AA kernel dedups by INPUT template-pair
+# (tidA,tidB), NOT by output value; for a self-contraction gram ψ†ψ many output blocks
+# coincide (group-difference D=a⊕a' → nc-fold repeats, KL 16→4). This collapses templates
+# with equal block-values into one and remaps alias_ids, so the gram gets genuine
+# dedup>1 and downstream M^{-1/2}·φ touches fewer templates. Cost O(n_tmpl·n_distinct·blksize)
+# — worth it for the gram, NOT for hot matvec (templates there are genuinely distinct),
+# hence off by default and enabled only at the gram call site.
+function _dedup_templates_by_value!(
+    C::AliasedBlockSparse{T,N,N2,P,K,AI}; atol::Real=1e-12,
+) where {T,N,N2,P,K,AI}
+    nt = C.n_templates; bs = C.blksize
+    nt <= 1 && return C
+    canon = Int[]                       # old tids kept as canonical representatives
+    remap = zeros(Int, nt)
+    @inbounds for t in 1:nt
+        off = (t-1)*bs
+        bn = 0.0; for j in 1:bs; bn += abs2(C.templates[off+j]); end; bn = sqrt(bn)
+        found = 0
+        for (ci, ct) in enumerate(canon)
+            co = (ct-1)*bs; d = 0.0
+            for j in 1:bs; d += abs2(C.templates[off+j] - C.templates[co+j]); end
+            if sqrt(d) <= atol * max(bn, eps()); found = ci; break; end
+        end
+        found == 0 ? (push!(canon, t); remap[t] = length(canon)) : (remap[t] = found)
+    end
+    length(canon) == nt && return C     # nothing to collapse
+    newt = Vector{T}(undef, length(canon)*bs)
+    @inbounds for (nw, ct) in enumerate(canon)
+        copyto!(view(newt, (nw-1)*bs+1 : nw*bs), view(C.templates, (ct-1)*bs+1 : ct*bs))
+    end
+    C.templates   = newt
+    C.n_templates = length(canon)
+    C.alias_ids   = AI[_alias_id(AI, remap[Int(a)]) for a in C.alias_ids]
+    return C
+end
+
 # ─────────────────────────────────────────────────────────────────────────────
 # AliasedBlockSparse × Dense  →  AliasedBlockSparse
 # ─────────────────────────────────────────────────────────────────────────────
@@ -581,6 +617,11 @@ function _contract_aliased_prefix_outer_aa!(
 
     # Combined template deduplication: (tidA, tidB) -> combined_tid in C
     combined_tid_map = Dict{Tuple{Int,Int}, Int}()
+    # Combined templates go to a SCRATCH `pending` (NOT C.templates); the lazy commit
+    # copies only *referenced* ones into C.templates. Without this, keys that demote to
+    # an accumulator orphan their combined template → nt > nk (spurious parentless
+    # templates). Mirrors the AD kernel (_contract_aliased_prefix_outer_ad!).
+    pending = TC[]; n_pending = 0
 
     key_to_alias = Dict{NTuple{PC,Int}, Tuple{Int,TC}}()
     key_to_accum = Dict{NTuple{PC,Int}, Vector{TC}}()
@@ -619,8 +660,8 @@ function _contract_aliased_prefix_outer_aa!(
 
                 combined_tid = get(combined_tid_map, (tidA, tidB), 0)
                 if combined_tid == 0
-                    C.n_templates += 1
-                    combined_tid = C.n_templates
+                    n_pending += 1
+                    combined_tid = n_pending
                     combined_tid_map[(tidA, tidB)] = combined_tid
                     new_tmpl = zeros(TC, C.blksize)
                     tmpl_A   = _aliased_template_view(A, tidA)
@@ -630,21 +671,21 @@ function _contract_aliased_prefix_outer_aa!(
                     else
                         _outer_add!(new_tmpl, tmpl_B, tmpl_A)   # rows=B_dense, cols=A_dense
                     end
-                    append!(C.templates, new_tmpl)
+                    append!(pending, new_tmpl)
                 end
 
                 ckey = ntuple(Val(PC)) do j
                     s = src[j]; s > 0 ? akey[s] : bkey[-s]
                 end
 
-                _aliased_contribute!(key_to_alias, key_to_accum, C.templates,
+                _aliased_contribute!(key_to_alias, key_to_accum, pending,
                                      ckey, combined_tid, αC, C.blksize)
             end
             iA += 1
         end
     end
 
-    _commit_aliased_dicts!(C, key_to_alias, key_to_accum)
+    _commit_aliased_dicts_lazy!(C, key_to_alias, key_to_accum, pending, n_pending)
     return C
 end
 
@@ -699,6 +740,11 @@ function _contract_aliased_dense_aa!(
 
     # Combined template deduplication: (tidA, tidB) -> combined_tid in C
     combined_tid_map = Dict{Tuple{Int,Int}, Int}()
+    # Combined templates go to a SCRATCH `pending` (NOT C.templates); the lazy commit
+    # copies only *referenced* ones into C.templates. Without this, keys that demote to
+    # an accumulator orphan their combined template → nt > nk (spurious parentless
+    # templates). Mirrors the AD kernel (_contract_aliased_prefix_outer_ad!).
+    pending = TC[]; n_pending = 0
 
     key_to_alias = Dict{NTuple{PC,Int}, Tuple{Int,TC}}()
     key_to_accum = Dict{NTuple{PC,Int}, Vector{TC}}()
@@ -716,8 +762,8 @@ function _contract_aliased_dense_aa!(
 
             combined_tid = get(combined_tid_map, (tidA, tidB), 0)
             if combined_tid == 0
-                C.n_templates += 1
-                combined_tid = C.n_templates
+                n_pending += 1
+                combined_tid = n_pending
                 combined_tid_map[(tidA, tidB)] = combined_tid
 
                 tmpl_A = _aliased_template_view(A, tidA)   # length chunkA * R
@@ -757,17 +803,17 @@ function _contract_aliased_dense_aa!(
                     end
                 end
 
-                append!(C.templates, new_tmpl)
+                append!(pending, new_tmpl)
             end
 
             ckey = ntuple(j -> (srcA[j] != 0 ? akey[srcA[j]] : bkey[srcB[j]]), Val(PC))
 
-            _aliased_contribute!(key_to_alias, key_to_accum, C.templates,
+            _aliased_contribute!(key_to_alias, key_to_accum, pending,
                                  ckey, combined_tid, αC, C.blksize)
         end
     end
 
-    _commit_aliased_dicts!(C, key_to_alias, key_to_accum)
+    _commit_aliased_dicts_lazy!(C, key_to_alias, key_to_accum, pending, n_pending)
     return C
 end
 

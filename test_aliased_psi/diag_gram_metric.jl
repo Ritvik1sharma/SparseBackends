@@ -252,7 +252,7 @@ function run_bond(b, psi_d, psi_ali, gc_d, gc_ali, H, sites, nn_ali, ee_ali)
             Cw = ITensors.get_external_storage(Hv)
             if Cw isa SparseBackends.WrappedAliasedBlockSparse && Tw isa SparseBackends.WrappedAliasedBlockSparse
                 Hv = ITensors._itensor_from_external_storage(
-                    SparseBackends.recast_aliased_to_template(Cw, Tw))
+                    SparseBackends.align_aliased_axes(Cw, Tw))
             end
         end
         return InnerProductVec(Hv, M_dot)
@@ -283,7 +283,7 @@ function run_bond(b, psi_d, psi_ali, gc_d, gc_ali, H, sites, nn_ali, ee_ali)
             Cw = ITensors.get_external_storage(Hv)
             if Cw isa SparseBackends.WrappedAliasedBlockSparse && Tw isa SparseBackends.WrappedAliasedBlockSparse
                 Hv = ITensors._itensor_from_external_storage(
-                    SparseBackends.recast_aliased_to_template(Cw, Tw))
+                    SparseBackends.align_aliased_axes(Cw, Tw))
             end
         end
         Av = Minv_apply(Hv)
@@ -315,7 +315,7 @@ function run_bond(b, psi_d, psi_ali, gc_d, gc_ali, H, sites, nn_ali, ee_ali)
     #             Cw = ITensors.get_external_storage(Hv)
     #             if Cw isa SparseBackends.WrappedAliasedBlockSparse && Tw isa SparseBackends.WrappedAliasedBlockSparse
     #                 return ITensors._itensor_from_external_storage(
-    #                     SparseBackends.recast_aliased_to_template(Cw, Tw))
+    #                     SparseBackends.align_aliased_axes(Cw, Tw))
     #             end
     #         end
     #         return Hv

@@ -540,7 +540,7 @@ function contract_preserve_bs(A::ITensors.ITensor, B::ITensors.ITensor;
   end
   # #recast-kill (gated SB_ALIASED_ALIGN_OUTPUT): ask the aliased contract to emit
   # its output already in the aliased template's axis order, so the downstream
-  # recast_aliased_to_template becomes a no-op. Only set for an aliased template
+  # align_aliased_axes becomes a no-op. Only set for an aliased template
   # (routes to the aliased contract overload that accepts preferred_output_labels).
   # Caller-provided ordered output labels (e.g. the dense-chain next-step hint)
   # take precedence; otherwise derive from the aliased template (recast-align).

@@ -73,6 +73,12 @@ Storage layout
 `keys` are kept sorted in column-major order (same convention as
 `NewBlockSparseSorted`), enabling O(log N) binary-search element access.
 """
+# Shared empty default for the factor-core hint below: constructing an aliased
+# tensor without the hint costs ZERO allocation (all empties alias this one). Safe
+# because the hint is only ever *reassigned* (population builds a fresh vector),
+# never mutated in place.
+const _EMPTY_SLICE_MAP = Int[]
+
 mutable struct AliasedBlockSparse{T,N,N2,P,K<:Integer,AI<:Integer} <: SparseTensor{T,N}
     dims        :: NTuple{N,Int}
     blksize     :: Int                       # prod(dims[P+1 : N])
@@ -81,6 +87,19 @@ mutable struct AliasedBlockSparse{T,N,N2,P,K<:Integer,AI<:Integer} <: SparseTens
     keys        :: Vector{NTuple{P,K}}       # sorted sparse prefix keys (key type K)
     alias_ids   :: Vector{AI}                # alias_ids[i] → template index (1-based)
     scalars     :: Vector{T}                 # scalar multiplier per block
+    # factor-core hint (empty by default): slice_to_template[s] = template id holding
+    # core's physical-slice s, for ψ built via COO-MPO × dense-MPS (ψ = P·core, diagonal
+    # P). Lets read_core/write_core! recover/mutate the underlying core MPS in place.
+    # Only populated by the contract_aliased_coo_dense kernel; every other constructor
+    # / copy / permute leaves it EMPTY (read_core then re-derives it from `keys`).
+    slice_to_template :: Vector{Int}
+    # 7-arg inner constructor keeps every existing call site working (defaults the hint
+    # empty); struct is mutable so the COO×dense kernel sets it after construction.
+    function AliasedBlockSparse{T,N,N2,P,K,AI}(dims, blksize, templates, n_templates,
+                                               keys, alias_ids, scalars) where {T,N,N2,P,K,AI}
+        return new{T,N,N2,P,K,AI}(dims, blksize, templates, n_templates,
+                                  keys, alias_ids, scalars, _EMPTY_SLICE_MAP)
+    end
 end
 
 # Outer constructor inferring the alias-id type AI from the passed vector. Keeps

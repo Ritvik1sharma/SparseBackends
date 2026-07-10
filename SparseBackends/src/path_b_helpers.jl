@@ -24,10 +24,20 @@ using TimerOutputs: @timeit
 # Direction switches do not require rebuilding (the cache stays valid for
 # the side that was being updated, the other side stayed valid throughout).
 # Net cost: O(N) contractions per sweep (down from O(N²)).
+# ── SUPERSEDED by the env-slice (Stage 1, 2026-07) ───────────────────────────
+# ψ = P·core and [H,P]=0 ⇒ Lgram = core†P†P core is EXACTLY the identity-string
+# channel of the H-env Lenv = core†P†HP core that DMRG already builds. So the
+# gram is now obtained by slicing lproj/rproj onto H's identity co-vector
+# (build_covector_cache + inline slice in dmrg.jl), NOT by a separate ψ†ψ
+# transfer. Validated bit-exact (scale 1, residual ~1e-16) at every bond via
+# test_aliased_psi/diag_env_gram_overlap.jl. The independent-transfer cache
+# below is kept commented for reference / quick revert.
+#=
 mutable struct GramCache
     L::Vector{ITensors.ITensor}
     R::Vector{ITensors.ITensor}
 end
+=#
 
 # Helper: dag(T) with all Link indices primed (the convention used in the
 # gram contractions).
@@ -41,8 +51,8 @@ function _dag_link_primed(T::ITensors.ITensor)
     return Td
 end
 
-# Build both L and R caches from scratch. Called once at the start of DMRG.
-# Cost: 2N contractions (one full pass left-to-right + one right-to-left).
+# ── SUPERSEDED ψ†ψ transfer cache (see header above); kept for reference. ────
+#=
 function init_gram_cache(psi)
     N = length(psi)
     L = Vector{ITensors.ITensor}(undef, N + 1)
@@ -57,26 +67,57 @@ function init_gram_cache(psi)
     end
     return GramCache(L, R)
 end
-
-# Update L[i+1] after psi[i] has changed. Called after replacebond! at b
-# in the forward direction (psi[b] is now the newly-fixed left tensor).
 function update_left!(cache::GramCache, psi, i::Int)
     @inbounds cache.L[i + 1] = cache.L[i] * psi[i] * _dag_link_primed(psi[i])
     return cache
 end
-
-# Update R[i] after psi[i] has changed. Called after replacebond! at b
-# in the backward direction (psi[b+1] is now the newly-fixed right tensor;
-# pass i=b+1).
 function update_right!(cache::GramCache, psi, i::Int)
     @inbounds cache.R[i] = cache.R[i + 1] * psi[i] * _dag_link_primed(psi[i])
     return cache
 end
-
-# Retrieve gram envs for bond b. Lgram at b = gram of ψ[1..b-1] = cache.L[b].
-# Rgram at b = gram of ψ[b+2..N] = cache.R[b+2].
 get_left_gram(cache::GramCache, b::Int)  = @inbounds cache.L[b]
 get_right_gram(cache::GramCache, b::Int) = @inbounds cache.R[b + 2]
+=#
+
+# ── Stage 1: gram = identity-channel slice of the H-env ───────────────────────
+# The identity co-vector is a property of H's MPO alone (fixed all run), so we
+# precompute it ONCE. Per bond, the gram is one cheap contraction of the env
+# DMRG already built: Lgram(b) = lproj · eL[b], Rgram(b) = rproj · eR[b+2]
+# (done inline in dmrg.jl, which has the ProjMPO).
+#
+# Identity-coefficient transfer of one MPO tensor: trace its physical legs and
+# divide by the physical dim d. The identity operator has coefficient 1; every
+# traceless single-site operator (Sx,Sy,Sz,…) drops out. So propagating this
+# selects the "no operator fired yet" channel = ⟨ψ|ψ⟩. (For a Hamiltonian whose
+# MPO carries NON-traceless off-diagonal operators this selector would need
+# revisiting — assert/verify per H; validated for the KL model.)
+struct CoVectorCache
+    eL::Vector{ITensors.ITensor}   # eL[i] = identity co-vector over sites 1..i-1  (⇒ Lgram(b)=lproj·eL[b])
+    eR::Vector{ITensors.ITensor}   # eR[i] = identity co-vector over sites i..N    (⇒ Rgram(b)=rproj·eR[b+2])
+end
+
+function _mpo_identity_transfer(Hi::ITensors.ITensor)
+    is  = collect(ITensors.inds(Hi))
+    ket = only(filter(I -> ITensors.plev(I) == 0 && ITensors.hastags(I, "Site"), is))
+    bra = only(filter(I -> ITensors.plev(I) == 1 && ITensors.hastags(I, "Site"), is))
+    return (Hi * ITensors.delta(ket, bra)) / ITensors.dim(ket)
+end
+
+# Precompute the identity co-vectors from H's MPO (call once at DMRG start).
+function build_covector_cache(H)
+    N  = length(H)
+    eL = Vector{ITensors.ITensor}(undef, N + 1)
+    eR = Vector{ITensors.ITensor}(undef, N + 1)
+    eL[1]     = ITensors.ITensor(1.0)                 # over sites 1..0 (empty)
+    @inbounds for i in 1:N
+        eL[i + 1] = eL[i] * _mpo_identity_transfer(H[i])
+    end
+    eR[N + 1] = ITensors.ITensor(1.0)                 # over sites N+1..N (empty)
+    @inbounds for i in N:-1:1
+        eR[i] = eR[i + 1] * _mpo_identity_transfer(H[i])
+    end
+    return CoVectorCache(eL, eR)
+end
 
 # Is this MPS using sparse storage? Used to gate Path-B code paths in DMRG.
 function is_sparse_mps(psi)::Bool
@@ -110,8 +151,9 @@ function build_minv_half_pair_bs_side(G::ITensors.ITensor,
   end
   if !ITensors.has_external_storage(phi_template) ||
      !(ITensors.get_external_storage(phi_template) isa WrappedBlockSparse)
-    # phi must be BS to extract allowed chan values
-    return build_half_pair_single(G; rtol)
+    # phi must be BS to extract allowed chan values; the dense fallback uses the
+    # dense-path cutoff (build_half_pair_single's own default), NOT bs_side's rtol.
+    return build_half_pair_single(G)
   end
   pw = ITensors.get_external_storage(phi_template)
   phi_bs = pw.blocksparse
@@ -126,7 +168,7 @@ function build_minv_half_pair_bs_side(G::ITensors.ITensor,
   mult_unp_list = filter(I -> (I in phi_dense_set),  unp)
   if isempty(chan_unp_list)
     # No channel axes — single-axis case. Fall back to dense (no restriction needed).
-    return build_half_pair_single(G; rtol)
+    return build_half_pair_single(G)
   end
 
   function _primed_of(I::ITensors.Index, all_prm::Vector)
@@ -293,8 +335,8 @@ end
 # Per-side eigen is on a (bond_dim_total)² matrix (~160² for N=4 mid bond)
 # instead of the combined (bond_dim²)² matrix (~25600²) — ~2,000,000× fewer
 # eigen ops AND avoids the multi-GB densification of the combined M.
-function build_half_pair_single(G::ITensors.ITensor; rtol::Real=1e-10)
-  # Env override for the pseudo-inverse cutoff. The aliased gram M is
+function build_half_pair_single(G::ITensors.ITensor; rtol::Real=0.1)
+  # rtol is the pseudo-inverse cutoff (drop eigenvalues < rtol·maxλ). The aliased gram M is
   # structurally rank-deficient (dedup + channel structure → near-linearly-
   # dependent directions), so the default rtol=1e-10 retains near-null
   # eigenvalues whose 1/√λ blows up M⁻¹ and destabilises the Path-B eigsolve at
@@ -316,11 +358,20 @@ function build_half_pair_single(G::ITensors.ITensor; rtol::Real=1e-10)
   # cleans up the marginal/redundant directions on the GRADED bonds (cond up to
   # ~98 at md=40 — the spectrum is graded, not cleanly bimodal), so each local
   # eigsolve is better conditioned and lands in a slightly better minimum.
-  # Harmless for canonical M=I (no eigenvalue is dropped). Overridable via
-  # BMF_MINV_RTOL. NOTE: revisit at larger md/N — if genuine DOF ever extend
-  # below 0.1·maxλ, the cond≤10 cap would over-truncate and rtol must be relaxed
-  # (staying above the ~1e-3 stability cliff).
-  rtol = 1e-1  # knob for rtol
+  # Harmless for canonical M=I (no eigenvalue is dropped). NOTE: revisit at
+  # larger md/N — if genuine DOF ever extend below 0.1·maxλ, the cond≤10 cap
+  # would over-truncate and rtol must be relaxed (staying above the ~1e-3
+  # stability cliff).
+  #
+  # The default rtol=0.1 is now the SIGNATURE default (was previously hardcoded
+  # here, overriding the kwarg). It is overridable via dmrg's `minv_rtol` kwarg
+  # (threaded through build_minv_half_pair_factored's dense/eigen branch) — used
+  # to scan rtol, e.g. to test whether PXP's graded M has any converging cutoff.
+  # 1e-1 is NEEDED as the default: the P-projected metric M=c·Π is INTRINSICALLY
+  # rank-deficient (rank nm of nc·nm — Π kills the non-symmetric channel combos
+  # outside P's image), so M^{-1/2} must be the pseudo-inverse on the range and
+  # DROP that null space. c·Π has a huge gap (c vs ~0) so 1e-1 separates cleanly;
+  # relaxing to 1e-10 keeps near-null dirs whose 1/√λ blows up → DMRG diverges.
   G_inds = collect(ITensors.inds(G))
   if isempty(G_inds)
     # Scalar gram: pass-through. Both Mhalf and Linv are scalar 1.
@@ -401,10 +452,16 @@ end
 function build_minv_half_pair_factored(Lgram::ITensors.ITensor,
                                        Rgram::ITensors.ITensor;
                                        rtol::Real=1e-10,
+                                       minv_rtol::Union{Nothing,Real}=nothing,
                                        phi_template::Union{Nothing,ITensors.ITensor}=nothing,
                                        use_bs_restricted::Bool=false,
                                        both_aliased::Bool=false,
                                        p_c::Union{Nothing,Tuple{<:Real,<:Real}}=nothing)
+  # minv_rtol: explicit pseudo-inverse cutoff for the dense/eigen M^{-1/2} path
+  # (build_half_pair_single). nothing → that function's default (0.1). Used to
+  # scan the cutoff (e.g. PXP graded-M convergence study). Does NOT affect the
+  # BS-restricted path (use_bs_restricted) or the from-P path (p_c).
+  _dense_rtol = minv_rtol === nothing ? 0.1 : float(minv_rtol)
   # p_c = (cL, cR): Step 2b from-P path. When provided, build M^{±1/2} = c^{∓...}·G
   # directly from the geometric constant (no eigen). Default nothing → eigen path.
  @timeit SparseBackends.TIMER "build_minv_half_pair_factored" begin
@@ -421,8 +478,8 @@ function build_minv_half_pair_factored(Lgram::ITensors.ITensor,
     Mhalf_R, Linv_R = build_minv_half_pair_bs_side(Rgram, phi_template, :right; rtol)
   else
     @timeit SparseBackends.TIMER "bmf.eigen" begin
-      Mhalf_L, Linv_L = build_half_pair_single(Lgram; rtol)
-      Mhalf_R, Linv_R = build_half_pair_single(Rgram; rtol)
+      Mhalf_L, Linv_L = build_half_pair_single(Lgram; rtol=_dense_rtol)
+      Mhalf_R, Linv_R = build_half_pair_single(Rgram; rtol=_dense_rtol)
     end
     # BS-wrap dense Linv/Mhalf using phi_template's classification
     # (chan=sparse, mult=dense). Lets the BS×BS / Dense×BS kernel produce
@@ -1067,7 +1124,7 @@ function recast_to_template(z::ITensors.ITensor, template::ITensors.ITensor)
     if Cw isa WrappedBlockSparse && Tw isa WrappedBlockSparse
       return ITensors._itensor_from_external_storage(recast_bs_to_template(Cw, Tw))
     elseif Cw isa WrappedAliasedBlockSparse && Tw isa WrappedAliasedBlockSparse
-      return ITensors._itensor_from_external_storage(recast_aliased_to_template(Cw, Tw))
+      return ITensors._itensor_from_external_storage(align_aliased_axes(Cw, Tw))
     end
   end
   return z
@@ -1176,8 +1233,8 @@ function apply_minv_preserve_bs(Minv::ITensors.ITensor, y::ITensors.ITensor, tem
     elseif Cw isa WrappedAliasedBlockSparse && Tw isa WrappedAliasedBlockSparse
       # Aliased recast: align Hv's inds order to phi-template's inds order
       # so subsequent Path-B apply_minv calls see consistent classification.
-      z = @timeit SparseBackends.TIMER "amp.recast2_aliased" ITensors._itensor_from_external_storage(recast_aliased_to_template(Cw, Tw))
-      _minv_diag && minv_diag_dump("z after recast_aliased_to_template", z)
+      z = @timeit SparseBackends.TIMER "amp.recast2_aliased" ITensors._itensor_from_external_storage(align_aliased_axes(Cw, Tw))
+      _minv_diag && minv_diag_dump("z after align_aliased_axes", z)
     end
   end
   _minv_diag && minv_diag_dump("z RETURNED", z)
@@ -1185,145 +1242,3 @@ function apply_minv_preserve_bs(Minv::ITensors.ITensor, y::ITensors.ITensor, tem
  end
 end
 
-# ------------------------------------------------------------------
-# Generalized Rayleigh-Ritz local eigensolve (BMF_RAYLEIGH_RITZ path).
-#
-# Solves the local generalized problem  H_eff·φ = E·M·φ  WITHOUT ever applying
-# M^{±1/2} to a vector (the operation that discards aliasing in the B_op/A_op
-# paths). It projects onto a small aliased Krylov subspace built only from H·v,
-# forms tiny k×k matrices H_small / M_small via SCALAR inner products (M applied
-# with the RAW Lgram/Rgram — no square root, no BMF_MINV_RTOL pseudoinverse), and
-# solves the k×k generalized eig densely with a per-block null projection. The
-# Ritz vector φ_new = Σ cᵢ vᵢ is an aliased linear combo of φ-schema vectors, so
-# it stays aliased (combos of same-(P,N2)-schema aliased tensors never densify).
-# ------------------------------------------------------------------
-
-# Pick the eigenvalue index matching KrylovKit's `which` selector. DMRG ground
-# state uses :SR (smallest real) → most-negative algebraic eigenvalue.
-function _rr_select_index(vals, which::Symbol)
-    rv = real.(vals)
-    if which in (:LR, :LA, :largest, :LM)
-        return argmax(rv)
-    else                      # :SR, :SA, :smallest, default
-        return argmin(rv)
-    end
-end
-
-# Solve H_small c = λ M_small c, k×k, with M_small symmetric PSD but possibly
-# rank-deficient (M is structurally rank-deficient for aliased ψ). Project out
-# M_small's near-null directions (per-block analog of the per-side pseudoinverse),
-# whiten, solve the reduced standard symmetric eig, and recover c in the original
-# basis (already M-normalized: cᵀ·M_small·c = 1).
-function solve_small_geneig(Hs::AbstractMatrix, Ms::AbstractMatrix, which::Symbol; rtol::Real=1e-8)
-    k = size(Hs, 1)
-    Hsym = LinearAlgebra.Hermitian((Hs + Hs') / 2)
-    Msym = LinearAlgebra.Hermitian((Ms + Ms') / 2)
-    Fm = LinearAlgebra.eigen(Msym)            # ascending eigenvalues
-    mu = Fm.values
-    U  = Fm.vectors
-    mumax = isempty(mu) ? 0.0 : maximum(mu)
-    if mumax <= 0                              # degenerate M_small → plain eig of Hs
-        Fh = LinearAlgebra.eigen(Hsym)
-        sel = _rr_select_index(Fh.values, which)
-        return (real(Fh.values[sel]), Fh.vectors[:, sel])
-    end
-    keep = findall(>(rtol * mumax), mu)
-    UK = U[:, keep]
-    invsqrt = LinearAlgebra.Diagonal(1 ./ sqrt.(mu[keep]))
-    B = invsqrt * (UK' * (Matrix(Hsym) * UK)) * invsqrt
-    B = LinearAlgebra.Hermitian((B + B') / 2)
-    Fb = LinearAlgebra.eigen(B)
-    sel = _rr_select_index(Fb.values, which)
-    lam = real(Fb.values[sel])
-    c = UK * (invsqrt * Fb.vectors[:, sel])
-    return (lam, c)
-end
-
-# Driver. `Hop` is the H_eff apply closure (built in dmrg.jl as
-# v -> recast_to_phi(product(PH, v)) — must NOT be built here: SparseBackends
-# does not depend on ITensorMPS). `phi` is the current local tensor (the schema
-# template + starting vector). Lgram/Rgram are the raw bond grams. Returns
-# (vals, vecs) matching the B_op/A_op contract: vals[1] real, vecs[1] aliased.
-function rayleigh_ritz_local_eigsolve(Hop::Function, phi::ITensors.ITensor,
-        Lgram::ITensors.ITensor, Rgram::ITensors.ITensor;
-        which::Symbol = :SR, tol::Real = 1e-12,
-        krylovdim::Int = 8, maxiter::Int = 100,
-        rtol::Real = 1e-8, b::Int = 0, ha::Int = 0, sw::Int = 0)
- @timeit SparseBackends.TIMER "rayleigh_ritz" begin
-    # M·v via RAW gram (no M^{1/2}). The result is consumed only by a scalar
-    # `inner`, so any transient densification here does not enter the basis.
-    Mop = v -> apply_minv_preserve_bs(Lgram, apply_minv_preserve_bs(Rgram, v, phi), phi)
-    _ip(a, c) = real(ITensors.inner(a, c))
-    _nrm(a) = sqrt(max(_ip(a, a), 0.0))
-    orth_tol = 1e-12
-    # RR-iteration debug print, disabled; flip to `true` (and restore the check
-    # below) to re-enable. Note: this whole Rayleigh-Ritz eigensolve is parked
-    # (never called in production, ~2.5x slower than the default B_op path).
-    dbg = false
-    kdim = max(krylovdim, 2)
-
-    n0 = _nrm(phi)
-    n0 == 0 && return ([0.0], [phi])
-    x = (1.0 / n0) * phi
-    V = ITensors.ITensor[x]
-    lam = 0.0
-    lam_prev = Inf
-
-    for outer_it in 1:maxiter
-        # ── grow block to kdim with DGKS double re-orthogonalization (standard
-        #    inner product — keeps φ-schema combos aliased; M handled in the
-        #    k×k solve) ──
-        while length(V) < kdim
-            w = Hop(V[end])
-            for _pass in 1:2, u in V
-                w = w - _ip(u, w) * u
-            end
-            nw = _nrm(w)
-            nw < orth_tol && break              # breakdown → block complete
-            push!(V, (1.0 / nw) * w)
-        end
-        k = length(V)
-
-        # ── small matrices: H_small / M_small via scalar inner products ──
-        HV = [Hop(V[j]) for j in 1:k]
-        MV = [Mop(V[j]) for j in 1:k]
-        Hs = Array{Float64}(undef, k, k)
-        Ms = Array{Float64}(undef, k, k)
-        for i in 1:k, j in 1:k
-            Hs[i, j] = _ip(V[i], HV[j])
-            Ms[i, j] = _ip(V[i], MV[j])
-        end
-
-        lam, c = solve_small_geneig(Hs, Ms, which; rtol=rtol)
-
-        # ── Ritz vector + its H/M images via the SAME coefficients ──
-        x  = c[1] * V[1]
-        Hx = c[1] * HV[1]
-        Mx = c[1] * MV[1]
-        for j in 2:k
-            x  = x  + c[j] * V[j]
-            Hx = Hx + c[j] * HV[j]
-            Mx = Mx + c[j] * MV[j]
-        end
-
-        # ── generalized residual r = H x - λ M x ──
-        r = Hx - lam * Mx
-        rnorm = _nrm(r)
-        # if dbg
-        #     println("[RR b=$b ha=$ha sw=$sw] it=$outer_it k=$k lam=$lam rnorm=$rnorm")
-        #     flush(stdout)
-        # end
-        if rnorm < tol || abs(lam - lam_prev) < tol
-            return ([lam], [x])
-        end
-        lam_prev = lam
-
-        # ── thick restart: new basis = {Ritz vector, residual direction} ──
-        rr = r - _ip(x, r) * x
-        nrr = _nrm(rr)
-        V = nrr < orth_tol ? ITensors.ITensor[x] :
-                             ITensors.ITensor[x, (1.0 / nrr) * rr]
-    end
-    return ([isfinite(lam_prev) ? lam_prev : lam], [x])
- end
-end
