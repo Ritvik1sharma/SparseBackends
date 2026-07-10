@@ -72,6 +72,22 @@ function parse_command_line()
         "--no-excited"
             help = "Skip the excited-state search (useful for quick benchmarking)."
             action = :store_true
+        "--run-mode"
+            help = "Path-B eigensolve mode: bop_aliased (default √-frame), rr (Rayleigh-Ritz), minner (M-inner Lanczos), bop_densify."
+            arg_type = String
+            default = "bop_aliased"
+        "--gram-from-h"
+            help = "true = covector env-slice gram (assumes traceless H — WRONG for PXP); false = direct ψ†ψ transfer (correct for any H). PXP needs false."
+            arg_type = Bool
+            default = false
+        "--rr-dense-iter"
+            help = "run_mode=rr only: run the local eigensolve fully DENSE and re-alias only at φ recovery (snap_dense_to_aliased). Diagnostic."
+            arg_type = Bool
+            default = false
+        "--minv-rtol"
+            help = "bop_* only: M^{-1/2} pseudo-inverse cutoff (drop eigenvalues < rtol·maxλ). NaN → default 0.1. Scan to test whether PXP's graded M has any converging cutoff."
+            arg_type = Float64
+            default = NaN
         "--roofline"
             help = "Enable the consolidated roofline/flop-count/env-footprint/perm-capture/GEMM-histogram instrumentation."
             arg_type = Bool
@@ -131,18 +147,26 @@ end
 # ── Sweep runner ──────────────────────────────────────────────────────────────
 function run_sweeps(H, psi0, n_sweeps::Int, maxdim::Int;
                     cutoff=1e-10, mindim=1, target_E=NaN, label="ALI",
-                    orthogonal_states=nothing, weight=20.0, roofline::Bool=false)
+                    orthogonal_states=nothing, weight=20.0, roofline::Bool=false,
+                    run_mode::Symbol=:bop_aliased, gram_from_h::Bool=false,
+                    rr_dense_iter::Bool=false, minv_rtol=nothing)
     psi = psi0
     E = NaN
     cum = 0.0; cum_excl1 = 0.0
     target_reached_sweep = 0; target_reached_cum = NaN; target_reached_cum_excl1 = NaN
     for i in 1:n_sweeps
         sw = Sweeps(1); setmaxdim!(sw, maxdim); setmindim!(sw, mindim); setcutoff!(sw, cutoff)
+        # minv_from_p=nothing → EIGEN M^{±1/2} (general). PXP's metric is NOT the
+        # scaled projector c·Π (it's a directional reduced DM), so the from-P scalar
+        # (minv_from_p=true, the dmrg default — valid only for KL) gives garbage
+        # energy here. PXP MUST use the eigen path.
         t = if orthogonal_states === nothing
-            @elapsed (E, psi, _esw, terr) = dmrg(H, psi, sw; outputlevel=0, use_early_exit=false, roofline=roofline)
+            @elapsed (E, psi, _esw, terr) = dmrg(H, psi, sw; outputlevel=0, use_early_exit=false, roofline=roofline,
+                minv_from_p=nothing, run_mode=run_mode, gram_from_h=gram_from_h, rr_dense_iter=rr_dense_iter, minv_rtol=minv_rtol)
         else
             @elapsed (E, psi, _esw, terr) = dmrg(H, orthogonal_states, psi, sw;
-                outputlevel=0, use_early_exit=false, weight=weight, roofline=roofline)
+                outputlevel=0, use_early_exit=false, weight=weight, roofline=roofline,
+                minv_from_p=nothing, run_mode=run_mode, gram_from_h=gram_from_h, rr_dense_iter=rr_dense_iter, minv_rtol=minv_rtol)
         end
         cum += t; if i > 1; cum_excl1 += t; end
         @printf("  [%s sweep %2d] t=%8.3fs  E=%.12f  maxtruncerr=%.3e\n", label, i, t, E, terr)
@@ -169,9 +193,13 @@ let
     target_E   = parsed_args["target-energy"]
     no_excited = parsed_args["no-excited"]
     roofline   = parsed_args["roofline"]
+    run_mode   = Symbol(parsed_args["run-mode"])
+    gram_from_h   = parsed_args["gram-from-h"]
+    rr_dense_iter = parsed_args["rr-dense-iter"]
+    minv_rtol     = isnan(parsed_args["minv-rtol"]) ? nothing : parsed_args["minv-rtol"]
 
     println("=== PXP benchmark — ALIASED ψ (Path-B) ===")
-    println("run_mode=:bop_aliased (default) — required for non-iso aliased ψ")
+    println("run_mode=:$run_mode  gram_from_h=$gram_from_h  rr_dense_iter=$rr_dense_iter  minv_rtol=$(minv_rtol === nothing ? "default(0.1)" : minv_rtol) — non-iso aliased ψ needs Path-B; PXP needs gram_from_h=false (direct ψ†ψ M)")
     println("N=$N  n_sweeps=$n_sweeps  maxdim=$maxdim  mindim=$mindim  target_E=$(isnan(target_E) ? "—" : target_E)")
     println("UNCAPPED (honest_bd=channel×maxdim) [DEFAULT]")
     println("ψ = ALIASED (P·ψ₀ via NotEqlsLoop_R1); DMRG on BARE H (constraint enforced structurally).")
@@ -194,7 +222,8 @@ let
     SparseBackends.reset_roofline!(roofline)  # zero accumulators once before the sweep loops below
 
     println("\n=== GROUND STATE ($n_sweeps sweeps at maxdim=$maxdim, mindim=$mindim; sweep 1 = JIT) ===")
-    res_gs = run_sweeps(H, psi_ali, n_sweeps, maxdim; mindim=mindim, target_E=target_E, roofline=roofline)
+    res_gs = run_sweeps(H, psi_ali, n_sweeps, maxdim; mindim=mindim, target_E=target_E, roofline=roofline,
+                        run_mode=run_mode, gram_from_h=gram_from_h, rr_dense_iter=rr_dense_iter, minv_rtol=minv_rtol)
     E_gs = res_gs.E; psi_gs = res_gs.psi
     avg_excl1 = n_sweeps > 1 ? res_gs.total_excl1 / (n_sweeps - 1) : NaN
     @printf("[ground]    total=%.3fs  excl1=%.3fs  avg/sw=%.3fs  E=%.12f\n",
@@ -207,7 +236,8 @@ let
         println("\n=== EXCITED STATE (orthogonal to gs; $n_sweeps sweeps; weight=20) ===")
         psi_init = deepcopy(psi_ali)
         res_ex = run_sweeps(H, psi_init, n_sweeps, maxdim; mindim=mindim, label="EX",
-                            orthogonal_states=[psi_gs], weight=20.0, roofline=roofline)
+                            orthogonal_states=[psi_gs], weight=20.0, roofline=roofline,
+                            run_mode=run_mode, gram_from_h=gram_from_h, rr_dense_iter=rr_dense_iter, minv_rtol=minv_rtol)
         E_ex = res_ex.E; psi_ex = res_ex.psi; t_ex = res_ex.total
         avg_ex = n_sweeps > 1 ? res_ex.total_excl1 / (n_sweeps - 1) : NaN
         @printf("[excited]   total=%.3fs  excl1=%.3fs  avg/sw=%.3fs  E=%.12f\n",

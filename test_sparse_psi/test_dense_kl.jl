@@ -35,6 +35,10 @@ function parse_command_line()
             help = "If set, log the first sweep at which E ≤ target (does not early-exit)."
             arg_type = Float64
             default = NaN
+        "--roofline"
+            help = "Print the PROJMPO_TIMER breakdown (eigsolve/matvec/replacebond/position), steady-state (sweeps 2..n)."
+            arg_type = Bool
+            default = false
     end
     return parse_args(s)
 end
@@ -135,7 +139,7 @@ function report_state(label, psi, E=nothing; verbose=false)
 end
 
 function run_sweeps(H, psi0, n_sweeps::Int, maxdim::Int;
-                     cutoff=1e-10, mindim=1, target_E=NaN)
+                     cutoff=1e-10, mindim=1, target_E=NaN, roofline::Bool=false)
     psi = psi0
     E = NaN
     sweep_times = Float64[]
@@ -153,6 +157,10 @@ function run_sweeps(H, psi0, n_sweeps::Int, maxdim::Int;
         cum += t
         if i > 1; cum_excl1 += t; end
         @printf("  [sweep %2d] t=%7.3fs  E=%.12f  maxtruncerr=%.3e\n", i, t, E, terr)
+        # Reset AFTER sweep 1 (JIT) so the printed breakdown is steady-state only.
+        if i == 1 && roofline
+            reset_timer!(ITensorMPS.PROJMPO_TIMER)
+        end
         if target_reached_sweep == 0 && !isnan(target_E) && E <= target_E
             target_reached_sweep = i
             target_reached_cum = cum
@@ -171,6 +179,7 @@ let
     n_sweeps = parsed_args["n-sweeps"]
     maxdim_target = parsed_args["maxdim"]
     target_E = parsed_args["target-energy"]
+    roofline = parsed_args["roofline"]
 
     println("Projector sign = $psign  (P = ∏(I", psign > 0 ? "+" : "-", "C)/2)")
     println("N_plaq=$N_plaq  n_sweeps=$n_sweeps  maxdim=$maxdim_target  target_E=$(isnan(target_E) ? "—" : target_E)")
@@ -181,7 +190,7 @@ let
 
     reset_timer!(ITensorMPS.PROJMPO_TIMER)
     println("\n=== RUN ($n_sweeps sweeps at maxdim=$maxdim_target; sweep 1 = JIT) ===")
-    res = run_sweeps(H_d, psi_d, n_sweeps, maxdim_target; target_E=target_E)
+    res = run_sweeps(H_d, psi_d, n_sweeps, maxdim_target; target_E=target_E, roofline=roofline)
     E_prof = res.E; psi_prof = res.psi
 
     avg_excl1 = n_sweeps > 1 ? res.total_excl1 / (n_sweeps - 1) : NaN
@@ -202,5 +211,10 @@ let
     end
     println("\n--- final state ---")
     report_state("final psi_d", psi_prof, E_prof; verbose=true)
+
+    if roofline
+        println("\n========== ITensorMPS.PROJMPO_TIMER (dense, steady-state sweeps 2..$n_sweeps) ==========")
+        print_timer(ITensorMPS.PROJMPO_TIMER)
+    end
 end
 nothing

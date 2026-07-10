@@ -153,7 +153,7 @@ length(ARGS) < 1 && error("Usage: julia test_check_working_aliased.jl <N_plaq>")
 
 let
     spin        = parse(Int, get(ENV, "BENCH_SPIN", "3"))
-    spin_sector = 1.0
+    spin_sector = parse(Float64, get(ENV, "BENCH_PSIGN", "1.0"))   # projector eigenvalue sector (+1/-1)
     N           = parse(Int, ARGS[1])
     states      = 2*N + 2
 
@@ -210,10 +210,12 @@ let
     fuse_sparse_links!(H_new_aliased)
     println("  post-fuse H[3] inds: ", inds(H_new_aliased[3]))
 
-    if get(ENV, "SB_PREPERMUTE_H", "0") == "1"
-        println("\n[prepermuting aliased H tails]")
-        prepermute_aliased_mpo!(H_new_aliased)
-    end
+    # HARDENED: prepermute the aliased H dense tails unconditionally (was gated by
+    # SB_PREPERMUTE_H). Bakes the operand tail reorder into the constant H once so
+    # the per-matvec permute_A is ~identity (measured: add.permute_A alloc −81%,
+    # bit-identical E). No env knob.
+    println("\n[prepermuting aliased H tails]")
+    prepermute_aliased_mpo!(H_new_aliased)
 
     # ── Reference dense path ──────────────────────────────────────────────────
     H_new2 = sandwich_mpo_dense(ConsOpsCombined2, copy(H))
@@ -237,7 +239,7 @@ let
     end
 
     # ── DMRG ─────────────────────────────────────────────────────────────────
-    Random.seed!(42)
+    Random.seed!(parse(Int, get(ENV, "BENCH_SEED", "42")))   # initial-state seed (benchmark knob)
     psi_old = random_mps(sites)
     psi0    = copy(psi_old)
     for j in 1:N

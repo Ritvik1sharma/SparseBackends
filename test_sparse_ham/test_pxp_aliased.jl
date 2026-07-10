@@ -17,7 +17,7 @@
 # and compare energies + per-site MPO footprint.
 #
 # Usage:
-#   SB_FUSE_LINKS=1 SB_PLAN_B=1 \
+#   SB_FUSE_LINKS=1 \
 #     BENCH_MAXDIM=40 BENCH_NSWEEPS=6 \
 #     julia --project=. test_sparse_ham/test_pxp_aliased.jl <N>
 
@@ -106,7 +106,8 @@ end
 length(ARGS) < 1 && error("Usage: julia test_pxp_aliased.jl <N>")
 
 let
-    Random.seed!(42)
+    _seed = parse(Int, get(ENV, "BENCH_SEED", "42"))   # initial-state seed (benchmark knob)
+    Random.seed!(_seed)
     N     = parse(Int, ARGS[1])
     sites = siteinds("S=1", N)
 
@@ -123,12 +124,12 @@ let
     fuse_sparse_links!(H_aliased)
     length(H_aliased) >= 3 && println("  post-fuse H[3] inds: ", inds(H_aliased[3]))
 
-    if get(ENV, "SB_PREPERMUTE_H", "0") == "1"
-        println("\n[prepermuting aliased H tails]")
-        length(H_aliased) >= 3 && println("  pre-perm  H[3] inds: ", inds(H_aliased[3]))
-        prepermute_aliased_mpo!(H_aliased)
-        length(H_aliased) >= 3 && println("  post-perm H[3] inds: ", inds(H_aliased[3]))
-    end
+    # HARDENED: prepermute aliased H dense tails unconditionally (was gated by
+    # SB_PREPERMUTE_H) → per-matvec permute_A ~identity, bit-identical E. No knob.
+    println("\n[prepermuting aliased H tails]")
+    length(H_aliased) >= 3 && println("  pre-perm  H[3] inds: ", inds(H_aliased[3]))
+    prepermute_aliased_mpo!(H_aliased)
+    length(H_aliased) >= 3 && println("  post-perm H[3] inds: ", inds(H_aliased[3]))
 
     println("\n[Building H_dense via sandwich_mpo_dense]")
     H_dense = sandwich_mpo_dense(P, copy(H_raw))
@@ -173,7 +174,7 @@ let
         H_aliased, deepcopy(psi_init); nsweeps=_ns, maxdim, mindim, cutoff, outputlevel=1, run_label="ALIASED_G")
 
     # ── First excited state ───────────────────────────────────────────────────
-    Random.seed!(43)
+    Random.seed!(_seed + 1)   # excited init seed = ground seed + 1 (was hardcoded 43)
     psi_raw2  = random_mps(sites)
     psi_init2 = replaceprime(contract(P, psi_raw2; cutoff=1e-12), 1 => 0)
     normalize!(psi_init2)

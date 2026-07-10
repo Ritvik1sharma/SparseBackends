@@ -128,7 +128,7 @@ export FLOP_COUNTER, reset_flops!, report_flops, add_dense_macs!, add_aliased_ma
 # export whatever should be public:
 export NewBlockSparseSorted, blocksparse_from_dense, to_dense
 export COOTensor, coo_from_dense, to_dense
-export AliasedBlockSparse, to_blocksparse, to_dense, contract_aliased!, compression_ratio
+export AliasedBlockSparse, to_blocksparse, to_dense, contract_aliased!, compression_ratio, compress_aliased_templates!
 export WrappedAliasedBlockSparse, contract_aliased_itensor,
        contract_coo_dense_aliased
 
@@ -197,9 +197,11 @@ include("tensor_index.jl")
 include("tensor_contraction.jl")
 include("tensor_wrappers_aliased.jl")   # WrappedAliasedBlockSparse + top-level aliased contract functions
 include("aliased/factorize.jl")         # Aliased-aware factorize (Tier 1: dense SVD + re-aliasify)
+include("aliased/factor_core.jl")       # factor-core read_core/write_core!/slice_to_template (ψ=P·core)
 
 # Path-B (generalized eigsolve) helpers for sparse DMRG. Must be after
 # tensor_wrappers.jl so contract_preserve_bs / recast_bs_to_template are in scope.
 include("path_b_utils.jl")
 include("path_b_helpers.jl")
+include("rayleigh_ritz.jl")              # Rayleigh-Ritz local eigensolve (split from path_b_helpers.jl)
 end

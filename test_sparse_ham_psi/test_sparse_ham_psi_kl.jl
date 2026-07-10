@@ -127,10 +127,10 @@ function build_setup(N::Int, psign::Int, spin::Int; want_dense::Bool)
         println("  [fusing multi-strand sparse links in H_ali]")
         fuse_sparse_links!(H_ali)
     end
-    if get(ENV, "SB_PREPERMUTE_H", "0") == "1"
-        println("  [prepermuting aliased H tails]")
-        prepermute_aliased_mpo!(H_ali)
-    end
+    # HARDENED: prepermute aliased H dense tails unconditionally (was gated by
+    # SB_PREPERMUTE_H) → per-matvec permute_A ~identity, bit-identical E. No knob.
+    println("  [prepermuting aliased H tails]")
+    prepermute_aliased_mpo!(H_ali)
 
     # ── DENSE PHP reference (same construction as test_dense_kl.jl). ────────────
     H_dense = nothing; psi_dense = nothing
