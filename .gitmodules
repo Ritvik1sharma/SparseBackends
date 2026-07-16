@@ -1,7 +1,7 @@
 [submodule "ITensorMPS.jl"]
 	path = ITensorMPS.jl
 	url = https://github.com/Ritvik1sharma/ITensorMPS.jl.git
-	branch = sparse-edits-optimized
+	branch = sparse-edits-code-pruning
 [submodule "ITensors.jl"]
 	path = ITensors.jl
 	url = https://github.com/Ritvik1sharma/ITensors.jl.git
