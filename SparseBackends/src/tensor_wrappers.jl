@@ -474,6 +474,37 @@ function contract(A::ITensors.ITensor, B::ITensors.ITensor,
   return ITensors._itensor_from_external_storage(Cw)
 end
 
+# Three-backend public form: explicit OUTPUT backend `Cbackend`. Prefer this over
+# calling the internal `contract_aliased_itensor` directly — it is the consistent
+# public entry point when the output storage must be forced independently of the
+# input backends (e.g. `:coo × :dense → :aliased`, which neither input backend
+# would yield on its own). Delegates to the aliased kernel for `Cbackend=:aliased`
+# and to the two-backend method otherwise.
+function contract(A::ITensors.ITensor, B::ITensors.ITensor,
+                  Abackend::Union{Symbol,Backend},
+                  Bbackend::Union{Symbol,Backend},
+                  Cbackend::Union{Symbol,Backend};
+                  denseLinksA::Union{Nothing,Int}=nothing,
+                  denseLinksB::Union{Nothing,Int}=nothing,
+                  preserve_bs_output::Bool=true,
+                  preferred_output_labels::Union{Nothing,AbstractVector}=nothing,
+                  next_op=nothing,
+                  output_perm::Union{Nothing,Vector{Int}}=nothing,
+                  emit_window_map::Bool=false)
+  Cb = to_backend(Cbackend)
+  if Cb === ALIASED
+    return contract_aliased_itensor(A, B, Abackend, Bbackend;
+                                    denseLinksA=denseLinksA, denseLinksB=denseLinksB,
+                                    preserve_bs_output=preserve_bs_output,
+                                    preferred_output_labels=preferred_output_labels,
+                                    next_op=next_op, output_perm=output_perm,
+                                    emit_window_map=emit_window_map)
+  end
+  return contract(A, B, Abackend, Bbackend;
+                  denseLinksA=denseLinksA, denseLinksB=denseLinksB,
+                  preserve_bs_output=preserve_bs_output)
+end
+
 # Convenience: contract two ITensors (each carrying any storage) while forcing
 # the output to keep its WrappedBlockSparse storage even when the natural
 # output would be a plain dense ITensor. Used by Path-B sparse DMRG where

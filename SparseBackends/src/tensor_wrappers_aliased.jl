@@ -973,6 +973,49 @@ function static_output_perm(bondtype::Symbol, step::Int)::Union{Nothing,Vector{I
     return get(STATIC_OUTPUT_PERM, (bondtype, step), nothing)
 end
 
+# Dense-ψ × aliased-H matvec output-order table. Value = perm of the kernel's
+# NATURAL output labels (labelsC_vec) giving the chosen output order:
+# `canon_labels = labelsC_vec[perm]`. Only the two aliased matvec steps (2,3) hit
+# the ali_dense_path; env steps (1,4) are dense. Deterministic across ALL sweeps
+# because φ is pinned to [:l,:s2,:r,:s] at dmrg phi_build (reorder_to_roles) AND
+# step 1 runs `env * φ` (swapped) with env pre-ordered [ket,dense-H,fused,bra] by
+# _permute_env_to_canonical!, so step-1 emits T1 in "Layout C". `ndims` is fixed by
+# bondtype (leg count is bd-independent), so (bondtype, step) is a sufficient key.
+#
+# NOTATION (see MATVEC_INDEX_ORDER_ANALYSIS): links l1(left) l2(mid) l3(right),
+# strands per link ⁰=ket, ⁴¹=dense-H channel, ³¹/²¹=bra, F1/F2/F3=fused-sparse
+# channel; sites s2(first) s3(second), ⁰=ket ¹=bra. Each aliased step is the kernel
+# einsum `H(...) * B(...) -> out(...)`; the kernel reads B STRIDED (no permute_B)
+# iff B = [red | gapBefore(shared) | keepB(CONTIG) | gapAfter(shared)]. Maps below
+# are the GROUND (pinned-φ) path; EXCITED reuses these entries but φ is NOT pinned
+# there, so its T1/T2 differ and the strided read generally does not fire.
+#
+# Steps 2,3 einsums and where the transpose lands (verified from do_trace, N=8):
+#   (bulk,2)  H_b   (s2⁰,s2¹,F1,F2,l2⁴¹,l1⁴¹) * T1(l1⁴¹,F1,l1³¹,s3⁰,l3⁰,s2⁰)
+#                 -> T2(l2⁴¹,s2¹,s3⁰,l3⁰,l1³¹,F2)         [STRIDED: keepB{l1³¹,s3⁰,l3⁰} contig]
+#   (bulk,3)  H_b+1 (s3⁰,s3¹,F2,F3,l3⁴¹,l2⁴¹) * T2(l2⁴¹,s2¹,s3⁰,l3⁰,l1³¹,F2)
+#                 -> T3(s2¹,l3⁰,l1³¹,l3⁴¹,s3¹,F3)         [permB: keepB{s2¹,l3⁰,l1³¹} split by s3⁰ — the forced 2→3 transpose]
+#   (left,2)  H_s2  (s2⁰,s2¹,F1,F2,l2⁴¹,l1⁴¹) * T1(l2⁴¹,F2,l2²¹,s2⁰,s1⁰)
+#                 -> T2(l1⁴¹,s2¹,s1⁰,l2²¹,F1)             [permB: keepB{l2²¹,s1⁰} split by s2⁰ — chain reversed, contracts right link first]
+#   (left,3)  H_s1  (s1⁰,s1¹,F1,l1⁴¹) * T2(l1⁴¹,s2¹,s1⁰,l2²¹,F1)
+#                 -> T3(s2¹,l2²¹,s1¹)                     [permB: keepB{s2¹,l2²¹} split by s1⁰]
+#   (right,2) H_s   (sa⁰,sa¹,F1,F2,l2⁴¹,l1⁴¹) * T1(l1⁴¹,F1,l1²¹,sb⁰,sa⁰)
+#                 -> T2(l2⁴¹,sa¹,sb⁰,l1²¹,F2)             [STRIDED: keepB{l1²¹,sb⁰} contig]
+#   (right,3) H_s+1 (sb⁰,sb¹,F2,l2⁴¹) * T2(l2⁴¹,sa¹,sb⁰,l1²¹,F2)
+#                 -> T3(sa¹,l1²¹,sb¹)                     [permB: keepB{sa¹,l1²¹} split by sb⁰]
+# So the ground strided read fires at (bulk,2) and (right,2); the rest permute
+# (the (·,3) fires are the intrinsic forced 2→3 transpose; (left,2) is edge geometry).
+const STATIC_OUTPUT_PERM_DENSE = Dict{Tuple{Symbol,Int}, Vector{Int}}(
+    (:bulk,  2) => [3, 1, 5, 6, 4, 2],   # -> T2(l2⁴¹,s2¹,s3⁰,l3⁰,l1³¹,F2)
+    (:bulk,  3) => [4, 5, 6, 3, 1, 2],   # -> T3(s2¹,l3⁰,l1³¹,l3⁴¹,s3¹,F3)
+    (:left,  2) => [3, 1, 5, 4, 2],      # -> T2(l1⁴¹,s2¹,s1⁰,l2²¹,F1)
+    (:left,  3) => [2, 3, 1],            # -> T3(s2¹,l2²¹,s1¹)
+    (:right, 2) => [3, 1, 5, 4, 2],      # -> T2(l2⁴¹,sa¹,sb⁰,l1²¹,F2)
+    (:right, 3) => [2, 3, 1],            # -> T3(sa¹,l1²¹,sb¹)
+)
+static_output_perm_dense(bondtype::Symbol, step::Int)::Union{Nothing,Vector{Int}} =
+    get(STATIC_OUTPUT_PERM_DENSE, (bondtype, step), nothing)
+
 # Reorder an aliased φ so the legs it shares with `op` sit LAST within its sparse
 # prefix and within its dense tail — i.e. φ laid out A-canonically for the
 # contraction φ·op. Used (in dmrg `position!`) to put the eigensolver seed /
@@ -1045,6 +1088,7 @@ function wrapped_contract_aliased(
     remaining_ops=nothing,
     output_perm::Union{Nothing,Vector{Int}}=nothing,
     in_position::Bool=false,
+    emit_window_map::Bool=false,
 ) where {TA,TB,NA,NB}
     @timeit TIMER "get_data_info" begin
         Arep   = rep(A)
@@ -1091,6 +1135,21 @@ function wrapped_contract_aliased(
         labelsA_vec = fill_labels!(sc.labelsA, indsA)
         labelsB_vec = fill_labels!(sc.labelsB, indsB)
         labelsC_vec = fill_labels!(sc.labelsC, indsC)
+    end
+
+    # ── factor-core window-map path (off by default) ──────────────────────────
+    # ψ[b]·ψ[b+1] with BOTH inputs aliased P·core (slice_to_template populated). Route
+    # straight to the AliasedBS×AliasedBS contract_shared! with emit_window_map=true so
+    # it emits C.window_slice_map (the (rv_b,rv_{b+1})→tid routing). Bypasses the output-
+    # order alignment (template ids are order-independent; φ is read by explicit index
+    # lists downstream, so order is irrelevant here). This build is once-per-bond, not
+    # the hot matvec, so the align optimization is not needed.
+    if emit_window_map && Arep isa AliasedBlockSparse && Brep isa AliasedBlockSparse &&
+       !isempty(Arep.slice_to_template) && !isempty(Brep.slice_to_template)
+        Ce = WrappedAliasedBlockSparse(TC, dimsC, denseLinksC, indsC)
+        Ce.aliased = contract_shared_emit_window!(Ce.aliased, labelsC_vec,
+                                                  Arep, labelsA_vec, Brep, labelsB_vec)
+        return Ce
     end
 
     @timeit TIMER "!preserve_bs_output_path" begin
@@ -1145,13 +1204,15 @@ function wrapped_contract_aliased(
                     #        upstream's c_prefix  → next call's shared_prefix
                     #      So the right canonical order is
                     #        [b_other, keepA_labs, b_to_next, c_prefix_labs].
-                    # Priority 0: explicit `next_op` — derive the order from this
-                    # step's own output labels (labelsC_vec) + next_op's schema, so
-                    # the caller needn't recompute the shared/output index set.
-                    _next_canon = next_op === nothing ? nothing :
-                        _canon_labels_for_next(next_op, indsA, indsB, labelsC_vec)
-                    if _next_canon !== nothing
-                        canon_labels = _next_canon
+                    # Priority 0: the hardcoded dense-ψ table (`output_perm`), passed by
+                    # the matvec via static_output_perm_dense(bondtype, step). φ is pinned
+                    # upstream (reorder_to_roles) so labelsC_vec is deterministic every
+                    # sweep, making this a pure lookup: canon_labels = labelsC_vec[perm].
+                    # This RETIRES _canon_labels_for_next on the dense path. Non-matvec
+                    # callers (e.g. MPO build) pass no output_perm → fall through to the
+                    # preferred/heuristic branches below (unchanged).
+                    if output_perm !== nothing && length(output_perm) == length(labelsC_vec)
+                        canon_labels = [labelsC_vec[output_perm[i]] for i in 1:length(labelsC_vec)]
                     elseif preferred_output_labels !== nothing
                         # Accept either Vector{Index} (natural for callers) or the
                         # internal label tuple format. Convert as needed.
@@ -1186,7 +1247,7 @@ function wrapped_contract_aliased(
                     end
                 end
                 @timeit TIMER "ali_dense_alloc" begin
-                    C_canon = zeros(TC, canon_dims...)
+                    C_canon = _ali_dense_ctgt(TC, canon_dims)
                 end
 
                 if _add_dbg_enabled1() && _ADD_DBG_COUNT1[] < _add_dbg_max1()
@@ -1479,6 +1540,8 @@ function contract_aliased_itensor(
     preserve_bs_output :: Bool = true,
     preferred_output_labels :: Union{Nothing,AbstractVector} = nothing,
     next_op = nothing,
+    output_perm :: Union{Nothing,Vector{Int}} = nothing,
+    emit_window_map :: Bool = false,
 )
     Ab = to_backend(Abackend)
     Bb = to_backend(Bbackend)
@@ -1501,7 +1564,7 @@ function contract_aliased_itensor(
     end
 
     @timeit TIMER "wrapped_contract_aliased_call" begin
-        Cw = wrapped_contract_aliased(Aw, Bw; preserve_bs_output, preferred_output_labels, next_op)
+        Cw = wrapped_contract_aliased(Aw, Bw; preserve_bs_output, preferred_output_labels, next_op, output_perm, emit_window_map)
     end
     @timeit TIMER "wrap_output" begin
         Cw isa ITensors.ITensor && return Cw   # P_C = 0
@@ -1630,6 +1693,39 @@ function recycle_aliased_pending!(w::ITensors.ITensor)
     buf = ext.aliased.templates
     isempty(buf) && return nothing
     task_local_storage((:aliased_ws_pending, eltype(buf)), buf)
+    return nothing
+end
+
+# ── DENSE-output buffer pool for the aliased×dense→dense path (ali_dense_alloc) ──
+# The kernel's output C_canon is a fresh `zeros(TC, dims)` each call and becomes the
+# returned ITensor's storage — at N=100 that is ~12 GiB churned through GC per run
+# (the single largest non-GEMM cost). We pool it: a CONSUMED (dead) dense matvec
+# intermediate's buffer is recycled into a task-local single slot, and the next
+# ali_dense_alloc pops+zeros it instead of allocating. Pop REMOVES from the slot
+# (defensive — two pops with no intervening recycle can never share a live buffer),
+# so at worst we fall back to a fresh alloc. Zeroing still happens (the kernel
+# accumulates with β=1); only the allocation/GC churn is removed ⇒ numerics identical.
+# SAFETY: the caller recycles ONLY consumed operands (never the produced Hv, never the
+# input v), so the returned final output — which KrylovKit keeps live — is never pooled.
+function _ali_dense_ctgt(::Type{TC}, dims::NTuple{N,Int}) where {TC,N}
+    n = prod(dims)
+    key = (:ali_dense_ctgt_pending, TC)
+    tls = task_local_storage()
+    buf = get(tls, key, nothing)
+    if buf isa Vector{TC} && length(buf) >= n
+        delete!(tls, key)              # remove-on-pop
+        resize!(buf, n)
+        fill!(buf, zero(TC))
+        return reshape(buf, dims)
+    end
+    return zeros(TC, dims)
+end
+
+function recycle_dense_ctgt!(w::ITensors.ITensor)
+    ITensors.has_external_storage(w) && return nothing   # plain-dense intermediates only
+    buf = ITensors.NDTensors.data(ITensors.tensor(w))
+    (buf isa Vector && !isempty(buf)) || return nothing
+    task_local_storage((:ali_dense_ctgt_pending, eltype(buf)), buf)
     return nothing
 end
 

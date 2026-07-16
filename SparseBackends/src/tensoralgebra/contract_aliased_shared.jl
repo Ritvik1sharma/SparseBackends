@@ -163,6 +163,7 @@ function contract_shared!(
     shared_labels :: Vector;
     output_inds_hint::Union{Nothing,AbstractSet}=nothing,
     allowed_keys_C=nothing,
+    emit_window_map::Bool=false,
 ) where {TC,NC,N2C,PC,TA,NA,N2A,PA,TB,NB,N2B,PB}
 
     # ── 0) Preconditions ──────────────────────────────────────────────────────
@@ -173,6 +174,12 @@ function contract_shared!(
     # Clear output
     empty!(C.templates); C.n_templates = 0
     empty!(C.keys); empty!(C.alias_ids); empty!(C.scalars)
+
+    # ── factor-core window-map emission (off by default) — see core_helpers/window_map.jl.
+    # Captured HERE, BEFORE the permute below, from the raw A/B slice_to_template (template
+    # ids are permute-invariant, so the tidA/tidB seen in the join stay valid). `emit_st`
+    # is nothing on the hot path (no alloc); the two hooks below are no-ops then.
+    emit_st = window_emit_init(emit_window_map, A, B, Val(PC))
 
     # ── 1) Classify shared labels ─────────────────────────────────────────────
     shared_prefix = eltype(shared_labels)[]
@@ -357,6 +364,8 @@ function contract_shared!(
                 ckey = ntuple(j -> (src[j] > 0 ? akey[src[j]] : bkey[-src[j]]), Val(PC))
                 _aliased_contribute!(key_to_alias, key_to_accum, pending,
                                      ckey, combined_tid, αC, C.blksize)
+
+                emit_st === nothing || window_emit_record!(emit_st, ckey, tidA, tidB)
             end   # jj loop
         end   # ii loop
 
@@ -364,6 +373,8 @@ function contract_shared!(
     end   # merge-join
 
     _commit_aliased_dicts_lazy!(C, key_to_alias, key_to_accum, pending, n_pending)
+
+    emit_st === nothing || window_emit_finalize!(C, emit_st, key_to_accum)
     return C
 end
 

@@ -92,6 +92,17 @@ end
 end
 @inline _has(l, labels) = _posin(l, labels) != 0
 
+# Strided-read-B (K2): given a block's alias key, compute the (g1, g2) selector
+# indices into the gapBefore / gapAfter regions of the 4-region reshape
+# B4 = reshape(B, K, gapBefore, N, gapAfter). Bmat = view(B4, :, g1, :, g2).
+@inline function _strided_bmat_idx(akey, spb_posA, spb_stride, spa_posA, spa_stride)
+    g1 = 1
+    @inbounds for t in eachindex(spb_posA); g1 += (akey[spb_posA[t]] - 1) * spb_stride[t]; end
+    g2 = 1
+    @inbounds for t in eachindex(spa_posA); g2 += (akey[spa_posA[t]] - 1) * spa_stride[t]; end
+    return g1, g2
+end
+
 # Diagnostic: when SB_PERM_PROFILE=1, print the first SB_PERMB_DBG_MAX kernel
 # calls in which permute_B fires (i.e. env layout != [red_dense, keepB,
 # shared_prefix]), then the aggregate pattern + per-step tables.
@@ -194,6 +205,19 @@ function contract_aliased_dense_to_dense!(
         end
     end
 
+    # ── Strided-read-B (K2) state — set by the detection inside the permute_B
+    # block. When `strided_read`, B already arrives as
+    #   [ red (leading, contiguous) | sp_before | keepB (contiguous) | sp_after ]
+    # so per block Bmat = view(B4, :, g1, :, g2) with
+    #   B4 = reshape(B, K, gapBefore, N, gapAfter)
+    # is a K×N BLAS-strided matrix (row stride 1, col stride K·gapBefore) — no
+    # physical permute, the read-side mirror of the direct-write-C path. Falls
+    # back to the physical permute when the layout doesn't match.
+    strided_read = false
+    gapBefore = 1; gapAfter = 1
+    spb_posA = Int[]; spb_stride = Int[]
+    spa_posA = Int[]; spa_stride = Int[]
+
     @timeit TIMER "add.permute_B" begin
         permB = Vector{Int}(undef, NB)
         let i = 1
@@ -204,30 +228,69 @@ function contract_aliased_dense_to_dense!(
         if permB == collect(1:NB)
             Bp = B
         else
-            # Per-call permute_B detail: folded under the single SB_PERM_PROFILE
-            # flag (was its own SB_PERMB_DBG knob). Still capped via
-            # SB_PERMB_DBG_MAX so it prints the first N firings, then the
-            # aggregate + per-step tables come from _report_perm_profile.
-            if _perm_profile_enabled() &&
-               _PERMB_DBG_COUNT[] < parse(Int, get(ENV, "SB_PERMB_DBG_MAX", "12"))
-                _PERMB_DBG_COUNT[] += 1
-                println("\n[permB #", _PERMB_DBG_COUNT[], "] permute_B firing  (step=", CURRENT_STEP[], ")")
-                println("  labelsA = ", labelsA, "  (PA = ", PA, ")")
-                println("  labelsB = ", labelsB)
-                println("  labelsC = ", labelsC)
-                println("  red_dense     = ", red_dense)
-                println("  keepB         = ", keepB)
-                println("  shared_prefix = ", shared_prefix)
-                println("  desired B order = ", vcat(red_dense, keepB, shared_prefix),
-                        "  (red_dense first, shared_prefix last)")
-                println("  actual permB    = ", permB)
+            # K2 detection: red must be the leading contiguous run [1..n_rd] (in
+            # red_dense order) and keepB a contiguous run [p..p+n_keepB-1] after
+            # it (in keepB order); every remaining B axis must be a shared_prefix
+            # selector (split into the gap before/after keepB). Then we read B
+            # strided instead of copying it.
+            if n_rd > 0 && n_keepB > 0
+                posRed = Int[_posin(l, labelsB) for l in red_dense]
+                posKB  = Int[_posin(l, labelsB) for l in keepB]
+                p      = posKB[1]
+                if posRed == collect(1:n_rd) && p > n_rd &&
+                   posKB == collect(p : p + n_keepB - 1)
+                    before_pos = collect(n_rd + 1 : p - 1)
+                    after_pos  = collect(p + n_keepB : NB)
+                    if all(i -> _has(labelsB[i], shared_prefix), before_pos) &&
+                       all(i -> _has(labelsB[i], shared_prefix), after_pos)
+                        strided_read = true
+                        let s = 1
+                            @inbounds for i in before_pos
+                                push!(spb_posA, _posin(labelsB[i], labelsA))
+                                push!(spb_stride, s)
+                                s *= size(B, i)
+                            end
+                            gapBefore = s
+                        end
+                        let s = 1
+                            @inbounds for i in after_pos
+                                push!(spa_posA, _posin(labelsB[i], labelsA))
+                                push!(spa_stride, s)
+                                s *= size(B, i)
+                            end
+                            gapAfter = s
+                        end
+                    end
+                end
             end
-            # Bp = PermutedDimsArray(B, permB)
-            dimsBp     = ntuple(i -> size(B, permB[i]), Val(NB))
-            nB_total   = length(B)
-            permB_buf  = _bdd_permB_buffer(TB, nB_total)
-            Bp         = reshape(view(permB_buf, 1:nB_total), dimsBp)
-            Base.permutedims!(Bp, B, permB)
+            if strided_read
+                Bp = B   # no copy — the main loop reads strided views of B4
+            else
+                # Per-call permute_B detail: folded under the single SB_PERM_PROFILE
+                # flag (was its own SB_PERMB_DBG knob). Still capped via
+                # SB_PERMB_DBG_MAX so it prints the first N firings, then the
+                # aggregate + per-step tables come from _report_perm_profile.
+                if _perm_profile_enabled() &&
+                   _PERMB_DBG_COUNT[] < parse(Int, get(ENV, "SB_PERMB_DBG_MAX", "12"))
+                    _PERMB_DBG_COUNT[] += 1
+                    println("\n[permB #", _PERMB_DBG_COUNT[], "] permute_B firing  (step=", CURRENT_STEP[], ")")
+                    println("  labelsA = ", labelsA, "  (PA = ", PA, ")")
+                    println("  labelsB = ", labelsB)
+                    println("  labelsC = ", labelsC)
+                    println("  red_dense     = ", red_dense)
+                    println("  keepB         = ", keepB)
+                    println("  shared_prefix = ", shared_prefix)
+                    println("  desired B order = ", vcat(red_dense, keepB, shared_prefix),
+                            "  (red_dense first, shared_prefix last)")
+                    println("  actual permB    = ", permB)
+                end
+                # Bp = PermutedDimsArray(B, permB)
+                dimsBp     = ntuple(i -> size(B, permB[i]), Val(NB))
+                nB_total   = length(B)
+                permB_buf  = _bdd_permB_buffer(TB, nB_total)
+                Bp         = reshape(view(permB_buf, 1:nB_total), dimsBp)
+                Base.permutedims!(Bp, B, permB)
+            end
         end
     end
 
@@ -263,7 +326,8 @@ function contract_aliased_dense_to_dense!(
         canon_labels = vcat(keepA, keepB, c_prefix)
         perm_C       = [_posin(l, labelsC) for l in canon_labels]
         if _flop_count_enabled()
-            add_reshuffle!(permB != collect(1:NB), perm_C != collect(1:NC), in_position)
+            add_reshuffle!((permB != collect(1:NB)) && !strided_read,
+                           perm_C != collect(1:NC), in_position)
         end
         if _perm_profile_enabled()
             sig = _PermSig(copy(permB), copy(perm_C), n_sp, n_rd, n_keepA, n_keepB, n_cpfx)
@@ -271,7 +335,9 @@ function contract_aliased_dense_to_dense!(
             _st = string(CURRENT_STEP[])
             _v  = get!(_PERMB_STEP, _st, Int[0, 0])
             _v[1] += 1
-            (permB != collect(1:NB)) && (_v[2] += 1)
+            # count only PHYSICAL permutes — strided_read leaves permB != id but
+            # copies nothing (K2), so it must not register as a fire.
+            (permB != collect(1:NB) && !strided_read) && (_v[2] += 1)
         end
 
         # ── Direct-write detection (skips permute_back) ──────────────────────
@@ -409,6 +475,13 @@ function contract_aliased_dense_to_dense!(
     Bp_vec = vec(Bp)
     KN = K * N
     MN = M * N
+    # K2 read-side reshape: when strided_read, Bmat per block is view(B4,:,g1,:,g2)
+    # (a K×N BLAS-strided matrix). The 4-D reshape is a no-copy view of B; the
+    # non-strided arm never indexes B4, so its dummy shape is irrelevant.
+    B4 = reshape(B, strided_read ? K : length(B),
+                    strided_read ? gapBefore : 1,
+                    strided_read ? N : 1,
+                    strided_read ? gapAfter : 1)
     @timeit TIMER "add.main_loop" begin
       if direct_rows != :none
         # Direct fused-write paths (contiguous GAP==1 or strided GAP>1): one GEMM
@@ -419,34 +492,63 @@ function contract_aliased_dense_to_dense!(
         C_vec = vec(C)
         C4    = direct_strided ? reshape(C, reshR, reshGAP, reshCcols, reshTAIL) : C
         RGC   = reshR * reshGAP * reshCcols
-        @inbounds for ii in 1:nA
-          akey = A.keys[ii]
-          α    = convert(TC, A.scalars[ii])
-          sp_lin = 0
-          for t in 1:n_sp; sp_lin += (akey[join_posA[t]] - 1) * sp_stride[t]; end
-          base = 0
-          for j in 1:n_cpfx; base += (akey[c_prefix_pos_in_A[j]] - 1) * cpfx_strideC[j]; end
-          Boff = sp_lin * KN
-          Bmat = reshape(view(Bp_vec, Boff + 1 : Boff + KN), K, N)
-          Amat = reshape(_aliased_template_view(A, A.alias_ids[ii]), M, K)
-          _fused_block_gemm!(C_vec, C4, base, direct_strided,
-                             reshR, reshGAP, reshCcols, RGC, MN, Amat, Bmat, α, row_is_B)
+        if strided_read
+          @inbounds for ii in 1:nA
+            akey = A.keys[ii]
+            α    = convert(TC, A.scalars[ii])
+            base = 0
+            for j in 1:n_cpfx; base += (akey[c_prefix_pos_in_A[j]] - 1) * cpfx_strideC[j]; end
+            g1, g2 = _strided_bmat_idx(akey, spb_posA, spb_stride, spa_posA, spa_stride)
+            Bmat = view(B4, :, g1, :, g2)
+            Amat = reshape(_aliased_template_view(A, A.alias_ids[ii]), M, K)
+            _fused_block_gemm!(C_vec, C4, base, direct_strided,
+                               reshR, reshGAP, reshCcols, RGC, MN, Amat, Bmat, α, row_is_B)
+          end
+        else
+          @inbounds for ii in 1:nA
+            akey = A.keys[ii]
+            α    = convert(TC, A.scalars[ii])
+            sp_lin = 0
+            for t in 1:n_sp; sp_lin += (akey[join_posA[t]] - 1) * sp_stride[t]; end
+            base = 0
+            for j in 1:n_cpfx; base += (akey[c_prefix_pos_in_A[j]] - 1) * cpfx_strideC[j]; end
+            Boff = sp_lin * KN
+            Bmat = reshape(view(Bp_vec, Boff + 1 : Boff + KN), K, N)
+            Amat = reshape(_aliased_template_view(A, A.alias_ids[ii]), M, K)
+            _fused_block_gemm!(C_vec, C4, base, direct_strided,
+                               reshR, reshGAP, reshCcols, RGC, MN, Amat, Bmat, α, row_is_B)
+          end
         end
       else
         Ctgt_vec = vec(Ctgt)
-        @inbounds for ii in 1:nA
-          akey = A.keys[ii]
-          α    = convert(TC, A.scalars[ii])
-          sp_lin = 0
-          for t in 1:n_sp; sp_lin += (akey[join_posA[t]] - 1) * sp_stride[t]; end
-          cp_lin = 0
-          for j in 1:n_cpfx; cp_lin += (akey[c_prefix_pos_in_A[j]] - 1) * cpfx_stride[j]; end
-          Boff = sp_lin * KN
-          Coff = cp_lin * MN
-          Bmat = reshape(view(Bp_vec,   Boff + 1 : Boff + KN), K, N)
-          Cmat = reshape(view(Ctgt_vec, Coff + 1 : Coff + MN), M, N)
-          Amat = reshape(_aliased_template_view(A, A.alias_ids[ii]), M, K)
-          mul!(Cmat, Amat, Bmat, α, one(TC))
+        if strided_read
+          @inbounds for ii in 1:nA
+            akey = A.keys[ii]
+            α    = convert(TC, A.scalars[ii])
+            cp_lin = 0
+            for j in 1:n_cpfx; cp_lin += (akey[c_prefix_pos_in_A[j]] - 1) * cpfx_stride[j]; end
+            g1, g2 = _strided_bmat_idx(akey, spb_posA, spb_stride, spa_posA, spa_stride)
+            Coff = cp_lin * MN
+            Bmat = view(B4, :, g1, :, g2)
+            Cmat = reshape(view(Ctgt_vec, Coff + 1 : Coff + MN), M, N)
+            Amat = reshape(_aliased_template_view(A, A.alias_ids[ii]), M, K)
+            mul!(Cmat, Amat, Bmat, α, one(TC))
+          end
+        else
+          @inbounds for ii in 1:nA
+            akey = A.keys[ii]
+            α    = convert(TC, A.scalars[ii])
+            sp_lin = 0
+            for t in 1:n_sp; sp_lin += (akey[join_posA[t]] - 1) * sp_stride[t]; end
+            cp_lin = 0
+            for j in 1:n_cpfx; cp_lin += (akey[c_prefix_pos_in_A[j]] - 1) * cpfx_stride[j]; end
+            Boff = sp_lin * KN
+            Coff = cp_lin * MN
+            Bmat = reshape(view(Bp_vec,   Boff + 1 : Boff + KN), K, N)
+            Cmat = reshape(view(Ctgt_vec, Coff + 1 : Coff + MN), M, N)
+            Amat = reshape(_aliased_template_view(A, A.alias_ids[ii]), M, K)
+            mul!(Cmat, Amat, Bmat, α, one(TC))
+          end
         end
       end
     end
