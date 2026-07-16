@@ -5,8 +5,9 @@ DMRG (later TDVP) where the **stored state is the aliased `ψ = P·core`**, the
 **variable is `core`** (the dense template blocks), and the **local metric is I**
 — no `M`, no `M`-inversion, anywhere. Distinct from Path-B (variable ψ, metric M,
 plateaus −14.42) and PHP+core (variable bare core, state not aliased). Target
-**−14.77** on PXP, ψ stays aliased + deduped. **Diagonal-P only** (PXP; P is
-physically diagonal, off-diagonal KL-flip out of scope).
+**−14.77** on PXP, ψ stays aliased + deduped. **Both PXP (diagonal P) AND KL
+(off-diagonal / Z₂-flip P) must be supported** — read_core/write_core! key the core
+on the pre-P `rv` slice (stored `slice_to_template`), which is correct for flip P.
 
 ## 1. Mathematical foundation (why metric-I is exact and M never appears)
 - `[H,P] = 0` (PXP). ⇒ `H·ψ ∈ image(P)`; the bra-P in the operator projects the
@@ -53,12 +54,14 @@ physically diagonal, off-diagonal KL-flip out of scope).
 4. **`O = P·H` built DENSE** (per-site, tiny) so the matvec stays in the optimized
    **aliased×dense** kernel and dedup is provably preserved. *Knob* to try aliased O
    later; decide by output template count, not wall-clock.
-5. **Krylov vectors = dense cores; metric I via Frobenius.** Each matvec forms
-   `φ = P·core` from the current Krylov core by **deterministic routing** (cheap;
-   templates *are* the core + fixed P metadata built once), runs the aliased chain,
-   returns dense `v_o'`. Lanczos add/scale/inner are plain dense ops (2-site core is
-   small, ≈ 9·χ²). No custom inner, no M. *Alt:* aliased-φ Krylov + multiplicity-
-   weighted inner — only if the per-matvec routing shows up hot.
+5. **Krylov vectors = the 2-site CHANNEL-FREE core** (dense: `s_b, s_{b+1}` + the two
+   core-links), NOT the aliased φ. There is **NO per-matvec lift and NO write** — the
+   bare core is contracted straight through `Lenv·core·PH[b]·PH[b+1]·Renv`, and the P
+   structure lives entirely in the envs (built from aliased ψ) and PH: PH's channel
+   links merge Lenv/Renv's channel links, so a channel-free core maps to a channel-
+   free core. Metric is plain Frobenius on that dense core = metric I (no M).
+   Start vector each bond = `read_core(ψ[b])·read_core(ψ[b+1])` (per-site read_core,
+   merged over the shared core-link — read is per site, KL-safe via the `rv` map).
 6. **Update in `replacebond!` (`use_core=true`):** plain dense SVD of `v_o'`,
    truncate `maxdim` on the **core** bond, install `core[b],core[b+1]` into ψ by
    P-routing (reattach fixed `keys/alias_ids/scalars/slice_to_template` onto the new
@@ -70,29 +73,35 @@ physically diagonal, off-diagonal KL-flip out of scope).
    meaningless (P-inflated).
 
 ## 5. Per-bond algorithm + kernel map
-Precompute once: `H_bare` (MPO), `PH` (MPO of dense `O[j]=P[j]·H[j]`), and the
-window `slice_to_template` (+ per-template multiplicity `n_t`).
+Precompute ONCE, before any DMRG sweep: `H_bare` (MPO, for env growth) and the
+**aliased `PH`** (`PH[j] = P[j]·H[j]`, P applied locally on H's output at sites j and
+j+1; `build_ph_output`). `PH` is aliased and carries P's FSM **channel** links.
 
-**Eigensolve — matvec `A(core)`** (order `Lenv*φ` first, per project memory):
-| # | op | kernel |
+`Lenv`/`Renv` are grown by `position!` from **aliased ψ = P·core (bra + ket)** and
+**bare H** — so the envs carry `P†…P` for the off-window sites and expose P-FSM
+**channel** links at the window boundary.
+
+**Eigensolve vector = the 2-site CHANNEL-FREE core** `c(s_b, s_{b+1}, cl_L, cl_R)`
+(`cl` = core-link). Start each bond from `read_core(ψ[b])·read_core(ψ[b+1])`.
+
+**Matvec `A(c)` — NO lift, NO write, NO aliased-φ:**
+| # | op | note |
 |---|---|---|
-| 0 | route core → aliased φ (`P·core`) | not a contraction (template placement) |
-| 1 | `t1 = Lenv(dense) * φ(aliased)` | aliased×dense → aliased |
-| 2 | `t2 = t1 * O[b](dense)` | aliased×dense → aliased |
-| 3 | `t3 = t2 * O[b+1](dense)` | aliased×dense → aliased |
-| 4 | `v_o' = t3 * Renv(dense)` | aliased×dense → **dense** (4 FSM bonds closed ⇒ channel-free core) |
+| 1 | `t1 = Lenv · c` | contracts `cl_L`; Lenv's boundary **channel** link stays open |
+| 2 | `t2 = t1 · PH[b]` | PH[b]'s channel links merge Lenv's channel link |
+| 3 | `t3 = t2 · PH[b+1]` | PH[b+1] channels chain b→b+1 |
+| 4 | `v_o = t3 · Renv` | Renv's channel link merges PH[b+1]'s; **all channels closed ⇒ channel-free dense core** |
 
-**Update (replacebond!, use_core):**
-| # | op | kernel |
-|---|---|---|
-| 5 | plain SVD of `v_o'`, truncate maxdim | dense LA (only all-dense step) |
-| 6 | install core[b],core[b+1] into ψ (P-routing) | metadata reattach (+ cheap reorder) |
+The P structure is supplied entirely by `Lenv/Renv` + `PH`; the bare core `c` only
+carries site + core-link legs, so `c → v_o` are both channel-free. Contraction order
+`Lenv·c` first (project memory).
 
-**Env move (`position!`):** `Lenv·ψ[b]·H_bare[b]·ψ[b]†` → aliased×dense→aliased
-twice, then bra-close aliased×aliased→dense. Reused verbatim from `bop_aliased`.
+**Update (writeback):** SVD `v_o` (channel-free 2-site core), truncate `maxdim` on the
+core bond → `c[b], c[b+1]`, then `write_core!` each into ψ **per site** (single-site,
+KL-safe via the stored `rv` map; keys/alias_ids/scalars fixed). No merged write.
 
-No `dense×dense` *contraction* in the hot path; only the small-core SVD + dense
-Lanczos arithmetic are all-dense.
+**Env move (`position!`):** grow `Lenv/Renv` from aliased ψ + bare H (`bop_aliased`
+paths). No `dense×dense` contraction in the hot path.
 
 ## 6. Implementation work items (ordered)
 - **[DONE] Step 1** — `read_core`/`write_core!`/`slice_to_template`/
@@ -100,38 +109,48 @@ Lanczos arithmetic are all-dense.
   `storage.jl`)
 - **[DONE, likely UNUSED] Step 2** — `core_canonical` aliased factorize. Superseded:
   `v_o'` is dense, so we plain-SVD it (no aliased factorize). Keep for reference.
-- **[BUILD] Step 3a — operator `PH`.** Build `O[j]=P[j]·H[j]` dense, P on H output.
-  Prime bookkeeping: follow the diag_heff_php contract pattern but **single-sided**;
-  the output physical must land at the plev matching the env **bra**-channel
-  (plev 1) and unprime to core plev 0. *(Confidence: medium — exact plev to confirm
-  in 3c.)*
-- **[BUILD] Step 3b — dual-operator ProjMPO.** `CoreProjMPO{H_bare, PH, LR, …}`;
-  `position!`/env growth on `H_bare`; `product` = `Lenv·PH[b]·PH[b+1]·Renv` with the
-  core-routing wrapper (form φ in, dense `v_o'` out). Reuse env code paths.
-- **[BUILD] Step 3c — one-shot matvec check** (before any run-mode wiring):
-  at one bond assert (i) `v_o'` is channel-free (no P-FSM index survives),
-  (ii) `A` Hermitian in the core metric, (iii) `⟨core|A|core⟩` == dense `P†HP`
-  reference. This nails the plev detail and the channel-closing empirically.
-- **[BUILD] Step 4 — `replacebond!` use_core path.** dense SVD + maxdim on core bond
-  + P-routing install; keep `slice_to_template` fixed.
-- **[BUILD] Step 5 — `run_mode=:core_php` in dmrg.jl.** Thread `use_core` through
-  the eigensolve (KrylovKit on dense cores) + replacebond!; report system energy
-  each sweep.
-- **[VALIDATE] PXP N=12 run** → target −14.77 (beats Path-B/RR −14.42); confirm ψ
-  stays aliased + deduped (dedup ratio > 1); energy stable both sectors.
+- **[DONE ✓] Step 3a — operator `PH`** — `build_ph_output(P,H)` in
+  `ITensorMPS/src/abstractprojmpo/core_projmpo.jl`. Recipe: `prime(P;tags="Link")`
+  (FSM→1), per site `PH[j] = contract(prime(Pl[j];tags="Site"), H[j], :coo, :dense,
+  :aliased)` then `replaceprime(2=>1;Site)`. **Aliased** output (COO+complex-P
+  capable ⇒ KL), built once. Uses the public 3-backend `contract` (NOT the internal
+  `contract_aliased_itensor`).
+- **[DONE ✓] Step 3c — one-shot matvec check** — `ph_matvec_oneshot_test.jl` (PXP).
+- **[DONE ✓] Step 3b — dual-operator `CoreProjMPO`** (core_projmpo.jl). `{Hbare, PH}`;
+  `position!`/env growth on bare H; `product(cpm, c) = Lenv·c·PH[b]·PH[b+1]·Renv`
+  applied to the **channel-free core** `c` (channels close via env + PH).
+- **[DONE ✓] Step 4 — writeback** — `_core_writeback!` (factor_core_dmrg.jl): plain
+  SVD of the channel-free `v_o`, `maxdim`/`mindim`/`cutoff` on the core bond, then
+  `_core_rebuild` (resize-capable per-site write_core!) into ψ[b], ψ[b+1]. Keys/
+  alias_ids/scalars + `slice_to_template` fixed.
+- **[DONE ✓] Step 5 — `dmrg_core_php`** (factor_core_dmrg.jl): self-contained driver
+  (separate from dmrg.jl per user); eigsolve on channel-free cores + writeback +
+  per-sweep system energy. `dmrg(...; run_mode=:core_php, P=P)` gate: PENDING.
+- **[VALIDATE — GATED, not run]** PXP N=12 bd40 → target −14.77 (regression gate),
+  then **KL** N=12 bd40; confirm ψ stays aliased + deduped, energy stable.
 
 ## 7. Files
-- `SparseBackends/src/aliased/factor_core.jl` — core I/O (+ operator build?)
-- `SparseBackends/src/aliased/storage.jl` — slice_to_template field (done)
-- `ITensorMPS.jl/src/…/dmrg.jl` — `:core_php` run mode, replacebond! use_core
-- `ITensorMPS.jl/src/abstractprojmpo/…` — CoreProjMPO (dual operator)
-- `test_aliased_psi/test_factor_core/` — env_channel_audit.jl (done), one-shot
-  matvec check, PXP validation.
+- `SparseBackends/src/aliased/factor_core.jl` — core I/O (read_core/write_core!/
+  slice_to_template/populate_slice_map!); write_core! is **single-site only**.
+- `SparseBackends/src/aliased/storage.jl` — `slice_to_template` field (done)
+- `SparseBackends/src/tensoralgebra/contract_aliased_coo_dense.jl` — persists the
+  pre-P `rv → tid` map into `slice_to_template` (KL routing).
+- `SparseBackends/src/tensor_wrappers.jl` — public 3-backend `contract(A,B,Ab,Bb,Cb)`.
+- `ITensorMPS.jl/src/abstractprojmpo/core_projmpo.jl` — `build_ph_output` + `CoreProjMPO`.
+- `ITensorMPS.jl/src/factor_core_dmrg.jl` — **self-contained** `dmrg_core_php` driver
+  (separate from dmrg.jl); `_core_read_window`, `_core_writeback!`, `_core_rebuild`,
+  `_core_canonicalize!`, `core_php_energy`.
+- `ITensorMPS.jl/src/dmrg.jl` — `run_mode=:core_php` gate delegating to `dmrg_core_php` (PENDING).
+- `test_aliased_psi/test_factor_core/` — env_channel_audit.jl, ph_matvec_oneshot_test.jl,
+  core_php_driver_test.jl (PXP), + a KL round-trip + KL driver test (TODO).
 
-## 8. Open items to confirm before/while building
-- **Krylov representation:** dense-core (decision 5) vs aliased-φ+multiplicity —
-  confirm dense-core as the first cut.
-- **Exact plev** on `PH`'s output leg — resolved empirically in step 3c.
-- **Step-4 output form:** whether step-4 kernel emits dense vs aliased-dedup-1 —
-  densify if needed (cheap, channel-free).
-- **`O` backend knob** (dense now / aliased later) — parameterize from the start?
+## 8. Open items / status
+- **Krylov representation — RESOLVED:** the 2-site **channel-free core** (decision 5),
+  contracted straight through `Lenv·c·PH·Renv` (no lift, no write). Rejected dead-ends
+  logged so they are not re-tried: per-matvec P-contraction lift, aliased-φ vector,
+  merged 2-site write, `_core_place_window`/`_core_window_map` helpers.
+- **Exact plev** on `PH`'s output leg — resolved empirically (step 3c).
+- **KL correctness — the open risk:** read_core/write_core! are single-site and key on
+  the stored pre-P `rv` map (KL-intended) but **never run on KL**. Settle with a KL
+  round-trip (write_core→read_core identity) before trusting the full KL DMRG.
+- **Gate:** `dmrg(...; run_mode=:core_php, P=P)` delegation into `dmrg_core_php`.

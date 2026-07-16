@@ -161,5 +161,15 @@ function contract_aliased!(
     C.alias_ids = C.alias_ids[p]
     C.scalars   = C.scalars[p]
 
+    # ── factor-core: persist the PRE-P routing (rv → template id). rv = the reduction
+    # index = the core (B) column = pre-P site slice. read_core/write_core! key the core
+    # on rv via this map, so they work for OFF-DIAGONAL/flip P (KL), not just diagonal.
+    # (Diagonal P has rv == output site, so this equals the group-by-s' derivation ⇒ PXP
+    # stays bit-identical.) Accumulated (multi-rv) templates are absent from rv_to_tid —
+    # a clean P·core has none. Unset rv slots stay 0 (that pre-P slice absent).
+    s2t = zeros(Int, R)
+    for (rv, tid) in rv_to_tid; s2t[rv] = tid; end
+    C.slice_to_template = s2t
+
     return C
 end

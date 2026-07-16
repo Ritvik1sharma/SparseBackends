@@ -78,6 +78,7 @@ Storage layout
 # because the hint is only ever *reassigned* (population builds a fresh vector),
 # never mutated in place.
 const _EMPTY_SLICE_MAP = Int[]
+const _EMPTY_WINDOW_MAP = Dict{NTuple{2,Int},Int}()
 
 mutable struct AliasedBlockSparse{T,N,N2,P,K<:Integer,AI<:Integer} <: SparseTensor{T,N}
     dims        :: NTuple{N,Int}
@@ -93,12 +94,21 @@ mutable struct AliasedBlockSparse{T,N,N2,P,K<:Integer,AI<:Integer} <: SparseTens
     # Only populated by the contract_aliased_coo_dense kernel; every other constructor
     # / copy / permute leaves it EMPTY (read_core then re-derives it from `keys`).
     slice_to_template :: Vector{Int}
-    # 7-arg inner constructor keeps every existing call site working (defaults the hint
-    # empty); struct is mutable so the COO×dense kernel sets it after construction.
+    # factor-core 2-site hint (empty by default): window_slice_map[(rv_b, rv_{b+1})] =
+    # template id of the merged 2-site core block. Emitted ONLY by the AliasedBS×AliasedBS
+    # contract_shared! (emit_window_map=true) when BOTH inputs carry slice_to_template —
+    # i.e. the ψ[b]·ψ[b+1] window build. Holds the (rv_b,rv_{b+1})→tid routing that CANNOT
+    # be recovered post-hoc for off-diagonal (flip) P, because φ sums over the internal
+    # FSM bond; the pairing is known only while that bond is being contracted. Lets
+    # write_core_window! re-attach a merged core. Every other constructor/copy leaves it
+    # EMPTY (never mutated in place; always reassigned a fresh dict when populated).
+    window_slice_map :: Dict{NTuple{2,Int},Int}
+    # 7-arg inner constructor keeps every existing call site working (defaults both hints
+    # empty); struct is mutable so the COO×dense / window kernels set them after construction.
     function AliasedBlockSparse{T,N,N2,P,K,AI}(dims, blksize, templates, n_templates,
                                                keys, alias_ids, scalars) where {T,N,N2,P,K,AI}
         return new{T,N,N2,P,K,AI}(dims, blksize, templates, n_templates,
-                                  keys, alias_ids, scalars, _EMPTY_SLICE_MAP)
+                                  keys, alias_ids, scalars, _EMPTY_SLICE_MAP, _EMPTY_WINDOW_MAP)
     end
 end
 
