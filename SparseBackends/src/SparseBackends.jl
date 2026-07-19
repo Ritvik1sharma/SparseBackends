@@ -200,10 +200,5 @@ include("tensor_wrappers_aliased.jl")   # WrappedAliasedBlockSparse + top-level 
 include("aliased/factorize.jl")         # Aliased-aware factorize (Tier 1: dense SVD + re-aliasify)
 include("core_helpers/factor_core.jl")  # factor-core read_core/write_core_window!/slice_to_template (ψ=P·core)
 
-# Path-B (generalized eigsolve) helpers for sparse DMRG. Must be after
-# tensor_wrappers.jl so contract_preserve_bs / recast_bs_to_template are in scope.
-include("path_b_utils.jl")
-include("path_b_helpers.jl")
-include("rayleigh_ritz.jl")              # Rayleigh-Ritz local eigensolve (split from path_b_helpers.jl)
 include("../../utils.jl")                 # reorder_to_roles: symbolic (role-based) index-order permuter
 end
