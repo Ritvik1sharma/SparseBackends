@@ -2315,3 +2315,14 @@ function ITensors._external_map_storage!(
     _apply_elementwise!(f, R, A)
     return nothing
 end
+
+# Predicate: does this MPS carry sparse/aliased storage? (Gate used by dmrg to route an
+# aliased ψ to the factor-core method.) Relocated here from the removed path_b_helpers.jl;
+# depends only on the wrapper storage types defined above.
+function is_sparse_mps(psi)::Bool
+    length(psi) == 0 && return false
+    T = psi[1]
+    ITensors.has_external_storage(T) || return false
+    s = ITensors.get_external_storage(T)
+    return s isa WrappedBlockSparse || s isa WrappedAliasedBlockSparse
+end
