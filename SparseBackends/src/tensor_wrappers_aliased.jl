@@ -941,37 +941,9 @@ function _canon_keepB_red(indsA, indsC, denseLinksC::Int, next_op)
     return vcat(pre, keepA, keepB)
 end
 
-# Hard-coded per-(bond-type, step) output-order permutation table. Each value is a
-# permutation applied to the kernel's default `output_inds` order: the desired
-# (reduction-last) output is `indsC[perm]`. Derived once via the `_canon_by_rank`
-# generator (SB_PERM_CAPTURE) and baked here. Empty ⇒ the generator/legacy path
-# runs (so capture works before the table is filled). bond-type ∈ {:left,:bulk,:right}.
-const STATIC_OUTPUT_PERM = Dict{Tuple{Symbol,Int}, Vector{Int}}(
-    # Baked from the SB_PERM_CAPTURE generator (N=2, KL plaquette). Uniform across
-    # all bulk bonds; the length-guard in _static_output_pref falls back for any
-    # step whose output leg-count differs (e.g. sweep-1 warmup, before maxdim fills).
-    (:bulk, 1) => [3, 1, 2, 6, 7, 4, 5],
-    (:bulk, 2) => [2, 1, 3, 4, 7, 5, 6],
-    (:bulk, 3) => [1, 2, 3, 4, 7, 5, 6],
-    (:bulk, 4) => [1, 2, 4, 3, 6, 5],
-    (:left, 1) => [1, 2, 4, 5, 3],
-    (:left, 2) => [1, 2, 3, 5, 4],
-    (:left, 3) => [1, 2, 3, 4],
-    (:right, 1) => [1, 2, 4, 5, 3],
-    (:right, 2) => [1, 2, 3, 5, 4],
-    (:right, 3) => [1, 2, 3, 4],
-)
-# Stateless lookup of the static output permutation for a given (bond-type,
-# step) — was _static_output_pref, gated on SB_IN_MATVEC (an ENV bracket set
-# around the matvec loop, since this used to read the coordinate from ENV and
-# had no other way to know whether it was stale). Now the matvec loop (the
-# only caller with a real answer, in abstractprojmpo.jl) passes bondtype/step
-# directly and threads the *result* down as `output_perm`; no other caller
-# can reach this by accident, so no gate is needed at all.
-function static_output_perm(bondtype::Symbol, step::Int)::Union{Nothing,Vector{Int}}
-    isempty(STATIC_OUTPUT_PERM) && return nothing
-    return get(STATIC_OUTPUT_PERM, (bondtype, step), nothing)
-end
+# (Removed STATIC_OUTPUT_PERM + static_output_perm — the aliased-ψ (Path-B) matvec
+# output-order table. Path-B was pruned; the dense-ψ × aliased-H matvec uses
+# STATIC_OUTPUT_PERM_DENSE below.)
 
 # Dense-ψ × aliased-H matvec output-order table. Value = perm of the kernel's
 # NATURAL output labels (labelsC_vec) giving the chosen output order:
@@ -1676,25 +1648,8 @@ end
 end
 LinearAlgebra.norm(w::WrappedAliasedBlockSparse) = @timeit TIMER "vecop.norm" _alias_norm(w.aliased)
 
-# Recycle a DEAD aliased ITensor's template buffer back into the `pending` pool
-# (:aliased_ws_pending, keyed by element type — same slot the aliased×dense kernel
-# pops for its output) so the next contract reuses its capacity instead of growing a
-# fresh result-sized buffer from empty. Used ONLY for consumed matvec intermediates
-# in the dense-H aliased-ψ chain (caller guards `_Hv_prev !== v` so the input Krylov
-# vector, owned by KrylovKit, is never recycled). Numerics unchanged: the next
-# contract resize!s + overwrites (β=0) this buffer exactly as it would a fresh one.
-# SAFETY: caller must guarantee `w` is dead (no live refs); the kernel's zero-copy
-# finalize hands each output a DISTINCT buffer, so a consumed operand's buffer never
-# aliases the live result.
-function recycle_aliased_pending!(w::ITensors.ITensor)
-    ITensors.has_external_storage(w) || return nothing
-    ext = ITensors.get_external_storage(w)
-    ext isa WrappedAliasedBlockSparse || return nothing
-    buf = ext.aliased.templates
-    isempty(buf) && return nothing
-    task_local_storage((:aliased_ws_pending, eltype(buf)), buf)
-    return nothing
-end
+# (Removed recycle_aliased_pending! — recycled consumed intermediates for the
+# dense-H aliased-ψ matvec, which was the Path-B path now pruned.)
 
 # ── DENSE-output buffer pool for the aliased×dense→dense path (ali_dense_alloc) ──
 # The kernel's output C_canon is a fresh `zeros(TC, dims)` each call and becomes the
