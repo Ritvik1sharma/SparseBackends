@@ -4,3 +4,4 @@ test_archive/*
 auto_archived/
 logs/
 */logs/
+KrylovKit.jl/
