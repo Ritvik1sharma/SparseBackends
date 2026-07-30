@@ -2281,3 +2281,12 @@ function is_sparse_mps(psi)::Bool
     s = ITensors.get_external_storage(T)
     return s isa WrappedBlockSparse || s isa WrappedAliasedBlockSparse
 end
+
+# True only for a PLAIN block-sparse ψ (WrappedBlockSparse), NOT the aliased variant.
+# Lets the dmrg front-end distinguish it from an aliased ψ (which routes to factor-core).
+function is_blocksparse_mps(psi)::Bool
+    length(psi) == 0 && return false
+    T = psi[1]
+    ITensors.has_external_storage(T) || return false
+    return ITensors.get_external_storage(T) isa WrappedBlockSparse
+end
