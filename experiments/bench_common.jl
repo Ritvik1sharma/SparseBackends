@@ -19,7 +19,7 @@ using LinearAlgebra: BLAS
 # internally and is documented as FP-close but NOT bit-identical to serial.
 BLAS.set_num_threads(parse(Int, get(ENV, "BENCH_BLAS_THREADS", string(Sys.CPU_THREADS))))
 
-include(joinpath(@__DIR__, "..", "..", "experiments", "sparse_eval_utils.jl"))
+include(joinpath(@__DIR__, "..", "sparse_runner_utils.jl"))
 include(joinpath(@__DIR__, "configs.jl"))
 include(joinpath(@__DIR__, "models.jl"))
 
