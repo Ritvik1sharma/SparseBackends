@@ -47,22 +47,34 @@ path, not the sequential per-plaquette sandwich in `experiments/kl/*/*/v*.jl`.
 
 ## Running
 
-Every (config, variant) pair has its own standalone file:
+`run_group.jl` is the single entry point. It takes the config id, a
+comma-separated variant list and a seed:
 
 ```bash
 cd tensornetworks
-julia --project=SparseBackends SparseBackends/experiments/kl_min1_v26_bd40_sb_aliased.jl 0
-julia --project=.              experiments/manual_tests/kl_min1_v26_bd40_orig_dense.jl 0
-```
 
-`run_group.jl` is only a launcher — it calls the same `run_config` several times
-in one process so SparseBackends' codegen (~10 min, and it is per-process because
-the kernels specialise on runtime-determined tensor shapes) is paid once:
+# one variant
+julia --project=SparseBackends SparseBackends/experiments/run_group.jl \
+      kl_min1_v26_bd40 sb_aliased 0
 
-```bash
+# all three sb variants in ONE process -- what Sherlock runs
 julia --project=SparseBackends SparseBackends/experiments/run_group.jl \
       kl_min1_v26_bd40 sb_aliased,sb_fused,sb_dense 0
+
+# the original-ITensors baseline lives in the other project tree
+julia --project=. experiments/manual_tests/run_group.jl kl_min1_v26_bd40 0
 ```
+
+Grouping variants matters: SparseBackends' codegen (~10 min, per-process because
+the kernels specialise on runtime-determined tensor shapes) is then paid once
+instead of once per variant.
+
+There are deliberately **no per-(config, variant) wrapper files**. They existed
+until commit `87d4987` -- 39 of them, each a single `run_config(id, variant)`
+call -- and were removed because nothing referenced them, the Sherlock path
+(`sherlock_scripts/run_scripts/run_bench_task.sh`) has always used `run_group.jl`,
+and they silently went stale every time a config was added. To add an experiment,
+add one entry to `configs.jl`; no new file is needed.
 
 Variant order is deliberate: each writes its JSON the moment it finishes, so an
 OOM in `sb_dense` at the large configs cannot lose the aliased results.
