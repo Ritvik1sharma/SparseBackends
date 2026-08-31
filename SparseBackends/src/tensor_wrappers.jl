@@ -1030,6 +1030,13 @@ function output_inds(
             else
                 # Sparse in output. If from an operand's DENSE set, it's a
                 # "moved" axis (will be fissioned) → go LAST in sparse.
+                #
+                # NOTE: a DENSE-wrapped operand reports an EMPTY dense_inds, so a
+                # moved axis coming from a dense operand (MPO x MPS: the gate's s')
+                # is NOT caught here and lands in sparse_nonlink. Callers that need a
+                # particular prefix layout must state it via preferred_output_labels;
+                # do not re-purpose this classification for ordering, it is shared
+                # with the DMRG/PHP path.
                 from_dense = (I in denseA) || (I in denseB)
                 if from_dense && is_link(I)
                     push!(moved_dense_links, I)
@@ -1074,6 +1081,11 @@ function output_inds(
     # gave only ~14% permA_identity hits and the per-call sort overhead
     # negated savings. The current ordering is a no-op cost-wise. Larger gain
     # would require eliminating the permutedims COPY (in-place / data-share).
+    # NOTE: contract_aliased.jl's fission detector requires hint-moved axes to sit in
+    # the LAST prefix slots (see src_B_fission_pos there), which this default order
+    # does not give when both moved and sparse_link axes are present. Callers that
+    # need a specific layout say so via `preferred_output_labels` / `output_perm`
+    # rather than having a policy hardcoded here.
     indsC_vec = vcat(sparse_nonlink, moved_dense_links, sparse_link, dense_tail)
     return Tuple(indsC_vec), dense_tail
 end

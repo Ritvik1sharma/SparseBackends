@@ -212,8 +212,9 @@ end
 # — worth it for the gram, NOT for hot matvec (templates there are genuinely distinct),
 # hence off by default and enabled only at the gram call site.
 function _dedup_templates_by_value!(
-    C::AliasedBlockSparse{T,N,N2,P,K,AI}; atol::Real=1e-12,
+    C::AliasedBlockSparse{T,N,N2,P,K,AI}; atol::Real=1e-12, projective::Bool=false,
 ) where {T,N,N2,P,K,AI}
+    projective && return _dedup_templates_projective!(C; atol=atol)
     nt = C.n_templates; bs = C.blksize
     nt <= 1 && return C
     canon = Int[]                       # old tids kept as canonical representatives
@@ -233,6 +234,84 @@ function _dedup_templates_by_value!(
     newt = Vector{T}(undef, length(canon)*bs)
     @inbounds for (nw, ct) in enumerate(canon)
         copyto!(view(newt, (nw-1)*bs+1 : nw*bs), view(C.templates, (ct-1)*bs+1 : ct*bs))
+    end
+    C.templates   = newt
+    C.n_templates = length(canon)
+    C.alias_ids   = AI[_alias_id(AI, remap[Int(a)]) for a in C.alias_ids]
+    return C
+end
+
+# PROJECTIVE value-dedup: merge templates that agree UP TO A SCALAR, folding the ratio
+# into the per-block scalars. This is the format's OWN equivalence class — a block's value
+# is `scalars[i] * templates[alias_ids[i]]`, so `(λ, t)` and `(1, λt)` denote the same
+# block. `_dedup_templates_by_value!` compares raw templates and therefore never merges
+# proportional pairs, making its criterion strictly narrower than what the storage can
+# express. This closes that gap; it is a strict superset (equal templates have ratio 1).
+#
+# Each template is normalized by its largest-magnitude entry (which fixes scale AND
+# complex phase) and matched against the canonical set in that normalized form. On a hit
+# with canonical `c`, `t = (piv_t / piv_c) * c`, so every block aliasing `t` has its
+# scalar multiplied by that ratio and is repointed at `c`. Templates are kept in their
+# ORIGINAL (un-normalized) form so no other consumer sees a scale change.
+#
+# Cost O(n_tmpl · n_distinct · blksize), same as the non-projective pass. Opt-in only.
+function _dedup_templates_projective!(
+    C::AliasedBlockSparse{T,N,N2,P,K,AI}; atol::Real=1e-12,
+) where {T,N,N2,P,K,AI}
+    nt = C.n_templates; bs = C.blksize
+    nt <= 1 && return C
+    canon  = Int[]                       # old tids kept as canonical representatives
+    remap  = zeros(Int, nt)
+    ratio  = ones(T, nt)                 # t = ratio[t] * canonical(remap[t])
+    normal = Vector{T}(undef, nt * bs)   # normalized form of each canonical, packed
+    nbuf   = Vector{T}(undef, bs)        # normalized form of the template under test
+    @inbounds for t in 1:nt
+        off = (t - 1) * bs
+        # pivot = largest-magnitude entry; normalizing by it fixes scale and phase.
+        piv = zero(T); pm = 0.0
+        for j in 1:bs
+            v = C.templates[off + j]; av = abs(v)
+            av > pm && (pm = av; piv = v)
+        end
+        if pm == 0.0                     # all-zero template: normalize to itself
+            for j in 1:bs; nbuf[j] = zero(T); end
+        else
+            for j in 1:bs; nbuf[j] = C.templates[off + j] / piv; end
+        end
+        bn = 0.0; for j in 1:bs; bn += abs2(nbuf[j]); end; bn = sqrt(bn)
+        found = 0; lam = one(T)
+        for (ci, ct) in enumerate(canon)
+            co = (ci - 1) * bs; d = 0.0
+            for j in 1:bs; d += abs2(nbuf[j] - normal[co + j]); end
+            if sqrt(d) <= atol * max(bn, eps())
+                # canonical ct's own pivot, recovered from its stored normalized form.
+                cpm = 0.0; cpiv = zero(T); cof = (ct - 1) * bs
+                for j in 1:bs
+                    v = C.templates[cof + j]; av = abs(v)
+                    av > cpm && (cpm = av; cpiv = v)
+                end
+                found = ci
+                lam = cpm == 0.0 ? one(T) : piv / cpiv
+                break
+            end
+        end
+        if found == 0
+            push!(canon, t); remap[t] = length(canon); ratio[t] = one(T)
+            co = (length(canon) - 1) * bs
+            for j in 1:bs; normal[co + j] = nbuf[j]; end
+        else
+            remap[t] = found; ratio[t] = lam
+        end
+    end
+    length(canon) == nt && return C     # nothing to collapse
+    newt = Vector{T}(undef, length(canon) * bs)
+    @inbounds for (nw, ct) in enumerate(canon)
+        copyto!(view(newt, (nw-1)*bs+1 : nw*bs), view(C.templates, (ct-1)*bs+1 : ct*bs))
+    end
+    # Fold the proportionality ratio into each block's scalar BEFORE repointing alias_ids.
+    @inbounds for i in eachindex(C.alias_ids)
+        old = Int(C.alias_ids[i])
+        C.scalars[i] *= ratio[old]
     end
     C.templates   = newt
     C.n_templates = length(canon)
@@ -281,7 +360,18 @@ function _contract_aliased_prefix_outer_ad!(
     n_fission       = PC - n_A_prefix_in_C
     @assert n_fission >= 0 "PC=$PC less than A's non-r prefix count $n_A_prefix_in_C"
     Cpref_labels    = labelsC[1:PC]
-    fission_labels  = Set(Cpref_labels[i] for i in (n_A_prefix_in_C+1):PC)
+    # Fissioned axes are the C-prefix labels that ORIGINATE IN B -- a property the
+    # caller's output_inds_hint already determines exactly. Previously this was a
+    # positional guess (the last n_fission prefix entries), which reported a
+    # confusing "count mismatch" whenever the layout put a fissioned axis elsewhere.
+    #
+    # TODO: this only fixes DETECTION. Full position-independence also needs src_A /
+    # src_B_fission_pos below (and the key assembly that follows) to address C-prefix
+    # slots by label instead of assuming [A's prefix..., fission...] contiguous order.
+    # The cleaner fix is to let callers control the output index ordering on the
+    # aliased -> aliased path: output_perm / preferred_output_labels exist but are
+    # wired only into the aliased -> dense (matvec) path today.
+    fission_labels  = Set(lab for lab in Cpref_labels if haskey(mapB, lab))
     fission_pos_in_B   = Int[]
     remaining_pos_in_B = Int[]
     @inbounds for i in 1:NB-1   # iterate over B's non-r axes (after permutation)
