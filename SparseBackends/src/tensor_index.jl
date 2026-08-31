@@ -125,6 +125,12 @@ function replaceinds(w::SparseBackends.WrappedCOOTensor{T,N}, inds1, inds2) wher
   return SparseBackends.WrappedCOOTensor{T,N}(w.coo, new_inds)
 end
 
+# NOTE the aliased overload of `replaceinds` is NOT here -- it lives beside the
+# type in tensor_wrappers_aliased.jl, next to prime/noprime/setprime. This file
+# is included at SparseBackends.jl:197, before WrappedAliasedBlockSparse exists,
+# so a method written here fails to precompile with
+# `UndefVarError: WrappedAliasedBlockSparse not defined`.
+
 function ITensors.replaceinds(es::ITensors.ExternalStorage{S}, inds1, inds2; kwargs...) where {S}
   data = es.data
   data isa WrappedTensorTypes || throw(MethodError(ITensors.replaceinds, (es, inds1, inds2)))

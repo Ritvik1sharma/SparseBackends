@@ -359,7 +359,8 @@ function top_level_contract(
   aLeft::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing,
   aRight::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing,
   bLeft::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing,
-  bRight::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing
+  bRight::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing,
+  alias_hint::Union{Nothing,Symbol}=nothing
 )
   # Parse the public Symbol API to the canonical Backend enum (strict: a
   # non-canonical name like the old :aliasedblocksparse throws here).
@@ -401,25 +402,127 @@ function top_level_contract(
       wrap_itensor(B; backend=Bb, denseLinks=denseLinksB)
   end
   return contract_and_fuse_links(Aw, Bw, Cb, bondmap;
-                                 aLeft=aLeft, aRight=aRight, bLeft=bLeft, bRight=bRight)
+                                 aLeft=aLeft, aRight=aRight, bLeft=bLeft, bRight=bRight,
+                                 alias_hint=alias_hint)
 end
 
 @inline _bs_head_len(::WrappedBlockSparse{T,N,N2,P}) where {T,N,N2,P} = P
 
+"""
+    _preserve_prefix_hint(Aw, Bw, aLeft, aRight, bLeft, bRight) -> Set{Index}
+
+Dense-tail allow-list for `alias_hint = :preserve_prefix` (see
+`contract_and_fuse_links`). `output_inds_hint` is interpreted as the COMPLETE set of
+output dense-tail axes; every output axis absent from it is classified sparse, and
+one that was dense in an operand is then FISSIONED into the prefix.
+
+For MPO x MPS we want the output's prefix to match the aliased operand's:
+
+  * aliased operand's `dense_inds` (its payload / core bonds) -> tail
+  * the DENSE operand's link family                          -> tail
+    (omitting it would fission the gate bond and multiply the key space by its dim
+     for no benefit)
+  * the dense operand's SITE index (s')                      -> ABSENT, so it is
+    forced sparse. This is the whole point: with no hint, s' is classified dense
+    purely because it came from a dense operand, which demotes it out of the prefix
+    and destroys the alias key structure.
+"""
+function _preserve_prefix_hint(Aw, Bw, aLeft, aRight, bLeft, bRight)
+  hint = Set{ITensors.Index}()
+  _add!(v) = (v === nothing || union!(hint, v); nothing)
+  a_ali = Aw isa WrappedAliasedBlockSparse
+  b_ali = Bw isa WrappedAliasedBlockSparse
+  if b_ali && !a_ali
+    union!(hint, dense_inds(Bw)); _add!(aLeft); _add!(aRight)   # A is the dense operand
+  elseif a_ali && !b_ali
+    union!(hint, dense_inds(Aw)); _add!(bLeft); _add!(bRight)   # B is the dense operand
+  elseif a_ali && b_ali
+    union!(hint, dense_inds(Aw)); union!(hint, dense_inds(Bw))
+  end
+  return hint
+end
+
+"""
+    _preserve_prefix_order(Xw, Yw, hint) -> Vector{Index}
+
+Output index order for `:preserve_prefix`, passed as `preferred_output_labels`:
+
+    [ Xw's surviving prefix axes ] [ axes moved in from Yw ] [ dense tail ]
+
+Xw is the aliased operand. Moved axes (the dense operand's site index) go LAST in the
+sparse prefix: `contract_aliased.jl` maps C prefix slots `PC+1-n_fission .. PC` onto
+B's fission axes, so anything else trips "fission axes count mismatch". Contracted
+axes are dropped -- they do not appear in C.
+"""
+function _preserve_prefix_order(Xw, Yw, hint)
+  hint_ids = Set(ITensors.id(I) for I in hint)
+  # Compare FULL Indices, not ids: s and s' share an id and differ only in plev, so
+  # an id-based "is contracted" test drops s' too and the order list comes out short.
+  shared   = Set(Xw.inds) ∩ Set(Yw.inds)              # contracted axes vanish from C
+  keep(I)  = !(I in shared)
+  issp(I)  = !(ITensors.id(I) in hint_ids)
+  x_sparse = [I for I in Xw.inds if keep(I) && issp(I)]
+  y_sparse = [I for I in Yw.inds if keep(I) && issp(I)]   # moved -> fissioned, LAST
+  tail = ITensors.Index[]
+  append!(tail, [I for I in Xw.inds if keep(I) && !issp(I)])
+  append!(tail, [I for I in Yw.inds if keep(I) && !issp(I)])
+  return vcat(x_sparse, y_sparse, tail)
+end
+
+"""
+`alias_hint` selects an output axis-classification POLICY (default `nothing` =
+inherit each axis's density from its operand, the historical behaviour, so existing
+callers such as DMRG/PHP are unaffected):
+
+  * `nothing`            -- unchanged.
+  * `:preserve_prefix`   -- keep the aliased operand's prefix structure, promoting
+                            the dense operand's site index into it. Required for
+                            MPO x MPS TEBD on an aliased psi: without it s' is
+                            demoted to the dense tail and the alias keys collapse
+                            (measured at Nm=3: prefix [4,8,8] -> [8,8], keys 32 -> 8,
+                            dedup 8x -> 1x).
+"""
 function contract_and_fuse_links(
   Aw::WrappedTensorTypes, Bw::WrappedTensorTypes, Cbackend::Union{Nothing,Symbol,Backend},
   bondmap::BondMap;
   aLeft::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing,
   aRight::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing,
   bLeft::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing,
-  bRight::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing
+  bRight::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing,
+  alias_hint::Union{Nothing,Symbol}=nothing
 )
   Cb = Cbackend === nothing ? nothing : to_backend(Cbackend)
   if Aw isa WrappedAliasedBlockSparse || Bw isa WrappedAliasedBlockSparse || Cb === ALIASED
+    hint = alias_hint === nothing ? nothing :
+           alias_hint === :preserve_prefix ?
+             _preserve_prefix_hint(Aw, Bw, aLeft, aRight, bLeft, bRight) :
+             error("contract_and_fuse_links: unknown alias_hint=$alias_hint")
+    # OPERAND ORDER MATTERS for fission. contract_aliased.jl's fission detection
+    # (see its "C's prefix may include axes that came from B" comment) only promotes
+    # axes originating in *B* into C's prefix:
+    #     n_fission = PC - (PA - 1);  fission_pos_in_B must have exactly that many
+    # so an axis from A that the hint forces sparse trips
+    #     AssertionError: fission axes count mismatch (0 vs 1)
+    # With MPO x MPS the site index s' comes from the DENSE MPO. If the MPO is A, s'
+    # is unfissionable. Swapping so the ALIASED operand is A (and the dense MPO is B)
+    # makes s' a B-axis, which is exactly why DMRG's _mul_preserve_aliased works --
+    # it passes the aliased tensor first. Contraction is symmetric, and the bond
+    # canonicalisation below locates axes by Index identity, not position.
+    Xw, Yw = (Bw isa WrappedAliasedBlockSparse && !(Aw isa WrappedAliasedBlockSparse) &&
+              hint !== nothing) ? (Bw, Aw) : (Aw, Bw)
+    # Desired output layout: [aliased prefix survivors] [moved site axis] [dense tail].
+    # The moved axis goes LAST in the prefix because contract_aliased.jl maps C prefix
+    # slots PC+1-n_fission .. PC onto B's fission axes. nothing for every caller that
+    # passes no alias_hint, so DMRG/PHP keeps the historical layout.
+    pref = alias_hint === :preserve_prefix ?
+           _preserve_prefix_order(Xw, Yw, hint) : nothing
     if Cb === ALIASED
-      Cw = wrapped_contract_aliased(Aw, Bw; preserve_bs_output=true)  # <-- aliased output
+      Cw = wrapped_contract_aliased(Xw, Yw; preserve_bs_output=true,
+                                    output_inds_hint=hint,
+                                    preferred_output_labels=pref)  # <-- aliased output
     elseif Cb === DENSE
-      Cw = wrapped_contract_aliased(Aw, Bw)  # <-- dense output
+      Cw = wrapped_contract_aliased(Xw, Yw; output_inds_hint=hint,
+                                    preferred_output_labels=pref)  # <-- dense output
     else
       error("Unsupported Cbackend=$Cb for contract_and_fuse_links with aliased inputs.")
     end

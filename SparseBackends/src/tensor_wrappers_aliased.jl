@@ -118,9 +118,14 @@ Base.eltype(::Type{ITensors.ExternalStorage{W}}) where {W<:WrappedAliasedBlockSp
 # Public opt-in: value-dedup an aliased ITensor's templates (e.g. a ψ†ψ gram). Collapses
 # templates with equal block-values (the AA kernel only dedups by input-pair, so a gram's
 # group-difference duplicates persist). No-op on dense / non-aliased tensors. Mutates+returns.
-function compress_aliased_templates!(t::ITensors.ITensor; atol::Real=1e-12)
+#
+# `projective=true` merges templates equal only UP TO A SCALAR, folding the ratio into the
+# per-block scalars — the format's own equivalence class, and a strict superset of the
+# default exact-value merge. Off by default so the existing gram call site is unchanged.
+function compress_aliased_templates!(t::ITensors.ITensor; atol::Real=1e-12,
+                                     projective::Bool=false)
     if ITensors.has_external_storage(t) && t.tensor.data isa WrappedAliasedBlockSparse
-        _dedup_templates_by_value!(t.tensor.data.aliased; atol=atol)
+        _dedup_templates_by_value!(t.tensor.data.aliased; atol=atol, projective=projective)
     end
     return t
 end
@@ -318,6 +323,23 @@ end
 
 function setprime(w::WrappedAliasedBlockSparse{T,N,N2,P}, args...) where {T,N,N2,P}
     new_inds = _setprime_inds(w.inds, args...)
+    return WrappedAliasedBlockSparse{T,N,N2,P}(w.aliased, new_inds)
+end
+
+# The other two wrappers get `replaceinds` in tensor_index.jl:118,123; the aliased
+# one was missing, so any generic ITensor path that renames indices on an aliased
+# tensor died with `MethodError: no method matching replaceinds(
+# ::WrappedAliasedBlockSparse, ...)` -- the ExternalStorage dispatcher
+# (tensor_index.jl:128) forwards to the inner wrapper and found nothing.
+#
+# It lives HERE, not with the other two: tensor_index.jl is included at
+# SparseBackends.jl:197, before this file defines the type, so a method written
+# there fails to precompile with `UndefVarError: WrappedAliasedBlockSparse`.
+#
+# Index metadata only -- `aliased` is passed through untouched, so templates,
+# keys, alias_ids and scalars (and therefore the dedup ratio) are unaffected.
+function replaceinds(w::WrappedAliasedBlockSparse{T,N,N2,P}, inds1, inds2) where {T,N,N2,P}
+    new_inds = ITensors.replaceinds(w.inds, inds1, inds2)
     return WrappedAliasedBlockSparse{T,N,N2,P}(w.aliased, new_inds)
 end
 
@@ -1077,6 +1099,31 @@ function wrapped_contract_aliased(
         # how to classify hint-marked axes as dense.
         indsC, denseC = output_inds(indsA, indsB, denseA, denseB;
             output_inds_hint=output_inds_hint)
+        # Caller-controlled output ordering for the ALIASED-output path.
+        # output_inds emits a fixed bucket order
+        #   [sparse_nonlink, moved_dense_links, sparse_link, dense_tail]
+        # which has no slot for a sparse NON-LINK axis after the sparse links. The
+        # MPO x MPS case needs exactly that: the gate's site index s' must sit in the
+        # LAST prefix slot, because contract_aliased.jl maps C prefix slots
+        # PC+1-n_fission .. PC onto B's fission axes. Left first, it throws
+        # "fission axes count mismatch".
+        #
+        # This mirrors what output_perm already does on the aliased -> DENSE (matvec)
+        # path; that hook was never wired into this branch. nothing => untouched, so
+        # every existing caller (DMRG/PHP) keeps the historical layout.
+        if preferred_output_labels !== nothing
+            want = first(preferred_output_labels) isa ITensors.Index ?
+                   collect(preferred_output_labels) : nothing
+            if want !== nothing && length(want) == length(indsC) &&
+               Set(ITensors.id.(want)) == Set(ITensors.id.(indsC))
+                # Dense-tail axes must stay last, or the prefix/tail split breaks.
+                dset = Set(ITensors.id(I) for I in denseC)
+                ntail = count(I -> ITensors.id(I) in dset, want)
+                if all(I -> ITensors.id(I) in dset, want[(end - ntail + 1):end])
+                    indsC = Tuple(want)
+                end
+            end
+        end
         dimsC  = ntuple(i -> ITensors.dim(indsC[i]), length(indsC))
         TC     = promote_type(eltype(Arep), eltype(Brep))
     end
