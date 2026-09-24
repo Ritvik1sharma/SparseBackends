@@ -5,3 +5,6 @@ auto_archived/
 logs/
 */logs/
 KrylovKit.jl/
+
+# Retired experiments kept on disk for reference, not part of the package.
+auto_archived/
