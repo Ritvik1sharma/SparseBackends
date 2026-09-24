@@ -19,9 +19,22 @@ using LinearAlgebra: BLAS
 # internally and is documented as FP-close but NOT bit-identical to serial.
 BLAS.set_num_threads(parse(Int, get(ENV, "BENCH_BLAS_THREADS", string(Sys.CPU_THREADS))))
 
+using SparseBackends
+using ITensors, ITensorMPS
+using Random
+
+# fuse_sparse_links! / prepermute_aliased_mpo! / report_aliased_footprint /
+# sparse_prefix_inds — the same file the test drivers include, not a copy.
+include(joinpath(@__DIR__, "..", "test_sparse_ham", "aliased_helpers.jl"))
+# inflate_mpo_bonds / pad_hamiltonian — zero-pads the bare H's bond dimension for
+# the chi_H experiment. No-op unless a config sets pad_h_chi.
+include(joinpath(@__DIR__, "..", "..", "experiments", "pad_h_utils.jl"))
+
 include(joinpath(@__DIR__, "..", "sparse_runner_utils.jl"))
 include(joinpath(@__DIR__, "configs.jl"))
-include(joinpath(@__DIR__, "models.jl"))
+include(joinpath(@__DIR__, "php.jl"))   # sandwich_mpo / sandwich_mpo_aliased — model-independent
+include(joinpath(@__DIR__, "kl.jl"))    # kl_operators  / kl_psi0
+include(joinpath(@__DIR__, "pxp.jl"))   # pxp_operators / pxp_psi0
 
 const SB_VARIANTS = Dict(
     :sb_dense   => (php = :dense,   run_mode = :standard),
@@ -65,23 +78,23 @@ function build_problem(cfg::NamedTuple, variant::Symbol, seed::Int)
     spec = SB_VARIANTS[variant]
     extras = Dict{String,Any}()
 
+    # Each model supplies its projector(s) and its psi0; the sandwich itself is
+    # the same call for both — sandwich_mpo/sandwich_mpo_aliased take either a single MPO
+    # (PXP) or the per-plaquette vector (KL) and merge internally.
     if cfg.model === :kl
         sites, H_raw, ConsOps1, ConsOps2 = kl_operators(cfg.nplaq, cfg.spin, cfg.psign; pad_h_chi=get(cfg, :pad_h_chi, 0))
-        build_seconds = @elapsed begin
-            H_php = spec.php === :dense ? kl_php_dense(ConsOps1, H_raw) :
-                                          kl_php_aliased(ConsOps1, H_raw)
-        end
+        Ps   = ConsOps1
         psi0 = kl_psi0(sites, ConsOps2, seed)
     elseif cfg.model === :pxp
         sites, H_raw, P = pxp_operators(cfg.nsites; pad_h_chi=get(cfg, :pad_h_chi, 0))
-        build_seconds = @elapsed begin
-            H_php = spec.php === :dense ? pxp_php_dense(P, H_raw) :
-                                          pxp_php_aliased(P, H_raw)
-        end
+        Ps   = P
         psi0 = pxp_psi0(sites, P, seed)
         extras["P"] = P
     else
         error("build_problem: unknown model $(cfg.model)")
+    end
+    build_seconds = @elapsed begin
+        H_php = spec.php === :dense ? sandwich_mpo(Ps, H_raw) : sandwich_mpo_aliased(Ps, H_raw)
     end
 
     extras["sites"] = sites
@@ -120,7 +133,7 @@ function run_config(config_id::AbstractString, variant::Symbol;
         "run_mode"        => String(spec.run_mode),
         "php_backend"     => String(spec.php),
 
-        "dense_sandwich"  => "exact_is_ctn",   # no SVD; see pxp_php_dense docstring
+        "dense_sandwich"  => "exact_is_ctn",   # no SVD; see sandwich_mpo docstring
         "nsites"          => length(sites),
 
         "pad_h_chi"       => get(cfg, :pad_h_chi, 0),

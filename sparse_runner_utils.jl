@@ -37,7 +37,19 @@ using ITensors, ITensorMPS
 using JSON
 using Printf
 using LinearAlgebra
-using TimerOutputs
+# NO `using TimerOutputs` here. It is not a direct dependency of the
+# tensornetworks/ project that the orig_dense baseline runs under — only an
+# indirect one via ITensors/NDTensors — so `using TimerOutputs` throws
+# "Package TimerOutputs not found in current path" and takes the whole baseline
+# process down before it builds anything. (That is exactly what happened: it
+# silently killed all 24 orig_dense tasks of the chi_H ablation while the sb_*
+# tasks, which run under the SparseBackends project where it IS a direct dep,
+# completed fine.)
+#
+# Not needed anyway: both modules that own a timer already import reset_timer!
+# into their own namespace (SparseBackends/ITensorMPS.jl abstractprojmpo.jl:4 and
+# SparseBackends.jl:3), so _reset_profilers! calls it module-qualified and the
+# baseline never reaches those branches.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-sweep instrumentation
@@ -157,8 +169,10 @@ with that tree.
 """
 function _reset_profilers!()
     get(ENV, "BENCH_TIMERS", "0") == "1" || return nothing
-    isdefined(ITensorMPS, :PROJMPO_TIMER) &&
-        TimerOutputs.reset_timer!(ITensorMPS.PROJMPO_TIMER)
+    # reset_timer! is module-qualified, never via `using TimerOutputs` — see the
+    # note at the top of this file. Both conditions are false under packages/.
+    isdefined(ITensorMPS, :PROJMPO_TIMER) && isdefined(ITensorMPS, :reset_timer!) &&
+        getfield(ITensorMPS, :reset_timer!)(ITensorMPS.PROJMPO_TIMER)
     # Fused matvec's own 4-slot profiler. Arm it here too: it is a plain Ref, so
     # if it is never set to true the fused path records nothing and the report
     # prints "(no profiling data)".
@@ -171,7 +185,8 @@ function _reset_profilers!()
              Base.PkgId(Base.UUID("60b00394-95c5-4a10-8e1c-b93543744110"), "SparseBackends"),
              nothing)
     if SB !== nothing
-        isdefined(SB, :TIMER) && TimerOutputs.reset_timer!(getfield(SB, :TIMER))
+        isdefined(SB, :TIMER) && isdefined(SB, :reset_timer!) &&
+            getfield(SB, :reset_timer!)(getfield(SB, :TIMER))
         # reset_flops!(true) both zeroes the counter and arms it. dmrg's own
         # `set_roofline!(roofline)` call runs later and would otherwise be the
         # only thing arming it — this makes the state explicit per timed run.
