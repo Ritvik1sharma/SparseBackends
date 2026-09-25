@@ -24,10 +24,22 @@ _n2(w::WrappedAliasedBlockSparse{T,N,N2,P}) where {T,N,N2,P} = N2
 
 # core-slice → template id. Uses the cached hint if present, else derives it by
 # grouping keys on the physical axis (and asserts no scramble).
-function slice_to_template(w::WrappedAliasedBlockSparse)
+function slice_to_template(w::WrappedAliasedBlockSparse; assume_diagonal_P::Bool = false)
     a = w.aliased
     isempty(a.keys) && return Int[]
     !isempty(a.slice_to_template) && return a.slice_to_template
+    # NO SILENT FALLBACK. The derivation below reads the Site coordinate out of each
+    # key, which is the POST-P index s'. That equals the pre-P slice rv only when P is
+    # DIAGONAL. For an off-diagonal (flip) P it returns the right templates filed under
+    # the wrong slices -- a permuted core -- and it cannot detect the difference,
+    # because a relabelling produces no key collision for the `scramble` guard below.
+    # P is not in scope here, so this function cannot check; the caller must assert it.
+    assume_diagonal_P || error(
+        "factor-core: slice_to_template is absent and cannot be derived safely. It is " *
+        "written only by the COO-MPO x dense-MPS kernel (psi = P*core); any operation " *
+        "that rebuilt this storage without carrying it forward loses it. Deriving it " *
+        "from `keys` assumes a DIAGONAL P and silently returns a permuted core for a " *
+        "flip P. If this call site knows P is diagonal, pass assume_diagonal_P=true.")
     phys = _phys_prefix_pos(w)
     phys == 0 && error("factor-core: no Site axis in prefix; cannot derive slice_to_template")
     s2t = zeros(Int, a.dims[phys])
