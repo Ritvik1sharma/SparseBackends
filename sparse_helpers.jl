@@ -282,14 +282,43 @@ function merge_aliased_templates!(psi::MPS)
     return psi
 end
 
-step_sparse(psi::MPS, layers::Vector{MPO}; maxdim::Int, cutoff::Real = 0.0,
-            merge::Union{Bool,Symbol} = :before,
-            ortho_frame::Symbol = :left,
-            alias_hint::Union{Nothing,Symbol} = :preserve_prefix) =
-    foldl((p, M) -> apply_layer_sparse(p, M; maxdim = maxdim, cutoff = cutoff,
-                                       merge = merge, ortho_frame = ortho_frame,
-                                       alias_hint = alias_hint),
-          layers; init = psi)
+"""All layers of one Trotter cycle onto `psi`.
+
+`ortho_frame` is `:left`, `:right`, or `:alternate`. The first two hand the same fixed
+frame to every layer, so the canonicalization sweep runs in the SAME direction every
+time -- N->1 for `:left`, 1->N for `:right` -- and any directional bias in what
+`itensor_aliased_factorize` discards accumulates over the run.
+
+`:alternate` flips the frame per LAYER, the usual back-and-forth sweeping order. It is
+nearly free here: the frame only sets where the previous layer left the centre, and the
+next layer's contraction is exact and needs no canonical form, so alternating costs no
+extra sweep.
+
+`layer0` is the number of layers already applied before this call, so the parity
+CONTINUES across cycles: with an even number of layers per cycle, restarting at `:left`
+every cycle would reintroduce exactly the bias `:alternate` removes. Callers advancing
+cycle by cycle should pass `layer0 = (cycle - 1) * length(layers)`. Ignored unless
+`ortho_frame === :alternate`."""
+function step_sparse(psi::MPS, layers::Vector{MPO}; maxdim::Int, cutoff::Real = 0.0,
+                     merge::Union{Bool,Symbol} = :before,
+                     ortho_frame::Symbol = :left,
+                     layer0::Int = 0,
+                     alias_hint::Union{Nothing,Symbol} = :preserve_prefix)
+    ortho_frame in (:left, :right, :alternate) ||
+        error("step_sparse: ortho_frame must be :left, :right or :alternate; got $ortho_frame")
+    p = psi
+    for (k, M) in enumerate(layers)
+        # Resolved HERE, not in apply_layer_sparse: that function is stateless per layer
+        # and cannot know the parity, and keeping its contract at :left/:right leaves
+        # every existing caller bit-for-bit unchanged.
+        frame = ortho_frame === :alternate ?
+                (iseven(layer0 + k - 1) ? :left : :right) : ortho_frame
+        p = apply_layer_sparse(p, M; maxdim = maxdim, cutoff = cutoff,
+                               merge = merge, ortho_frame = frame,
+                               alias_hint = alias_hint)
+    end
+    return p
+end
 
 # --- observables ------------------------------------------------------------
 
