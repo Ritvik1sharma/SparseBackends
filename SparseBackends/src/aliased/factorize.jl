@@ -581,6 +581,13 @@ function _build_aliased_frozen_schema(
         templates_new, am.n_templates,
         copy(am.keys), copy(am.alias_ids), T.(am.scalars),
     )
+    # FROZEN schema, as the name says: keys, alias_ids and n_templates all come
+    # across verbatim and only the dense tail (the multiplicity bond) is rebuilt.
+    # Template ids therefore still denote the same slots, so the rv -> tid routing
+    # survives and must be carried; leaving it empty made read_core guess, which is
+    # a silent permutation for a flip P. Each of L and R is built by its own call
+    # with its own M_w, so each correctly inherits its own input's map.
+    isempty(am.slice_to_template) || (ali_new.slice_to_template = copy(am.slice_to_template))
     # Update the bond-multiplicity ind. Use the caller-provided shared Index
     # so L and R share the same id on the new bond.
     new_inds = collect(M_w.inds)

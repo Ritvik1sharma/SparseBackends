@@ -274,6 +274,22 @@ function filter_keys_keepdedup(w::WrappedAliasedBlockSparse{T,N,N2,P}, allowed) 
         a.dims, a.blksize, new_templates, n_kept,
         a.keys[keep], new_aids, a.scalars[keep],
     )
+    # Carry the factor-core hint through the template RENUMBERING. `remap` above is
+    # the old->new template id map, so the routing is still fully known here. A
+    # template that was dropped maps to 0, which read_core already handles ("pre-P
+    # slice absent"). Basis and values are untouched, so the rv -> tid routing is as
+    # valid after the filter as before it.
+    #
+    # Without this the field defaulted to EMPTY and read_core fell back to deriving
+    # rv from the KEY's Site coordinate -- i.e. the POST-P index s'. That is exact
+    # for diagonal P (PXP) and a silent PERMUTATION for a flip P (D4/KL), which is
+    # how route C in run_fidelity_sweep.jl read exactly the sector weight 1/8 at
+    # every cycle with no drift.
+    if !isempty(a.slice_to_template)
+        new_ali.slice_to_template =
+            [t == 0 ? 0 : Int(get(remap, eltype(old_aids)(t), zero(eltype(old_aids))))
+             for t in a.slice_to_template]
+    end
     return WrappedAliasedBlockSparse{T,N,N2,P}(new_ali, w.inds)
 end
 
@@ -1785,6 +1801,11 @@ function Base.copy(w::WrappedAliasedBlockSparse{T,N,N2,P}) where {T,N,N2,P}
         copy(A.templates), A.n_templates,
         copy(A.keys), copy(A.alias_ids), copy(A.scalars),
     )
+    # A copy changes nothing the hint refers to -- same keys, same alias_ids, same
+    # n_templates -- so dropping it here was pure loss. Fresh vector, never shared:
+    # the field is only ever reassigned, but a copy that aliased the source's vector
+    # would tie the two tensors together if that ever changed.
+    isempty(A.slice_to_template) || (new_ali.slice_to_template = copy(A.slice_to_template))
     return WrappedAliasedBlockSparse{T,N,N2,P}(new_ali, w.inds)
 end
 
