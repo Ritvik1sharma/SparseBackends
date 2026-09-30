@@ -122,7 +122,7 @@ function _aliased_shared_via_bs_fission!(
     nb = length(C_bs.keys)
     C.dims    = C_bs.dims
     C.blksize = C_bs.blksize
-    empty!(C.templates); append!(C.templates, C_bs.data)
+    C.templates = copy(C_bs.data)   # fresh exact-size copy
     C.n_templates = nb
     empty!(C.keys);      append!(C.keys, C_bs.keys)
     empty!(C.alias_ids); append!(C.alias_ids, _alias_id_range(eltype(C.alias_ids), nb))

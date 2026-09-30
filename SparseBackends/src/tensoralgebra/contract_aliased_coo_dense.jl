@@ -74,8 +74,39 @@ function contract_aliased!(
     @assert C.blksize == blksize "C.blksize=$(C.blksize) must equal prod(B dims without r)=$blksize"
     Bvec = vec(B)   # column-major; slice for fixed rv is contiguous
 
-    # ── Clear output ──
-    empty!(C.templates); C.n_templates = 0
+    axisAr = NA   # r is the last axis of A after alignment
+
+    # ── Exact template count from A's integer keys alone (no dense data touched).
+    #    Clean P (every ckey hit once, e.g. P·core): one template per distinct rv.
+    #    Otherwise mirror the main loop: distinct rv among first contributions to a
+    #    ckey, plus one accumulated template per ckey hit >= 2 times.
+    rvs   = Set{Int}()
+    ckeys = Set{NTuple{PC,Int}}()
+    n_nz  = 0
+    @inbounds for acoord in A.keys
+        rv = acoord[axisAr]
+        (1 <= rv <= R) || continue
+        n_nz += 1
+        push!(rvs, rv); push!(ckeys, ntuple(j -> acoord[j], Val(PC)))
+    end
+    if length(ckeys) == n_nz
+        n_tmpl_final = length(rvs)
+    else
+        ckey_count = Dict{NTuple{PC,Int},Int}()
+        first_rvs  = Set{Int}()
+        @inbounds for acoord in A.keys
+            rv = acoord[axisAr]
+            (1 <= rv <= R) || continue
+            ckey = ntuple(j -> acoord[j], Val(PC))
+            c = get(ckey_count, ckey, 0) + 1
+            ckey_count[ckey] = c
+            c == 1 && push!(first_rvs, rv)
+        end
+        n_tmpl_final = length(first_rvs) + count(>=(2), values(ckey_count))
+    end
+
+    # ── Clear output; templates allocated at their exact final size ──
+    C.templates = Vector{TC}(undef, n_tmpl_final * blksize); C.n_templates = 0
     empty!(C.keys); empty!(C.alias_ids); empty!(C.scalars)
 
     # Template deduplication: rv index -> template id
@@ -86,8 +117,6 @@ function contract_aliased!(
     #   key_to_accum[k] = Vector{TC}  — block accumulated from multiple contributions
     key_to_alias = Dict{NTuple{PC,Int}, Tuple{Int,TC}}()
     key_to_accum = Dict{NTuple{PC,Int}, Vector{TC}}()
-
-    axisAr = NA   # r is the last axis of A after alignment
 
     @inbounds for idx in eachindex(A.keys)
         acoord = A.keys[idx]
@@ -129,8 +158,9 @@ function contract_aliased!(
                 tid = C.n_templates
                 rv_to_tid[rv] = tid
                 src_off = (rv - 1) * blksize
+                dst_off = (tid - 1) * blksize
                 for j in 1:blksize
-                    push!(C.templates, convert(TC, Bvec[src_off + j]))
+                    C.templates[dst_off + j] = convert(TC, Bvec[src_off + j])
                 end
             end
             key_to_alias[ckey] = (tid, α)
@@ -148,7 +178,7 @@ function contract_aliased!(
     # ── Collect accumulated blocks: store each as its own template, scalar = 1 ──
     for (k, acc) in key_to_accum
         C.n_templates += 1
-        append!(C.templates, acc)
+        copyto!(C.templates, (C.n_templates - 1) * blksize + 1, acc, 1, blksize)
         push!(C.keys,      k)
         push!(C.alias_ids, _alias_id(AI, C.n_templates))
         push!(C.scalars,   one(TC))
@@ -171,5 +201,6 @@ function contract_aliased!(
     for (rv, tid) in rv_to_tid; s2t[rv] = tid; end
     C.slice_to_template = s2t
 
+    @assert C.n_templates == n_tmpl_final
     return C
 end

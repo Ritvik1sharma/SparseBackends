@@ -225,7 +225,7 @@ function _contract_dense_serial_legacy!(
         if _direct
             _ft0 = _RF_ON[] ? time_ns() : UInt64(0)
             # C.templates/keys/alias_ids/scalars were cleared at contract_shared! entry.
-            append!(C.templates, view(pending, 1:n_pending*blksize))
+            C.templates = pending[1:n_pending*blksize]   # fresh exact-size copy
             C.n_templates = n_pending
             resize!(C.keys, n_pending); resize!(C.alias_ids, n_pending); resize!(C.scalars, n_pending)
             for (k, cid) in ck_to_cid
