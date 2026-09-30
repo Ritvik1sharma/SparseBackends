@@ -1,26 +1,31 @@
 # aliased/factorize.jl
 #
-# Tier-2 aliased factorize via alias-reduced SVD.
-#
-# Algebra: with (keys, alias_ids, scalars) frozen on both sides, each phi
-# block at (i_L, i_R) pair satisfies
-#     phi[i_phi] / (scalars_L[i_L] * scalars_R[i_R])
-#       = templates_L[a_L(i_L)] @ templates_R[a_R(i_R)]    (contracted on bond)
-# The right side depends only on (a_L, a_R, L_other_tail_coords,
-# R_other_tail_coords). So we accumulate the "reduced" phi data into a small
-# matrix indexed by (a_L × L_other_tail) × (a_R × R_other_tail), SVD it, and
-# read off templates_L / templates_R. L's and R's keys, alias_ids, scalars,
-# and channel-bond axis are all inherited from M_b / M_b1 verbatim; only the
-# multiplicity-bond dim and the templates change.
+# Aliased factorizations. P (keys, alias_ids, scalars, channel axes) stays fixed;
+# only templates and the multiplicity (core-link) axis change.
+#   itensor_aliased_factorize        two-site, direct: split an aliased φ in template space
+#   _external_factorize_storage      single-site: the `factorize` hook (orthogonalize!, TEBD)
+# The factor-core two-site split (dense core in, core_split) is a separate method in
+# core_helpers/factor_core.jl; replacebond! picks between the two by the input's type.
 
 import ITensors
-using LinearAlgebra: svd, Diagonal
+using LinearAlgebra: svd, Diagonal, norm
 
-# SB_WHITEN_DIAG instrumentation: budgeted per-call print + running max of the
-# relative c-spread of w[a,c]² (the whitening c-constant assumption check).
-const _WHITEN_BUDGET = Ref{Int}(30)
-const _WHITEN_MAXDEV = Ref{Float64}(0.0)
+"""
+    itensor_aliased_factorize(phi, M_b, M_b1; ortho="left", maxdim, mindim=1,
+                              cutoff=0.0, tags=nothing) -> (L, R, spec)
 
+Direct two-site split of an aliased window φ back into the structure of `M_b`, `M_b1`
+(the tensors φ was contracted from, i.e. the current ψ[b], ψ[b+1]), working on φ's
+templates; no core is formed.
+
+Placement comes from the tensors: `window_pairs` reads, from the keys and alias_ids, the
+template pair (a_L, a_R) that built each φ template. φ's template is written, unscaled,
+into the (a_L, a_R) block of
+    M_red[(a_L, L_tail), (a_R, R_tail)],
+which is SVD'd; U's row blocks become M_b's new templates and V's column blocks M_b1's.
+Keys, alias_ids, scalars and the channel axes of both sides are kept. No per-channel
+division and no averaging: a block written twice must agree, otherwise it errors.
+"""
 function itensor_aliased_factorize(
     phi  :: ITensors.ITensor,
     M_b  :: ITensors.ITensor,
@@ -29,389 +34,63 @@ function itensor_aliased_factorize(
     maxdim  :: Int     = typemax(Int),
     mindim  :: Int     = 1,
     cutoff  :: Float64 = 0.0,
+    tags    = nothing,
     kwargs...,
 )
-    @assert ITensors.has_external_storage(phi)
-    @assert ITensors.has_external_storage(M_b)
-    @assert ITensors.has_external_storage(M_b1)
-    phi_w  = ITensors.get_external_storage(phi)::WrappedAliasedBlockSparse
-    M_b_w  = ITensors.get_external_storage(M_b)::WrappedAliasedBlockSparse
-    M_b1_w = ITensors.get_external_storage(M_b1)::WrappedAliasedBlockSparse
-    if ALIASED_TRACE[]
-        println("[SB_ALIASED_TRACE itensor_aliased_factorize] entered  ortho=$ortho")
-    end
-    L_R_spec = _aliased_alias_reduced_factorize(
-        phi_w, M_b_w, M_b1_w;
-        ortho, maxdim, mindim, cutoff,
-        core_canonical = get(kwargs, :core_canonical, false))
-    if ALIASED_TRACE[]
-        L_, R_, _ = L_R_spec
-        println("[SB_ALIASED_TRACE itensor_aliased_factorize] L storage=", typeof(L_.tensor.data),
-                "  R storage=", typeof(R_.tensor.data))
-    end
-    return L_R_spec
-end
+    ortho in ("left", "right") || error("itensor_aliased_factorize: unknown ortho=$ortho")
+    phi_w = ITensors.get_external_storage(phi)::WrappedAliasedBlockSparse
+    Bw    = ITensors.get_external_storage(M_b)::WrappedAliasedBlockSparse
+    B1w   = ITensors.get_external_storage(M_b1)::WrappedAliasedBlockSparse
+    # TODO: key-space SVD + re-merge for an off-manifold φ (one window_pairs rejects);
+    # no exact split into the fixed P exists for it.
+    pairs = window_pairs(phi_w, Bw, B1w)
+    aphi = phi_w.aliased
+    Ab, Ab1 = Bw.aliased, B1w.aliased
+    Tel = promote_type(eltype(aphi.templates), eltype(Ab.templates), eltype(Ab1.templates))
 
-# Identify shared inds between M_b and M_b1, classified as :channel (sparse
-# prefix on M_b's side) or :multiplicity (dense tail). Returns Vector of
-# (pos_in_M_b, pos_in_M_b1, kind).
-function _identify_bond_axes(M_b_w::WrappedAliasedBlockSparse,
-                              M_b1_w::WrappedAliasedBlockSparse)
-    P_b = _abs_head_len(M_b_w)
-    out = Tuple{Int,Int,Symbol}[]
-    for (i, Ib) in enumerate(M_b_w.inds)
-        for (j, Ib1) in enumerate(M_b1_w.inds)
-            if Ib == Ib1
-                kind = (i <= P_b) ? :channel : :multiplicity
-                push!(out, (i, j, kind))
-                break
-            end
-        end
-    end
-    return out
-end
+    # ---- tails: M_b = (L_other..., mult), M_b1 = (mult, R_other...) ------------
+    Pb, Pb1, Pphi = _abs_head_len(Bw), _abs_head_len(B1w), _abs_head_len(phi_w)
+    tail_b  = collect(Bw.inds[Pb+1:end]);   tail_b1 = collect(B1w.inds[Pb1+1:end])
+    mu = [I for I in tail_b if I in tail_b1]
+    length(mu) == 1 || error("itensor_aliased_factorize: expected one shared multiplicity " *
+                             "index in the dense tails, found $(length(mu))")
+    mult_old = only(mu)
+    jb, jb1 = findfirst(==(mult_old), tail_b), findfirst(==(mult_old), tail_b1)
+    Lo = [I for I in tail_b  if I != mult_old]
+    Ro = [I for I in tail_b1 if I != mult_old]
+    nLo = prod(ITensors.dim.(Lo); init = 1); nRo = prod(ITensors.dim.(Ro); init = 1)
+    tail_phi = collect(phi_w.inds[Pphi+1:end])
+    (Set(tail_phi) == Set([Lo; Ro]) && length(tail_phi) == length(Lo) + length(Ro)) ||
+        error("itensor_aliased_factorize: φ's dense tail is not (M_b tail, M_b1 tail) " *
+              "minus the shared multiplicity index")
+    perm_phi = [findfirst(==(I), tail_phi) for I in [Lo; Ro]]
+    dims_phi = Tuple(ITensors.dim.(tail_phi))
 
-# Column-major linear index over coords with given dims; 1-based.
-function _lin_col_major(coords::AbstractVector{Int}, dims::AbstractVector{Int})
-    isempty(coords) && return 1
-    idx = coords[1]
-    stride = 1
-    for j in 2:length(coords)
-        stride *= dims[j-1]
-        idx += (coords[j] - 1) * stride
-    end
-    return idx
-end
-
-# Decode a column-major linear index back into coords.
-function _decode_col_major!(coords::AbstractVector{Int}, lin::Int, dims::AbstractVector{Int})
-    rem = lin - 1
-    for j in 1:length(dims)
-        coords[j] = (rem % dims[j]) + 1
-        rem ÷= dims[j]
-    end
-    return coords
-end
-
-function _aliased_alias_reduced_factorize(
-    phi_w  :: WrappedAliasedBlockSparse,
-    M_b_w  :: WrappedAliasedBlockSparse,
-    M_b1_w :: WrappedAliasedBlockSparse;
-    ortho  :: String,
-    maxdim :: Int,
-    mindim :: Int,
-    cutoff :: Float64,
-    core_canonical :: Bool = false,   # factor-core mode: skip the M^{1/2} whitening
-)                                     # ⇒ plain SVD of the core two-site ⇒ core-orthonormal split (metric I)
-    am_b   = M_b_w.aliased
-    am_b1  = M_b1_w.aliased
-    am_phi = phi_w.aliased
-    Tel = promote_type(eltype(am_b.templates), eltype(am_b1.templates), eltype(am_phi.templates))
-
-    # ---- bond axes ----------------------------------------------------------
-    shared = _identify_bond_axes(M_b_w, M_b1_w)
-    @assert !isempty(shared) "M_b and M_b1 share no inds"
-    ch_pos_b  = [p for (p,_,k) in shared if k === :channel]
-    ch_pos_b1 = [q for (_,q,k) in shared if k === :channel]
-    mu_pos_b  = [p for (p,_,k) in shared if k === :multiplicity]
-    mu_pos_b1 = [q for (_,q,k) in shared if k === :multiplicity]
-    @assert length(ch_pos_b) == 1  "expected exactly one shared channel axis (sparse prefix)"
-    @assert length(mu_pos_b) <= 1 "expected at most one shared multiplicity axis (dense tail)"
-
-    cp_b  = ch_pos_b[1]
-    cp_b1 = ch_pos_b1[1]
-    has_mu = !isempty(mu_pos_b)
-    mp_b  = has_mu ? mu_pos_b[1]  : 0
-    mp_b1 = has_mu ? mu_pos_b1[1] : 0
-
-    P_b   = _abs_head_len(M_b_w);  N_b   = ndims(am_b);   N2_b  = N_b  - P_b
-    P_b1  = _abs_head_len(M_b1_w); N_b1  = ndims(am_b1);  N2_b1 = N_b1 - P_b1
-    P_phi = _abs_head_len(phi_w);  N_phi = ndims(am_phi); N2_phi = N_phi - P_phi
-
-    # ---- L_other / R_other classification on the dense tail ----------------
-    # L's tail (within M_b) minus the shared multiplicity axis (if present).
-    L_other_pos_b  = [P_b  + i for i in 1:N2_b  if (has_mu ? (P_b  + i != mp_b)  : true)]
-    R_other_pos_b1 = [P_b1 + i for i in 1:N2_b1 if (has_mu ? (P_b1 + i != mp_b1) : true)]
-    L_other_dims = Int[am_b.dims[p]  for p in L_other_pos_b]
-    R_other_dims = Int[am_b1.dims[p] for p in R_other_pos_b1]
-    n_L_other = prod(L_other_dims; init=1)
-    n_R_other = prod(R_other_dims; init=1)
-
-    bond_mult_old = has_mu ? am_b.dims[mp_b] : 1
-    bond_ch_dim   = am_b.dims[cp_b]
-
-    L_other_inds = ITensors.Index[M_b_w.inds[p]  for p in L_other_pos_b]
-    R_other_inds = ITensors.Index[M_b1_w.inds[p] for p in R_other_pos_b1]
-
-    # ---- phi tail position → (side, local index) ---------------------------
-    phi_tail_origin = Vector{Tuple{Symbol,Int}}(undef, N2_phi)
-    for j in 1:N2_phi
-        I = phi_w.inds[P_phi + j]
-        li = findfirst(==(I), L_other_inds)
-        if li !== nothing
-            phi_tail_origin[j] = (:L, li); continue
-        end
-        ri = findfirst(==(I), R_other_inds)
-        if ri !== nothing
-            phi_tail_origin[j] = (:R, ri); continue
-        end
-        error("phi tail ind $I not in L_other or R_other inds")
-    end
-    phi_tail_dims = Int[am_phi.dims[P_phi + j] for j in 1:N2_phi]
-
-    # ---- phi prefix position → (side, M_b or M_b1 axis position) -----------
-    nonshared_pos_b  = [i for i in 1:P_b  if i != cp_b]
-    nonshared_pos_b1 = [j for j in 1:P_b1 if j != cp_b1]
-    nonshared_inds_b  = [M_b_w.inds[p]  for p in nonshared_pos_b]
-    nonshared_inds_b1 = [M_b1_w.inds[p] for p in nonshared_pos_b1]
-    phi_prefix_origin = Vector{Tuple{Symbol,Int}}(undef, P_phi)
-    for i in 1:P_phi
-        I = phi_w.inds[i]
-        bi = findfirst(==(I), nonshared_inds_b)
-        if bi !== nothing
-            phi_prefix_origin[i] = (:b, nonshared_pos_b[bi]); continue
-        end
-        b1i = findfirst(==(I), nonshared_inds_b1)
-        if b1i !== nothing
-            phi_prefix_origin[i] = (:b1, nonshared_pos_b1[b1i]); continue
-        end
-        error("phi prefix ind $I not in M_b or M_b1 non-shared prefix")
-    end
-
-    # Pre-compute per-phi-prefix-axis: which (b/b1) and which axis position.
-    # Build look-up vectors keyed by M_b's axis positions → phi prefix axis index.
-    phi_idx_for_b_pos  = Dict{Int,Int}()
-    phi_idx_for_b1_pos = Dict{Int,Int}()
-    for (i_phi, (side, pos)) in enumerate(phi_prefix_origin)
-        if side === :b;  phi_idx_for_b_pos[pos]  = i_phi; end
-        if side === :b1; phi_idx_for_b1_pos[pos] = i_phi; end
-    end
-
-    # ---- key lookups -------------------------------------------------------
-    M_b_lookup  = Dict(Tuple(k) => i for (i, k) in enumerate(am_b.keys))
-    M_b1_lookup = Dict(Tuple(k) => i for (i, k) in enumerate(am_b1.keys))
-
-    # ---- accumulate alias-reduced matrix M_red ------------------------------
-    # Rows indexed by (a_L, L_other_lin) → row = (a_L-1)*n_L_other + L_other_lin
-    # Cols indexed by (a_R, R_other_lin) → col = (a_R-1)*n_R_other + R_other_lin
-    n_tL = am_b.n_templates
-    n_tR = am_b1.n_templates
-    nrows = n_tL * n_L_other * bond_mult_old
-    ncols = n_tR * n_R_other * bond_mult_old
-    # The bond multiplicity dim was contracted away in phi; it does NOT
-    # appear in M_red. M_red shape: (n_tL * n_L_other, n_tR * n_R_other).
-    # (After SVD, mult_new replaces bond_mult_old.)
-    M_red  = zeros(Tel, n_tL * n_L_other, n_tR * n_R_other)
-    counts = zeros(Int,  n_tL * n_L_other, n_tR * n_R_other)
-    # SB_MRED_DIAG: on-manifold check for the eigensolver's φ. If φ = P × psi_dense
-    # (the aliased manifold), then for a fixed environment template-pair the
-    # per-CHANNEL contribution vectors are exact scalar multiples (the projector P
-    # factors out, leaving the shared psi_dense) → channel-pair cosine = ±1. If the
-    # eigsolve drifted φ off-manifold, channels are no longer proportional → cosine
-    # < 1, and re-aliasing must lose energy. We accumulate per-channel matrices
-    # M_red_per_c[:, :, c] and report the pairwise channel cosine distribution.
-    _mred_diag = get(ENV, "SB_MRED_DIAG", "0") == "1"
-    M_red_per_c = _mred_diag ? zeros(Tel, size(M_red, 1), size(M_red, 2), bond_ch_dim) :
-                               zeros(Tel, 0, 0, 0)
-
-    L_other_buf = zeros(Int, length(L_other_dims))
-    R_other_buf = zeros(Int, length(R_other_dims))
-    phi_tail_buf = zeros(Int, N2_phi)
-
-    for i_phi in 1:length(am_phi.keys)
-        K_phi = am_phi.keys[i_phi]
-        a_phi = am_phi.alias_ids[i_phi]
-        sc_phi = am_phi.scalars[i_phi]
-        tmpl_off_phi = (a_phi - 1) * am_phi.blksize
-
-        for c in 1:bond_ch_dim
-            # Build M_b key (channel = c, non-shared coords from K_phi).
-            kb = Vector{Int}(undef, P_b)
-            for pos in nonshared_pos_b
-                iphi = phi_idx_for_b_pos[pos]
-                kb[pos] = K_phi[iphi]
-            end
-            kb[cp_b] = c
-            i_L = get(M_b_lookup, Tuple(kb), 0)
-            i_L == 0 && continue
-
-            kb1 = Vector{Int}(undef, P_b1)
-            for pos in nonshared_pos_b1
-                iphi = phi_idx_for_b1_pos[pos]
-                kb1[pos] = K_phi[iphi]
-            end
-            kb1[cp_b1] = c
-            i_R = get(M_b1_lookup, Tuple(kb1), 0)
-            i_R == 0 && continue
-
-            a_L  = am_b.alias_ids[i_L]
-            a_R  = am_b1.alias_ids[i_R]
-            sc_L = am_b.scalars[i_L]
-            sc_R = am_b1.scalars[i_R]
-            denom = sc_L * sc_R
-
-            for phi_tail_lin in 1:max(am_phi.blksize, 1)
-                _decode_col_major!(phi_tail_buf, phi_tail_lin, phi_tail_dims)
-                fill!(L_other_buf, 1); fill!(R_other_buf, 1)
-                for j in 1:N2_phi
-                    side, local_idx = phi_tail_origin[j]
-                    if side === :L
-                        L_other_buf[local_idx] = phi_tail_buf[j]
-                    else
-                        R_other_buf[local_idx] = phi_tail_buf[j]
-                    end
-                end
-                L_lin = _lin_col_major(L_other_buf, L_other_dims)
-                R_lin = _lin_col_major(R_other_buf, R_other_dims)
-                row = (a_L - 1) * n_L_other + L_lin
-                col = (a_R - 1) * n_R_other + R_lin
-                phi_val = sc_phi * am_phi.templates[tmpl_off_phi + phi_tail_lin]
-                _vadd = phi_val / denom
-                M_red[row, col] += _vadd
-                _mred_diag && (M_red_per_c[row, col, c] += _vadd)
-                counts[row, col] += 1
-            end
+    # ---- M_red: φ templates placed by (a_L, a_R), unscaled ---------------------
+    M_red  = zeros(Tel, Ab.n_templates * nLo, Ab1.n_templates * nRo)
+    filled = falses(Ab.n_templates, Ab1.n_templates)
+    for (tid, (a_L, a_R)) in pairs
+        blk = aphi.templates[(tid - 1) * aphi.blksize + 1 : tid * aphi.blksize]
+        Tm  = reshape(permutedims(reshape(blk, dims_phi...), perm_phi), nLo, nRo)
+        rows = (a_L - 1) * nLo + 1 : a_L * nLo
+        cols = (a_R - 1) * nRo + 1 : a_R * nRo
+        if filled[a_L, a_R]
+            isapprox(M_red[rows, cols], Tm; rtol = 1e-12, atol = 1e-14 * max(norm(Tm), 1)) ||
+                error("itensor_aliased_factorize: templates ($a_L, $a_R) receive two " *
+                      "different φ blocks; φ does not have M_b·M_b1's structure")
+        else
+            M_red[rows, cols] .= Tm; filled[a_L, a_R] = true
         end
     end
 
-    if _mred_diag
-        # Per-channel ON-MANIFOLD check: cosine between channel matrices M_c, M_c'.
-        # |cos| ≈ 1 for every populated pair ⇒ all channels proportional ⇒ φ lies on
-        # the P×psi_dense manifold (loss only sign/scale). |cos| < 1 ⇒ φ drifted off
-        # the manifold (the eigensolve produced channel-dependent multiplicity that a
-        # shared psi_dense cannot hold) ⇒ re-aliasing is intrinsically lossy.
-        nrm = zeros(real(Tel), bond_ch_dim)
-        @inbounds for c in 1:bond_ch_dim
-            s = 0.0
-            for col in 1:size(M_red_per_c, 2), row in 1:size(M_red_per_c, 1)
-                s += abs2(M_red_per_c[row, col, c])
-            end
-            nrm[c] = sqrt(s)
-        end
-        mincos = 1.0; meancos = 0.0; npair = 0; nmisaligned = 0
-        minoverlap = 1.0   # min fraction of shared-support entries among pairs
-        @inbounds for c1 in 1:bond_ch_dim, c2 in (c1+1):bond_ch_dim
-            (nrm[c1] == 0 || nrm[c2] == 0) && continue
-            ip = zero(Tel); nz1 = 0; nz2 = 0; nzboth = 0
-            for col in 1:size(M_red_per_c, 2), row in 1:size(M_red_per_c, 1)
-                a = M_red_per_c[row, col, c1]; b = M_red_per_c[row, col, c2]
-                ip += conj(a) * b
-                a != 0 && (nz1 += 1); b != 0 && (nz2 += 1)
-                (a != 0 && b != 0) && (nzboth += 1)
-            end
-            cosv = abs(ip) / (nrm[c1] * nrm[c2])
-            ov = min(nz1, nz2) > 0 ? nzboth / min(nz1, nz2) : 0.0  # overlap of supports
-            npair += 1; meancos += cosv
-            cosv < mincos && (mincos = cosv)
-            ov < minoverlap && (minoverlap = ov)
-            cosv < 0.99 && (nmisaligned += 1)
-        end
-        println("[MRED_DIAG] channels=", bond_ch_dim, "  pairs=", npair,
-                "  min|cos|=", round(mincos; sigdigits=4),
-                "  mean|cos|=", npair > 0 ? round(meancos/npair; sigdigits=4) : 1.0,
-                "  frac(|cos|<0.99)=", npair > 0 ? round(nmisaligned/npair; digits=3) : 0.0,
-                "  min-support-overlap=", npair > 0 ? round(minoverlap; sigdigits=3) : 1.0,
-                "   (cos→1 with overlap→1 ⇒ genuinely proportional, not disjoint)")
-        # Add-path tally since the previous factorize (≈ this bond's eigsolve adds).
-        println("[ADD_DIAG] since-last: axpy_match=", _ADD_AXPY_MATCH[],
-                "  plus_match=", _ADD_PLUS_MATCH[],
-                "  plus_merge=", _ADD_PLUS_MERGE[], "  plus_dense=", _ADD_PLUS_DENSE[],
-                "  inplace=", _ADD_INPLACE[], "  inplace_try=", _ADD_INPLACE_TRY[],
-                "  inplace_fail=", _ADD_INPLACE_FAIL[], "  inner_inplace=", _INNER_INPLACE[],
-                "   (merge/dense are EXACT but drop compression; all paths value-exact)")
-        _ADD_AXPY_MATCH[] = 0; _ADD_PLUS_MATCH[] = 0
-        _ADD_PLUS_MERGE[] = 0; _ADD_PLUS_DENSE[] = 0; _ADD_INPLACE[] = 0
-        _ADD_INPLACE_TRY[] = 0; _ADD_INPLACE_FAIL[] = 0; _INNER_INPLACE[] = 0
-    end
-    @inbounds for i in eachindex(counts)
-        if counts[i] > 1
-            M_red[i] /= counts[i]
-        end
-    end
-
-    # ---- WHITEN: account for block-multiplicity weighting so L,R are iso ----
-    # Iso condition on L: PER bond-channel value c,
-    #   sum_a w[a, c]² · template[a] · template[a]† = I  (on mult_new axis)
-    # which requires w[a, c]² to be c-independent (an inherent property of
-    # the alias structure on projector-derived psi).  Then W_L[a] := w[a, c]
-    # is the correct whitening factor.
-    #
-    # Compute w[a, c]² per (alias_id, channel) and verify it's c-constant;
-    # use w[a, c=1] (or whatever the constant value is) as W_L[a].
-    bond_ch_dim_b  = bond_ch_dim                # M_b's channel dim at the bond
-    bond_ch_dim_b1 = am_b1.dims[cp_b1]          # M_b1's channel dim at the bond
-    wL_per_c = zeros(real(Tel), n_tL, bond_ch_dim_b)
-    @inbounds for i_L in eachindex(am_b.keys)
-        a  = am_b.alias_ids[i_L]
-        c  = am_b.keys[i_L][cp_b]
-        wL_per_c[a, c] += abs2(am_b.scalars[i_L])
-    end
-    # core_canonical: wL=wR=1 ⇒ no M^{1/2} whitening ⇒ M_red is the raw core two-site
-    # matrix ⇒ its SVD is the plain core-orthonormal (metric-I) factorization.
-    wL = core_canonical ? ones(real(Tel), n_tL) :
-         [sqrt(maximum(@view wL_per_c[a, :])) for a in 1:n_tL]
-    wR_per_c = zeros(real(Tel), n_tR, bond_ch_dim_b1)
-    @inbounds for i_R in eachindex(am_b1.keys)
-        a  = am_b1.alias_ids[i_R]
-        c  = am_b1.keys[i_R][cp_b1]
-        wR_per_c[a, c] += abs2(am_b1.scalars[i_R])
-    end
-    wR = core_canonical ? ones(real(Tel), n_tR) :
-         [sqrt(maximum(@view wR_per_c[a, :])) for a in 1:n_tR]
-    # SB_WHITEN_DIAG: verify the whitening assumption that w[a,c]² is c-independent.
-    # The whitening (wL = sqrt(max_c w[a,c]²)) and the channel-averaged M_red are only
-    # EXACT if, for each template a, w[a,c]² is the same across all channels c it appears
-    # in. If FP drift (or approximate aliasing) makes it vary, the SVD truncates a
-    # distorted M_red → suboptimal energy. Report the worst relative c-spread.
-    if get(ENV, "SB_WHITEN_DIAG", "0") == "1" && _WHITEN_BUDGET[] != 0
-        devL = 0.0; devR = 0.0
-        @inbounds for a in 1:n_tL
-            mn = Inf; mx = 0.0
-            for c in 1:bond_ch_dim_b
-                v = wL_per_c[a, c]
-                v > 0 && (mn = min(mn, v); mx = max(mx, v))
-            end
-            mx > 0 && mn < Inf && (devL = max(devL, (mx - mn) / mx))
-        end
-        @inbounds for a in 1:n_tR
-            mn = Inf; mx = 0.0
-            for c in 1:bond_ch_dim_b1
-                v = wR_per_c[a, c]
-                v > 0 && (mn = min(mn, v); mx = max(mx, v))
-            end
-            mx > 0 && mn < Inf && (devR = max(devR, (mx - mn) / mx))
-        end
-        _WHITEN_MAXDEV[] = max(_WHITEN_MAXDEV[], devL, devR)
-        println("[WHITEN_DIAG] ortho=", ortho, "  c-spread L=", round(devL, sigdigits=4),
-                "  R=", round(devR, sigdigits=4), "  n_tL=", n_tL, " n_tR=", n_tR,
-                " ch_b=", bond_ch_dim_b, " ch_b1=", bond_ch_dim_b1,
-                "   0⇒c-constant(clean gram); >>0⇒distorted(spread gram)")
-        _WHITEN_BUDGET[] > 0 && (_WHITEN_BUDGET[] -= 1)
-    end
-    # Scale rows and columns of M_red by w_L and w_R (broadcast per alias group).
-    @inbounds for a_L in 1:n_tL, lo in 1:n_L_other, a_R in 1:n_tR, ro in 1:n_R_other
-        row = (a_L - 1) * n_L_other + lo
-        col = (a_R - 1) * n_R_other + ro
-        M_red[row, col] *= wL[a_L] * wR[a_R]
-    end
-
-    # ---- SVD + truncation ---------------------------------------------------
+    # ---- SVD + truncation -----------------------------------------------------
     F = svd(M_red)
-    sv = real.(F.S)
-    # Per-cM cap (mirror of the BS Path-B factorize, ops_factorize_qr.jl:471).
-    # The new bond is channel × multiplicity (doubled-link convention).
-    mult_cap = maxdim
-    # Relative-epsilon rank floor: ALWAYS drop numerical-zero singular values, even
-    # when cutoff=0 (as orthogonalize! passes). `sv` is sorted descending. Without this,
-    # cutoff=0 keeps machine-zero singular values (~1e-17..1e-49), inflating the bond
-    # past the true Schmidt rank → a spurious multiplicity and a non-projector (tail)
-    # gram. A dense SVD drops these by default; this matches the dense canonical form.
+    sv = F.S
     svmax = isempty(sv) ? zero(eltype(sv)) : sv[1]
     n_rank = svmax > 0 ? count(s -> s > 1e-12 * svmax, sv) : length(sv)
-    n_keep = min(length(sv), mult_cap, n_rank)
+    n_keep = min(length(sv), maxdim, n_rank)
     if cutoff > 0
-        total = sum(s -> s*s, sv)
-        running = 0.0
+        total = sum(s -> s * s, sv); running = 0.0
         for k in length(sv):-1:1
             running += sv[k]^2
             if running > cutoff * total
@@ -419,138 +98,36 @@ function _aliased_alias_reduced_factorize(
             end
         end
     end
-    # Cap the mindim floor at the available rank: you cannot keep more singular
-    # values than exist. Without the inner min(), mindim > length(sv) makes clamp
-    # (lo>hi) return mindim and the subsequent F.U[:,1:mult_new] slice overruns
-    # (BoundsError). NOTE: this means mindim is a SOFT floor — it will NOT fabricate
-    # rank by zero-padding (that would re-introduce the cutoff=0 rank inflation this
-    # file's epsilon-floor removed). A low-rank state (e.g. PXP) keeps its true rank.
     n_keep = clamp(n_keep, min(mindim, length(sv)), length(sv))
-    mult_new = max(n_keep, 1)
+    k = max(n_keep, 1)
+    Uk, Vtk, Sk = F.U[:, 1:k], F.V[:, 1:k]', sv[1:k]
+    Lmat, Rmat = ortho == "left" ? (Uk, Diagonal(Sk) * Vtk) : (Uk * Diagonal(Sk), Vtk)
 
-    Uk = F.U[:, 1:mult_new]
-    Vk = F.V[:, 1:mult_new]
-    Sk = sv[1:mult_new]
-    # ortho convention:
-    #   left  : L = U,     R = Σ V†  (L is left-iso, SVs go right)
-    #   right : L = U Σ,   R = V†    (R is right-iso, SVs go left)
-    L_block, R_block = if ortho == "left"
-        Uk, (Diagonal(complex.(Sk)) * Vk')
-    else
-        (Uk * Diagonal(complex.(Sk))), Vk'
+    # ---- write back into each side's templates --------------------------------
+    new_tail_b  = Int[ITensors.dim(I) for I in tail_b];  new_tail_b[jb]   = k
+    new_tail_b1 = Int[ITensors.dim(I) for I in tail_b1]; new_tail_b1[jb1] = k
+    perm_b  = [setdiff(1:length(tail_b), jb); jb]          # (L_other..., m)
+    perm_b1 = [jb1; setdiff(1:length(tail_b1), jb1)]       # (m, R_other...)
+    blk_b, blk_b1 = prod(new_tail_b), prod(new_tail_b1)
+    tmpl_b  = zeros(Tel, Ab.n_templates  * blk_b)
+    tmpl_b1 = zeros(Tel, Ab1.n_templates * blk_b1)
+    for a in 1:Ab.n_templates
+        arr = permutedims(reshape(Lmat[(a - 1) * nLo + 1 : a * nLo, :], new_tail_b[perm_b]...),
+                          invperm(perm_b))
+        tmpl_b[(a - 1) * blk_b + 1 : a * blk_b] .= vec(arr)
     end
-    # L_block: (nrows × mult_new); R_block: (mult_new × ncols)
+    for a in 1:Ab1.n_templates
+        arr = permutedims(reshape(Rmat[:, (a - 1) * nRo + 1 : a * nRo], new_tail_b1[perm_b1]...),
+                          invperm(perm_b1))
+        tmpl_b1[(a - 1) * blk_b1 + 1 : a * blk_b1] .= vec(arr)
+    end
+    new_mult = ITensors.Index(k; tags = something(tags, ITensors.tags(mult_old)))
+    L = _build_aliased_frozen_schema(Bw,  tmpl_b,  new_tail_b,  Pb + jb,   k, true, Tel, new_mult)
+    R = _build_aliased_frozen_schema(B1w, tmpl_b1, new_tail_b1, Pb1 + jb1, k, true, Tel, new_mult)
 
-    # ---- assemble new L's templates ----------------------------------------
-    # L's new tail dims = M_b's tail dims, but with bond-multiplicity axis dim
-    # replaced by mult_new. Other tail dims unchanged. Column-major layout.
-    new_L_tail_dims = Vector{Int}(undef, N2_b)
-    for j in 1:N2_b
-        pos_in_M = P_b + j
-        new_L_tail_dims[j] = (has_mu && pos_in_M == mp_b) ? mult_new : am_b.dims[pos_in_M]
-    end
-    L_blksize_new = isempty(new_L_tail_dims) ? 1 : prod(new_L_tail_dims)
-    templates_L = zeros(Tel, n_tL * L_blksize_new)
-    # For each (a_L, L_other_coords, m_new) read U value into the right slot.
-    L_other_buf2 = zeros(Int, length(L_other_dims))
-    L_tail_buf   = zeros(Int, N2_b)
-    for a_L in 1:n_tL
-        for L_other_lin in 1:max(n_L_other, 1)
-            _decode_col_major!(L_other_buf2, L_other_lin, L_other_dims)
-            row = (a_L - 1) * n_L_other + L_other_lin
-            inv_wL = wL[a_L] > 0 ? one(Tel) / wL[a_L] : zero(Tel)
-            for m in 1:mult_new
-                val = L_block[row, m] * inv_wL   # un-whiten: divide by w_L[a_L]
-                lo_cursor = 0
-                for j in 1:N2_b
-                    pos_in_M = P_b + j
-                    if has_mu && pos_in_M == mp_b
-                        L_tail_buf[j] = m
-                    else
-                        lo_cursor += 1
-                        L_tail_buf[j] = L_other_buf2[lo_cursor]
-                    end
-                end
-                tlin = _lin_col_major(L_tail_buf, new_L_tail_dims)
-                templates_L[(a_L - 1) * L_blksize_new + tlin] = val
-            end
-        end
-    end
-
-    # ---- assemble new R's templates ----------------------------------------
-    new_R_tail_dims = Vector{Int}(undef, N2_b1)
-    for j in 1:N2_b1
-        pos_in_M = P_b1 + j
-        new_R_tail_dims[j] = (has_mu && pos_in_M == mp_b1) ? mult_new : am_b1.dims[pos_in_M]
-    end
-    R_blksize_new = isempty(new_R_tail_dims) ? 1 : prod(new_R_tail_dims)
-    templates_R = zeros(Tel, n_tR * R_blksize_new)
-    R_other_buf2 = zeros(Int, length(R_other_dims))
-    R_tail_buf   = zeros(Int, N2_b1)
-    for a_R in 1:n_tR
-        inv_wR = wR[a_R] > 0 ? one(Tel) / wR[a_R] : zero(Tel)
-        for R_other_lin in 1:max(n_R_other, 1)
-            _decode_col_major!(R_other_buf2, R_other_lin, R_other_dims)
-            col = (a_R - 1) * n_R_other + R_other_lin
-            for m in 1:mult_new
-                val = R_block[m, col] * inv_wR    # un-whiten: divide by w_R[a_R]
-                ro_cursor = 0
-                for j in 1:N2_b1
-                    pos_in_M = P_b1 + j
-                    if has_mu && pos_in_M == mp_b1
-                        R_tail_buf[j] = m
-                    else
-                        ro_cursor += 1
-                        R_tail_buf[j] = R_other_buf2[ro_cursor]
-                    end
-                end
-                tlin = _lin_col_major(R_tail_buf, new_R_tail_dims)
-                templates_R[(a_R - 1) * R_blksize_new + tlin] = val
-            end
-        end
-    end
-
-    # ---- build new aliased ITensors -----------------------------------------
-    # The new bond-multiplicity Index must be SHARED between L and R (same id),
-    # otherwise the downstream Aliased×Aliased contract sees them as unrelated.
-    new_mult_ind = has_mu ? ITensors.Index(mult_new; tags = ITensors.tags(M_b_w.inds[mp_b])) : nothing
-    L_ali = _build_aliased_frozen_schema(M_b_w, templates_L, new_L_tail_dims, mp_b, mult_new, has_mu, Tel, new_mult_ind)
-    R_ali = _build_aliased_frozen_schema(M_b1_w, templates_R, new_R_tail_dims, mp_b1, mult_new, has_mu, Tel, new_mult_ind)
-
-    # Reports the NEW bond's channel/multiplicity placement on each side.
-    # Canonical convention requires: channel in PREFIX (pos ≤ P), multiplicity
-    # in DENSE tail (pos > P), and channel BEFORE multiplicity ("sparse precedes
-    # dense"). Flags any violation — this is where a factorize would break the
-    # convention and seed the downstream prefix/dense crossover. Debug-only,
-    # disabled; flip to `true` (and restore the body below) to re-enable.
-    if false
-    end
-    # if get(ENV, "SB_FACT_DIAG", "0") == "1"
-    #     _tg(I) = (ITensors.dim(I), string(ITensors.tags(I)), ITensors.plev(I))
-    #     _ch_ok_L = cp_b <= P_b
-    #     _mu_ok_L = !has_mu || mp_b > P_b
-    #     _ord_L   = !has_mu || cp_b < mp_b
-    #     _ch_ok_R = cp_b1 <= P_b1
-    #     _mu_ok_R = !has_mu || mp_b1 > P_b1
-    #     _ord_R   = !has_mu || cp_b1 < mp_b1
-    #     bad = !(_ch_ok_L && _mu_ok_L && _ord_L && _ch_ok_R && _mu_ok_R && _ord_R)
-    #     println("[FACT_DIAG ortho=", ortho, " bond_ch=", _tg(M_b_w.inds[cp_b]),
-    #             has_mu ? string("  mult=", _tg(M_b_w.inds[mp_b])) : "  (no mult yet)", "]")
-    #     println("   L: P=$P_b  ch_pos=$cp_b(", _ch_ok_L ? "prefix✓" : "DENSE✗", ")  ",
-    #             has_mu ? "mu_pos=$mp_b(" * (_mu_ok_L ? "dense✓" : "PREFIX✗") * ")  ch<mu:" * (_ord_L ? "✓" : "✗") : "no-mu")
-    #     println("   R: P=$P_b1  ch_pos=$cp_b1(", _ch_ok_R ? "prefix✓" : "DENSE✗", ")  ",
-    #             has_mu ? "mu_pos=$mp_b1(" * (_mu_ok_R ? "dense✓" : "PREFIX✗") * ")  ch<mu:" * (_ord_R ? "✓" : "✗") : "no-mu")
-    #     bad && println("   ⚠ [FACT BREAKS CANON] this factorize emits a non-canonical bond classification")
-    #     flush(stdout)
-    # end
-    # Discarded weight as a FRACTION of total spectral weight (∑ discarded sv² / ∑ sv²),
-    # so it is directly comparable to ITensors' (dense/BS) normalized truncerr. (Previously
-    # this reported the absolute ∑ discarded sv², which is NOT comparable across backends.)
-    _sv_tot = sum(s -> s*s, sv)
-    truncerr_val = (mult_new >= length(sv) || _sv_tot <= 0) ? 0.0 :
-                   sum(s -> s*s, sv[mult_new+1:end]) / _sv_tot
-    spec = (truncerr = truncerr_val, truncation_error = truncerr_val, eigenvalues = Sk)
-    return L_ali, R_ali, spec
+    _sv_tot = sum(s -> s * s, sv)
+    truncerr = (k >= length(sv) || _sv_tot <= 0) ? 0.0 : sum(s -> s * s, sv[k + 1:end]) / _sv_tot
+    return L, R, ITensors.Spectrum(abs2.(Sk), truncerr)
 end
 
 # Construct a new aliased ITensor whose schema (keys, alias_ids, scalars,
@@ -601,4 +178,110 @@ function _build_aliased_frozen_schema(
     end
     w = WrappedAliasedBlockSparse{T, N, N2, P}(ali_new, Tuple(new_inds))
     return ITensors._itensor_from_external_storage(w)
+end
+
+# Single-site factorize of an aliased tensor (the `factorize` hook, used by
+# orthogonalize! and so by TEBD). Only the multiplicity axis is refactorized.
+#
+# Every block is scalars[i] * templates[alias_ids[i]], so one matrix acting on the
+# multiplicity axis the same way for every channel is the only change the frozen
+# schema can represent. With X = A:
+#     W = vcat_a sqrt(w_a) * T_a      (rows: template a × other tail, cols: m)
+#     w_a = Σ_{i : alias_ids[i] = a} |scalars[i]|²    so  W'W = Σ_blocks B'B
+# svd(W) = U S V'. L is X with template a replaced by U_a / sqrt(w_a)
+# (weighted-isometric); R = S V' is a dense (new m, old m) matrix for the caller to
+# contract into the neighbour (`M[b+1] *= R`). L·R == A exactly whenever
+# k ≥ rank(W): a direction with W v = 0 has T_a v = 0 for every referenced template.
+# L keeps A's keys, alias_ids, scalars, n_templates, slice_to_template and the
+# bond's channel index; only the multiplicity index is replaced.
+function ITensors._external_factorize_storage(
+    Aw :: WrappedAliasedBlockSparse,
+    A  :: ITensors.ITensor,
+    Linds...;
+    mindim = nothing, maxdim = nothing, cutoff = nothing, ortho = nothing,
+    eigen_perturbation = nothing, kwargs...,
+)
+    something(ortho, "left") == "left" ||
+        error("aliased factorize: only ortho=\"left\" is supported (got $ortho)")
+    eigen_perturbation === nothing ||
+        error("aliased factorize: eigen_perturbation is not supported")
+    maxdim = something(maxdim, typemax(Int))
+    mindim = something(mindim, 1)
+    cutoff = Float64(something(cutoff, 0.0))
+
+    X  = Aw.aliased
+    Px = _abs_head_len(Aw)
+    Lis = ITensors.commoninds(A, ITensors.indices(Linds...))
+    mus = [p for p in (Px + 1):ndims(X) if !(Aw.inds[p] in Lis)]
+    length(mus) == 1 || error("aliased factorize: expected exactly one multiplicity " *
+        "(dense-tail) index outside Linds, found $(length(mus))")
+    mx = mus[1]
+    old_mult = Aw.inds[mx]
+    Tel = eltype(X.templates)
+
+    # ---- stack weighted templates as (template × other tail) × m ------------
+    tail_x = Int[X.dims[i] for i in (Px + 1):ndims(X)]
+    jx = mx - Px
+    m_old = tail_x[jx]
+    nrest = X.blksize ÷ m_old
+    perm_x = [setdiff(1:length(tail_x), jx); jx]          # m axis last
+    w = zeros(real(Tel), X.n_templates)
+    @inbounds for i in eachindex(X.alias_ids)
+        w[X.alias_ids[i]] += abs2(X.scalars[i])
+    end
+    W = zeros(Tel, X.n_templates * nrest, m_old)
+    for a in 1:X.n_templates
+        Ta = reshape(permutedims(reshape(X.templates[(a - 1) * X.blksize + 1 : a * X.blksize],
+                                         tail_x...), perm_x), nrest, m_old)
+        W[(a - 1) * nrest + 1 : a * nrest, :] .= sqrt(w[a]) .* Ta
+    end
+
+    # ---- SVD + truncation ----------------------------------------------------
+    F = svd(W)
+    sv = F.S
+    # Same rule as ITensors' truncate! (route C, dense): cutoff = 0 drops only exact
+    # zeros; anything else is removed by maxdim or a nonzero cutoff below.
+    n_rank = count(s -> s > 0, sv)
+    n_keep = min(length(sv), maxdim, n_rank)
+    if cutoff > 0
+        total = sum(s -> s * s, sv); running = 0.0
+        for k in length(sv):-1:1
+            running += sv[k]^2
+            if running > cutoff * total
+                n_keep = min(n_keep, k); break
+            end
+        end
+    end
+    n_keep = clamp(n_keep, min(mindim, length(sv)), length(sv))
+    k_new = max(n_keep, 1)
+
+    # ---- L: templates U_a / sqrt(w_a), m axis -> k_new ------------------------
+    new_tail_x = copy(tail_x); new_tail_x[jx] = k_new
+    blk_x = prod(new_tail_x)
+    tmpl_x = zeros(Tel, X.n_templates * blk_x)
+    iperm_x = invperm(perm_x)
+    for a in 1:X.n_templates
+        w[a] > 0 || continue                               # unreferenced / zero-scalar
+        Ua = F.U[(a - 1) * nrest + 1 : a * nrest, 1:k_new] ./ sqrt(w[a])
+        arr = permutedims(reshape(Ua, new_tail_x[perm_x]...), iperm_x)
+        tmpl_x[(a - 1) * blk_x + 1 : a * blk_x] .= vec(arr)
+    end
+    new_mult = ITensors.Index(k_new; tags = ITensors.tags(old_mult))
+    L = _build_aliased_frozen_schema(Aw, tmpl_x, new_tail_x, mx, k_new, true, Tel, new_mult)
+
+    # ---- R = S V' over (new m, old m) ----------------------------------------
+    SVt = Matrix{Tel}(Diagonal(sv[1:k_new]) * F.V[:, 1:k_new]')
+    R = ITensors.ITensor(SVt, new_mult, old_mult)
+
+    _sv_tot = sum(s -> s * s, sv)
+    truncerr_val = (k_new >= length(sv) || _sv_tot <= 0) ? 0.0 :
+                   sum(s -> s * s, sv[k_new + 1:end]) / _sv_tot
+    spec = ITensors.Spectrum(abs2.(sv[1:k_new]), truncerr_val)
+    return L, R, spec, new_mult
+end
+
+# TODO: add a single-site block-sparse factorize once the aliased one is validated.
+function ITensors._external_factorize_storage(Aw::WrappedBlockSparse, A::ITensors.ITensor,
+                                              Linds...; kwargs...)
+    error("factorize: block-sparse (non-aliased) storage is not supported yet")
 end
