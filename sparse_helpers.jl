@@ -229,9 +229,11 @@ are now selectable so an accuracy sweep can measure them rather than assume them
   * `ortho_frame` -- `:left` (default, centre at site 1) or `:right` (centre at site N).
 
 Template counts were previously found identical across all four combinations, but their
-FIDELITY was never compared: `itensor_aliased_factorize` discards on the P-weighted
-blocks, so which multiplicity directions it drops can depend on the sweep direction even
-when the resulting schema does not."""
+FIDELITY was never compared. The direction dependence that motivated `ortho_frame` came
+from truncating in a single sweep on a non-canonical φ; truncation is now two-pass (see
+the body), so the frames are expected to agree closely. The remaining difference is the
+aliased factorize's shared multiplicity projector, whose L is orthonormal only summed
+over channels."""
 function apply_layer_sparse(psi::MPS, M::MPO; maxdim::Int, cutoff::Real = 0.0,
                             merge::Union{Bool,Symbol} = :before,
                             ortho_frame::Symbol = :left,
@@ -246,26 +248,12 @@ function apply_layer_sparse(psi::MPS, M::MPO; maxdim::Int, cutoff::Real = 0.0,
     phi = replaceprime(contract(M, psi, :dense, bk; Cbackend = bk,
                                 alias_hint = alias_hint), 1 => 0)
     # MERGE FIRST. The output-stationary kernel emits one template per output block
-    # (dedup 1.00x by construction), and itensor_aliased_factorize inherits its schema
+    # (dedup 1.00x by construction), and the single-site aliased factorize inherits its schema
     # from the INPUT tensors -- so merging here hands the sweep the small schema, whereas
     # merging afterwards has to find proportionality the refactorization destroyed.
     (mode === :before || mode === :both) && merge_aliased_templates!(phi)
-    if maxdim > 0
-        j = ortho_frame === :left ? 1 : length(phi)
-        # `cutoff` is forwarded ONLY when nonzero. The kwarg is a LOCAL patch to
-        # SparseBackends/ITensorMPS.jl; upstream -- and the copy deployed on Sherlock --
-        # has `orthogonalize!(M, j; maxdim, normalize)` and nothing else, so passing
-        # cutoff unconditionally kills every remote run with an unsupported-keyword
-        # MethodError, after setup and JIT, i.e. minutes in and long past any load
-        # check. cutoff=0.0 is the default here and was measured inert on this model
-        # anyway (relerr 0.000e+00 against 1e-14), so the default path needs no patched
-        # library and the sweep does not have to ship one.
-        if Float64(cutoff) > 0
-            orthogonalize!(phi, j; maxdim = maxdim, cutoff = Float64(cutoff))
-        else
-            orthogonalize!(phi, j; maxdim = maxdim)
-        end
-    end
+    maxdim > 0 && truncate_sparse!(phi; maxdim = maxdim, cutoff = cutoff,
+                                   ortho_frame = ortho_frame)
     (mode === :after || mode === :both) && merge_aliased_templates!(phi)
     return phi
 end
@@ -278,6 +266,47 @@ function merge_aliased_templates!(psi::MPS)
     for i in 1:length(psi)
         storage_kind(psi[i]) === :aliased || continue
         SparseBackends.compress_aliased_templates!(psi[i]; projective = true)
+    end
+    return psi
+end
+
+"""Truncate `psi` in place to `maxdim` (and `cutoff`, if > 0). The centre ends at site 1
+for `ortho_frame = :left`, at site N for `:right`.
+
+Factored out of `apply_layer_sparse` so the truncation can be tested on a given state.
+
+TWO PASSES, as in ITensorMPS.truncate!. After a layer, ψ is raw contraction output with no
+canonical form, and a single truncating sweep cuts on local singular values while the
+sites ahead are still unnormalized -- those are not Schmidt values, so it keeps redundant
+directions and drops the wrong ones. Pass 1 canonicalizes toward the far end without
+truncating (only exact zeros are dropped, as in ITensors' truncate!); pass 2 sweeps back and truncates, so each bond has an orthonormal side behind it
+and the pass-1 side ahead of it. truncate! itself cannot be used: it calls svd, and
+aliased storage only hooks factorize. The limits are reset because whatever contract left
+is not trusted.
+
+For aliased ψ pass 2 is still not exactly optimal: the single-site factorize applies one
+multiplicity projector shared by all channels, and its L is orthonormal only summed over
+channels, so pass 1 leaves ψ close to canonical but not exactly."""
+function truncate_sparse!(psi::MPS; maxdim::Int, cutoff::Real = 0.0,
+                          ortho_frame::Symbol = :left)
+    ortho_frame in (:left, :right) ||
+        error("truncate_sparse!: ortho_frame must be :left or :right; got $ortho_frame")
+    N = length(psi)
+    j, j0 = ortho_frame === :left ? (1, N) : (N, 1)
+    reset_ortho_lims!(psi)
+    orthogonalize!(psi, j0)
+    # `cutoff` is forwarded ONLY when nonzero. The kwarg is a LOCAL patch to
+    # SparseBackends/ITensorMPS.jl; upstream -- and the copy deployed on Sherlock --
+    # has `orthogonalize!(M, j; maxdim, normalize)` and nothing else, so passing
+    # cutoff unconditionally kills every remote run with an unsupported-keyword
+    # MethodError, after setup and JIT, i.e. minutes in and long past any load
+    # check. cutoff=0.0 is the default here and was measured inert on this model
+    # anyway (relerr 0.000e+00 against 1e-14), so the default path needs no patched
+    # library and the sweep does not have to ship one.
+    if Float64(cutoff) > 0
+        orthogonalize!(psi, j; maxdim = maxdim, cutoff = Float64(cutoff))
+    else
+        orthogonalize!(psi, j; maxdim = maxdim)
     end
     return psi
 end
