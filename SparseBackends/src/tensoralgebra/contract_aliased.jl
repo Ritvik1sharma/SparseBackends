@@ -129,9 +129,14 @@ function _commit_aliased_dicts!(
     for (k, (tid, α)) in key_to_alias
         push!(C.keys, k); push!(C.alias_ids, _alias_id(AI, tid)); push!(C.scalars, α)
     end
+    # Final length = existing + one blksize block per accumulator: allocate it exactly.
+    blksize = C.blksize
+    old = C.templates
+    C.templates = Vector{TC}(undef, length(old) + length(key_to_accum) * blksize)
+    copyto!(C.templates, old)
     for (k, acc) in key_to_accum
         C.n_templates += 1
-        append!(C.templates, acc)
+        copyto!(C.templates, (C.n_templates - 1) * blksize + 1, acc, 1, blksize)
         push!(C.keys,      k)
         push!(C.alias_ids, _alias_id(AI, C.n_templates))
         push!(C.scalars,   one(TC))
@@ -165,16 +170,17 @@ function _commit_aliased_dicts_lazy!(
         ref[ptid] = true
     end
     # 2) Copy referenced templates into C.templates and build remap.
+    #    Final count = referenced pending + accumulators, known now: allocate exactly.
+    #    Every caller empties C first (final_tid numbering from 1 relies on it).
+    @assert isempty(C.templates)
+    C.templates = Vector{TC}(undef, (count(ref) + length(key_to_accum)) * blksize)
     remap = zeros(Int, n_pending)
     final_tid = 0
     @inbounds for p in 1:n_pending
         ref[p] || continue
         final_tid += 1
         remap[p] = final_tid
-        off = (p - 1) * blksize
-        for j in 1:blksize
-            push!(C.templates, pending[off + j])
-        end
+        copyto!(C.templates, (final_tid - 1) * blksize + 1, pending, (p - 1) * blksize + 1, blksize)
     end
     C.n_templates = final_tid
 
@@ -188,7 +194,7 @@ function _commit_aliased_dicts_lazy!(
     # 4) Push accumulator blocks as new concrete templates.
     for (k, acc) in key_to_accum
         C.n_templates += 1
-        append!(C.templates, acc)
+        copyto!(C.templates, (C.n_templates - 1) * blksize + 1, acc, 1, blksize)
         push!(C.keys, k)
         push!(C.alias_ids, _alias_id(AI, C.n_templates))
         push!(C.scalars, one(TC))
@@ -238,6 +244,9 @@ function _dedup_templates_by_value!(
     C.templates   = newt
     C.n_templates = length(canon)
     C.alias_ids   = AI[_alias_id(AI, remap[Int(a)]) for a in C.alias_ids]
+    # merged templates are equal in value, so the rv -> tid map just follows the renumbering
+    isempty(C.slice_to_template) ||
+        (C.slice_to_template = [t == 0 ? 0 : remap[t] for t in C.slice_to_template])
     return C
 end
 
@@ -248,11 +257,13 @@ end
 # proportional pairs, making its criterion strictly narrower than what the storage can
 # express. This closes that gap; it is a strict superset (equal templates have ratio 1).
 #
-# Each template is normalized by its largest-magnitude entry (which fixes scale AND
-# complex phase) and matched against the canonical set in that normalized form. On a hit
-# with canonical `c`, `t = (piv_t / piv_c) * c`, so every block aliasing `t` has its
-# scalar multiplied by that ratio and is repointed at `c`. Templates are kept in their
-# ORIGINAL (un-normalized) form so no other consumer sees a scale change.
+# Each template t is matched against the canonical set by its least-squares ratio
+# λ = <c,t>/<c,c> and accepted when ‖t − λc‖ ≤ atol·‖t‖. On a hit every block aliasing
+# `t` has its scalar multiplied by λ and is repointed at `c`. (An earlier version
+# normalized by the largest-magnitude entry; entries tied in magnitude, common under a
+# flip P, could then pick different pivots in two round-off-equal templates and miss
+# the match, so projective merged fewer templates than exact.) Templates are kept in
+# their ORIGINAL form so no other consumer sees a scale change.
 #
 # Cost O(n_tmpl · n_distinct · blksize), same as the non-projective pass. Opt-in only.
 function _dedup_templates_projective!(
@@ -263,42 +274,30 @@ function _dedup_templates_projective!(
     canon  = Int[]                       # old tids kept as canonical representatives
     remap  = zeros(Int, nt)
     ratio  = ones(T, nt)                 # t = ratio[t] * canonical(remap[t])
-    normal = Vector{T}(undef, nt * bs)   # normalized form of each canonical, packed
-    nbuf   = Vector{T}(undef, bs)        # normalized form of the template under test
     @inbounds for t in 1:nt
         off = (t - 1) * bs
-        # pivot = largest-magnitude entry; normalizing by it fixes scale and phase.
-        piv = zero(T); pm = 0.0
-        for j in 1:bs
-            v = C.templates[off + j]; av = abs(v)
-            av > pm && (pm = av; piv = v)
-        end
-        if pm == 0.0                     # all-zero template: normalize to itself
-            for j in 1:bs; nbuf[j] = zero(T); end
-        else
-            for j in 1:bs; nbuf[j] = C.templates[off + j] / piv; end
-        end
-        bn = 0.0; for j in 1:bs; bn += abs2(nbuf[j]); end; bn = sqrt(bn)
+        tn2 = 0.0; for j in 1:bs; tn2 += abs2(C.templates[off + j]); end
         found = 0; lam = one(T)
         for (ci, ct) in enumerate(canon)
-            co = (ci - 1) * bs; d = 0.0
-            for j in 1:bs; d += abs2(nbuf[j] - normal[co + j]); end
-            if sqrt(d) <= atol * max(bn, eps())
-                # canonical ct's own pivot, recovered from its stored normalized form.
-                cpm = 0.0; cpiv = zero(T); cof = (ct - 1) * bs
-                for j in 1:bs
-                    v = C.templates[cof + j]; av = abs(v)
-                    av > cpm && (cpm = av; cpiv = v)
-                end
-                found = ci
-                lam = cpm == 0.0 ? one(T) : piv / cpiv
-                break
+            co = (ct - 1) * bs
+            cc = 0.0; ct_ = zero(T)
+            for j in 1:bs
+                cv = C.templates[co + j]
+                cc += abs2(cv); ct_ += conj(cv) * C.templates[off + j]
+            end
+            if cc == 0.0                 # zero canonical matches only a zero template
+                tn2 == 0.0 && (found = ci; lam = one(T); break)
+                continue
+            end
+            l = ct_ / cc
+            d = 0.0
+            for j in 1:bs; d += abs2(C.templates[off + j] - l * C.templates[co + j]); end
+            if sqrt(d) <= atol * max(sqrt(tn2), eps())
+                found = ci; lam = l; break
             end
         end
         if found == 0
             push!(canon, t); remap[t] = length(canon); ratio[t] = one(T)
-            co = (length(canon) - 1) * bs
-            for j in 1:bs; normal[co + j] = nbuf[j]; end
         else
             remap[t] = found; ratio[t] = lam
         end
@@ -316,6 +315,13 @@ function _dedup_templates_projective!(
     C.templates   = newt
     C.n_templates = length(canon)
     C.alias_ids   = AI[_alias_id(AI, remap[Int(a)]) for a in C.alias_ids]
+    # rv -> tid: the map names a template's VALUE, so it follows the renumbering only if
+    # every template it points at merged with ratio 1; otherwise no template holds that
+    # slice any more and the map is cleared (read_core then errors instead of misreading).
+    if !isempty(C.slice_to_template)
+        C.slice_to_template = all(t -> t == 0 || ratio[t] == one(T), C.slice_to_template) ?
+            [t == 0 ? 0 : remap[t] for t in C.slice_to_template] : Int[]
+    end
     return C
 end
 
@@ -551,6 +557,8 @@ function _contract_aliased_dense_ad!(
     # combined_tids[t] = new template id in C for old template t.
     n_tmplA      = A.n_templates
     combined_tids = Vector{Int}(undef, n_tmplA)
+    # One output template per A template, C emptied by the caller: exact size up front.
+    C.templates = Vector{TC}(undef, n_tmplA * C.blksize)
 
     can_blas = (TC == TA == TB) && (TC <: LinearAlgebra.BlasFloat)
 
@@ -561,7 +569,7 @@ function _contract_aliased_dense_ad!(
         tmpl_A = _aliased_template_view(A, t)            # length chunkA * R
         Amat   = reshape(tmpl_A, chunkA, R)              # (chunkA, R)
 
-        new_tmpl = Vector{TC}(undef, C.blksize)
+        new_tmpl = view(C.templates, (t - 1) * C.blksize + 1 : t * C.blksize)
 
         if dense_order == :AB
             # Cmat (chunkA, chunkB) = Amat (chunkA, R) @ Bmat^T (R, chunkB)
@@ -590,8 +598,6 @@ function _contract_aliased_dense_ad!(
                 end
             end
         end
-
-        append!(C.templates, new_tmpl)
     end
 
     # Build C blocks: same keys (possibly reordered by src), same scalars,
@@ -657,8 +663,13 @@ function contract_aliased!(
         A, labelsA, mapA = _aliased_r_to_last_prefix(A, labelsA, mapA, rlab)
         return _contract_aliased_prefix_outer_ad!(C, labelsC, A, labelsA, B, labelsB, mapA, mapB, rlab)
     else
+        # Dense-tail reduction: template t of A becomes template t of C (C starts
+        # empty) and the prefix is untouched, so the rv -> tid routing carries over.
+        s2t = copy(A.slice_to_template)
         A, labelsA, mapA = _aliased_r_to_last_dense(A, labelsA, mapA, rlab)
-        return _contract_aliased_dense_ad!(C, labelsC, A, labelsA, B, labelsB, mapA, mapB, rlab)
+        _contract_aliased_dense_ad!(C, labelsC, A, labelsA, B, labelsB, mapA, mapB, rlab)
+        C.slice_to_template = s2t
+        return C
     end
 end
 

@@ -517,11 +517,12 @@ function WrappedAliasedBlockSparse(
     dims = ntuple(i -> ITensors.dim(inds_full[i]), Val(N))
     ali  = AliasedBlockSparse{eltype(array_full),N,N2}(dims)
     bs   = blocksparse_from_dense(array_full, Val(N2))
-    # Populate ali: one template per block, scalar = 1
+    # Populate ali: one template per block, scalar = 1 (templates sized exactly)
+    ali.templates = Vector{eltype(array_full)}(undef, length(bs.keys) * bs.blksize)
     for (i, key) in enumerate(bs.keys)
         ali.n_templates += 1
         blk_off = (bs.ids[i] - 1) * bs.blksize
-        append!(ali.templates, @view bs.data[blk_off+1 : blk_off+bs.blksize])
+        copyto!(ali.templates, (i - 1) * bs.blksize + 1, bs.data, blk_off + 1, bs.blksize)
         push!(ali.keys,      key)
         push!(ali.alias_ids, _alias_id(eltype(ali.alias_ids), ali.n_templates))
         push!(ali.scalars,   one(eltype(array_full)))
