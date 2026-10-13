@@ -51,17 +51,6 @@ julia test_psi_properties.jl <N>
 
 ---
 
-### `test_gram_matrix.jl`
-**What:** Path B correctness at one bond. Builds the Gram matrix M explicitly, verifies that M⁻¹H_eff eigsolve gives the same eigenvalue as dense, and cross-checks ⟨ψ|H|ψ⟩ in all four sparse/dense H × sparse/dense ψ combinations.
-
-```
-julia test_gram_matrix.jl <N>
-```
-
-Use when debugging Path B eigenvalue problems or contraction-kernel bugs.
-
----
-
 ## SVD / factorization
 
 ### `test_relax_iso_microbench.jl`

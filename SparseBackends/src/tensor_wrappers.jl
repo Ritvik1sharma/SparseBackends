@@ -488,7 +488,6 @@ function contract(A::ITensors.ITensor, B::ITensors.ITensor,
                   denseLinksB::Union{Nothing,Int}=nothing,
                   preserve_bs_output::Bool=true,
                   preferred_output_labels::Union{Nothing,AbstractVector}=nothing,
-                  next_op=nothing,
                   output_perm::Union{Nothing,Vector{Int}}=nothing,
                   emit_window_map::Bool=false)
   Cb = to_backend(Cbackend)
@@ -497,117 +496,12 @@ function contract(A::ITensors.ITensor, B::ITensors.ITensor,
                                     denseLinksA=denseLinksA, denseLinksB=denseLinksB,
                                     preserve_bs_output=preserve_bs_output,
                                     preferred_output_labels=preferred_output_labels,
-                                    next_op=next_op, output_perm=output_perm,
+                                    output_perm=output_perm,
                                     emit_window_map=emit_window_map)
   end
   return contract(A, B, Abackend, Bbackend;
                   denseLinksA=denseLinksA, denseLinksB=denseLinksB,
                   preserve_bs_output=preserve_bs_output)
-end
-
-# Convenience: contract two ITensors (each carrying any storage) while forcing
-# the output to keep its WrappedBlockSparse storage even when the natural
-# output would be a plain dense ITensor. Used by Path-B sparse DMRG where
-# KrylovKit's geneigsolve needs storage stability across Krylov iterations.
-#
-# If `template` is given (an ITensor with WrappedBlockSparse external storage
-# whose Indices match the natural output's), the result is re-cast so that
-# its (dense-axes, sparse-axes) classification AND inds-ordering match the
-# template's. This makes the result type-identical to the template, which is
-# what KrylovKit's `scale!`/`axpy!` require across operator applications.
-function contract_preserve_bs(A::ITensors.ITensor, B::ITensors.ITensor;
-                              template::Union{Nothing,ITensors.ITensor}=nothing,
-                              output_inds_hint::Union{Nothing,AbstractSet}=nothing,
-                              preferred_output_labels::Union{Nothing,AbstractVector}=nothing,
-                              next_op=nothing,
-                              remaining_ops=nothing,
-                              output_perm::Union{Nothing,Vector{Int}}=nothing,
-                              in_position::Bool=false)
- @timeit TIMER "contract_preserve_bs" begin
-  # Both inputs plain dense → no BS storage to preserve; standard contract.
-  if !ITensors.has_external_storage(A) && !ITensors.has_external_storage(B)
-    output_perm !== nothing && error("contract_preserve_bs: output_perm given but both operands are dense — the static output-permutation table only applies to the aliased/BS-preserving path")
-    return ITensors.contract(A, B)
-  end
-  if ITensors.has_external_storage(A)
-    Aw = ITensors.get_external_storage(A)
-  else
-    Aw = wrap_itensor(A; backend=:dense)
-  end
-  if ITensors.has_external_storage(B)
-    Bw = ITensors.get_external_storage(B)
-  else
-    Bw = wrap_itensor(B; backend=:dense)
-  end
-  # Auto-derive hint from template if caller didn't supply one (template's
-  # dense_inds is exactly the set of axes that should be dense in the output).
-  # UNSAFE, kept hardcoded off: the in-kernel hint path is not yet implemented
-  # (without kernel support, hint causes correctness errors). Do not flip this
-  # to true (was BMF_USE_HINT, default-off knob, never safe to enable).
-  if false &&
-     output_inds_hint === nothing && template !== nothing &&
-     ITensors.has_external_storage(template) &&
-     ITensors.get_external_storage(template) isa WrappedBlockSparse
-    output_inds_hint = dense_inds(ITensors.get_external_storage(template))
-  end
-  # Aliased Path-B fix (route 2): drive the output axis classification from an
-  # ALIASED template's dense_inds, so the contract produces output with φ's
-  # EXACT {N2,P} split via the native aliased fission kernel rather than letting
-  # a dense Minv reclassify a channel axis into the dense tail (the Path-B
-  # alias-collapse bug). Requires SB_ALIASED_NATIVE_FISSION=1 for the native
-  # (dedup-preserving) fission path; without it the kernel BS-delegates (trivial
-  # dedup). Hardened 2026-06 — always on (was SB_ALIASED_MINV_HINT, default-on knob).
-  if output_inds_hint === nothing && template !== nothing &&
-     ITensors.has_external_storage(template) &&
-     ITensors.get_external_storage(template) isa WrappedAliasedBlockSparse
-    output_inds_hint = dense_inds(ITensors.get_external_storage(template))
-  end
-  template_for_filter = nothing
-  # UNSAFE, kept hardcoded off: see BMF_USE_HINT note above.
-  if false && template !== nothing &&
-     ITensors.has_external_storage(template) &&
-     ITensors.get_external_storage(template) isa WrappedBlockSparse
-    template_for_filter = ITensors.get_external_storage(template)::WrappedBlockSparse
-  end
-  # #recast-kill (gated SB_ALIASED_ALIGN_OUTPUT): ask the aliased contract to emit
-  # its output already in the aliased template's axis order, so the downstream
-  # align_aliased_axes becomes a no-op. Only set for an aliased template
-  # (routes to the aliased contract overload that accepts preferred_output_labels).
-  # Caller-provided ordered output labels (e.g. the dense-chain next-step hint)
-  # take precedence; otherwise derive from the aliased template (recast-align).
-  _pref_order = preferred_output_labels
-  # Hardened 2026-06 — always try to align to the template's own axis order
-  # when one is available (was SB_ALIASED_ALIGN_OUTPUT, default-off knob); the
-  # kernel already falls back gracefully (_ALIGN_FALLBACK) when it can't honor
-  # the request, so this is a pure win when it succeeds and a no-op otherwise.
-  if _pref_order === nothing &&
-     template !== nothing && ITensors.has_external_storage(template) &&
-     ITensors.get_external_storage(template) isa WrappedAliasedBlockSparse
-    _pref_order = collect(ITensors.inds(template))
-  end
-  Cw = if _pref_order !== nothing
-    @timeit TIMER "cpb.contract" contract(Aw, Bw; preserve_bs_output=true,
-        output_inds_hint=output_inds_hint, template_for_filter=template_for_filter,
-        preferred_output_labels=_pref_order, next_op=next_op, remaining_ops=remaining_ops,
-        output_perm=output_perm, in_position=in_position)
-  else
-    @timeit TIMER "cpb.contract" contract(Aw, Bw; preserve_bs_output=true,
-        output_inds_hint=output_inds_hint, template_for_filter=template_for_filter,
-        next_op=next_op, remaining_ops=remaining_ops,
-        output_perm=output_perm, in_position=in_position)
-  end
-  Cw isa ITensors.ITensor && return Cw
-
-  # Optionally recast to match template's axis classification + ordering.
-  if template !== nothing && ITensors.has_external_storage(template) &&
-     Cw isa WrappedBlockSparse
-    Tw = ITensors.get_external_storage(template)
-    if Tw isa WrappedBlockSparse
-      Cw = @timeit TIMER "cpb.recast" recast_bs_to_template(Cw, Tw)
-    end
-  end
-  return ITensors._itensor_from_external_storage(Cw)
- end
 end
 
 # Re-cast a WrappedBlockSparse result so its inds-ordering, axis classification
@@ -1238,47 +1132,11 @@ end
 
 
 
-# Build the set of allowed C-prefix keys, in C's prefix order, from a template
-# WrappedBlockSparse. The template's keys are in its own prefix order; we permute
-# them so each j-th entry of the C-tuple is the value from the template axis
-# whose Index id matches indsC[j]. Returns nothing if template/indsC are
-# structurally incompatible (different PC, or some indsC[j] not found in
-# template) — in that case the caller skips filtering.
-function _allowed_keys_from_template(Tw::WrappedBlockSparse{TT,NT,N2T,PT},
-                                     indsC::NTuple{N,ITensors.Index},
-                                     denseLinksC::Int) where {TT,NT,N2T,PT,N}
-  PC = N - denseLinksC
-  PC == PT || return nothing  # classification mismatch
-  N == NT || return nothing
-  # σ[j] = position (in 1..PT) of indsC[j] within Tw.inds, matching by Index id.
-  σ = Vector{Int}(undef, PC)
-  t_ids = ntuple(i -> ITensors.id(Tw.inds[i]), Val(length(Tw.inds)))
-  @inbounds for j in 1:PC
-    target_id = ITensors.id(indsC[j])
-    pos = 0
-    for i in 1:PT
-      if t_ids[i] == target_id
-        pos = i; break
-      end
-    end
-    pos == 0 && return nothing  # indsC[j] not in template prefix
-    σ[j] = pos
-  end
-  PCv = PC
-  allowed = Set{NTuple{PCv, Int}}()
-  sizehint!(allowed, length(Tw.blocksparse.keys))
-  @inbounds for tk in Tw.blocksparse.keys
-    push!(allowed, ntuple(j -> tk[σ[j]], Val(PCv)))
-  end
-  return allowed
-end
-
 function wrapped_contract(A::WrappedTensorTypes{TA,NA},
                           B::WrappedTensorTypes{TB,NB};
                           output_backend::Symbol=:blocksparse,
                           preserve_bs_output::Bool=false,
                           output_inds_hint::Union{Nothing,AbstractSet}=nothing,
-                          template_for_filter::Union{Nothing,WrappedBlockSparse}=nothing,
                           in_position::Bool=false) where {TA,TB,NA,NB}
   # `preserve_bs_output=true` is an opt-in pathway that forces the result of
   # a BlockSparse-involving contraction to remain WrappedBlockSparse, even
@@ -1446,24 +1304,12 @@ function wrapped_contract(A::WrappedTensorTypes{TA,NA},
           @timeit TIMER "wc.alloc_bs" begin
             C = WrappedBlockSparse(TC, dimsC, denseLinksC, indsC)
           end
-          # Build allowed_keys_C from template by permuting template's keys
-          # into C's prefix coordinate system. Only when (a) template provided,
-          # (b) hint path is active (BS×Dense only), (c) prefix sizes match.
-          allowed_keys_C = nothing
-          if template_for_filter !== nothing && hint_for_kernel !== nothing &&
-             Arep isa NewBlockSparseSorted && !(Brep isa NewBlockSparseSorted)
-            @timeit TIMER "wc.build_allowed_keys" begin
-              allowed_keys_C = _allowed_keys_from_template(
-                  template_for_filter, indsC, denseLinksC)
-            end
-          end
           @timeit TIMER "kern.contract!_bs_out" begin
             C.blocksparse = SparseBackends.contract!(
                 C.blocksparse, labelsC_vec,
                 Arep, labelsA_vec,
                 Brep, labelsB_vec;
                 output_inds_hint=hint_for_kernel,
-                allowed_keys_C=allowed_keys_C,
             )
           end
         end

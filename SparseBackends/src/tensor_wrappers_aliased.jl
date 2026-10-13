@@ -833,153 +833,6 @@ function _align_output_order(inds, denseLinks::Int, preferred)
     return ord
 end
 
-# Build the canonical output-label ordering that makes the NEXT contraction's
-# `permB` identity, given the operator `next_op` this result feeds into.
-#   - output axis in next_op's dense TAIL    → red_dense     (FIRST, next-tail order)
-#   - output axis in next_op's sparse PREFIX → shared_prefix (LAST,  next-prefix order)
-#   - else (passes through next contraction) → keepB         (MIDDLE, indsA-then-indsB order)
-# `labelsC_vec` is the kernel's already-computed output-label set, so the
-# contraction's shared/output indices are NOT recomputed here. `indsA`/`indsB`
-# are the original (pre-swap) operand inds, giving `keepB` its incoming order.
-# Returns the ordered `Vector{Label}`, or `nothing` if next_op isn't aliased.
-function _canon_labels_for_next(next_op, indsA, indsB, labelsC_vec::AbstractVector)
-    (next_op isa ITensors.ITensor) || return nothing
-    ITensors.has_external_storage(next_op) || return nothing
-    st = ITensors.get_external_storage(next_op)
-    (st isa WrappedAliasedBlockSparse) || return nothing
-    PB = _abs_head_len(st)
-    next_inds = ITensors.inds(next_op)
-    outset = Set(labelsC_vec)
-    red_dense     = Label[]
-    shared_prefix = Label[]
-    @inbounds for i in (PB + 1):length(next_inds)
-        l = label_key_for_ind(next_inds[i]); (l in outset) && push!(red_dense, l)
-    end
-    @inbounds for i in 1:PB
-        l = label_key_for_ind(next_inds[i]); (l in outset) && push!(shared_prefix, l)
-    end
-    placed = Set{Label}(red_dense); union!(placed, shared_prefix)
-    keepB = Label[]
-    @inbounds for I in indsA
-        l = label_key_for_ind(I); (l in outset && !(l in placed)) && push!(keepB, l)
-    end
-    @inbounds for I in indsB
-        l = label_key_for_ind(I); (l in outset && !(l in placed)) && push!(keepB, l)
-    end
-    return vcat(red_dense, keepB, shared_prefix)
-end
-
-# A-canonical sibling of `_canon_labels_for_next`, for the preserve_bs_output=true
-# (Aliased×Dense → Aliased) matvec path. There this step's output becomes the
-# NEXT step's *A* operand (the aliased accumulator Hv), so the permute to zero is
-# the next kernel's `permA`, which wants A already laid out as
-#   prefix: [keep_pref..., shared_pref...]   dense: [keepA..., red_dense...]
-# i.e. the axes the next step CONTRACTS (shared with next_op) placed LAST within
-# each region. We build that order as a reordering of THIS output's `indsC`,
-# split-respecting (never crossing the prefix/dense boundary) so that
-# `_align_output_order` accepts it. The dense tail additionally honours THIS
-# kernel's requirement that A-origin and B-origin kept dims each be CONTIGUOUS
-# (`_cdense_grouping_and_orders`). Returns a Vector{Index} (preferred order), or
-# `nothing` if next_op carries no inds OR the next-reduced axes span both origins
-# (the two constraints then conflict → genuine Phase-4 / strided-GEMM residual).
-function _canon_inds_for_next_A(next_op, indsA, indsB, indsC, denseLinksC::Int)
-    (next_op isa ITensors.ITensor) || return nothing
-    nxt_ids = Set(ITensors.id(I) for I in ITensors.inds(next_op))
-    isempty(nxt_ids) && return nothing
-    aids = Set(ITensors.id(I) for I in indsA)   # this-step A (accumulator) origin
-    N  = length(indsC)
-    Pc = N - denseLinksC
-    in_next(I) = ITensors.id(I) in nxt_ids       # contracted at the NEXT step
-    from_A(I)  = ITensors.id(I) in aids          # output leg's THIS-step operand origin
-
-    # Prefix (sparse): [keep_pref..., shared_pref...] — next-contracted LAST.
-    # No A/B-contiguity constraint applies to the prefix.
-    keep_pre = ITensors.Index[indsC[i] for i in 1:Pc if !in_next(indsC[i])]
-    red_pre  = ITensors.Index[indsC[i] for i in 1:Pc if  in_next(indsC[i])]
-
-    # Dense tail — two simultaneous constraints: (a) THIS kernel needs A-origin and
-    # B-origin kept dims each contiguous; (b) NEXT permA wants next-contracted axes
-    # last. Both hold iff the next-contracted axes live in ONE origin block, as its
-    # suffix, and that block is placed last. Order each origin block
-    # [not-next..., next-reduced...], then put the next-reduced-owning block last.
-    den = (Pc+1):N
-    A_keep = ITensors.Index[indsC[i] for i in den if  from_A(indsC[i]) && !in_next(indsC[i])]
-    A_red  = ITensors.Index[indsC[i] for i in den if  from_A(indsC[i]) &&  in_next(indsC[i])]
-    B_keep = ITensors.Index[indsC[i] for i in den if !from_A(indsC[i]) && !in_next(indsC[i])]
-    B_red  = ITensors.Index[indsC[i] for i in den if !from_A(indsC[i]) &&  in_next(indsC[i])]
-    dense_order = if isempty(A_red) && isempty(B_red)
-        vcat(A_keep, B_keep)                  # nothing reduced next; order irrelevant
-    elseif isempty(A_red)
-        vcat(A_keep, B_keep, B_red)           # next-reduced only in B → B-block last
-    elseif isempty(B_red)
-        vcat(B_keep, A_keep, A_red)           # next-reduced only in A → A-block last
-    else
-        # next-reduced spans BOTH origins: can't satisfy A/B-contiguity AND
-        # reduced-last with contiguous blocks. Emit the INTERLEAVED order (keeps
-        # first, both reduction groups LAST) so the next step's permA is still the
-        # identity; the kernel realizes this layout via a strided scatter (lmap).
-        # Gated to the serial BLAS path (the only one wired for the strided write);
-        # elsewhere fall back to the kernel's permA (return nothing). Interleaving
-        # itself hardened 2026-06 — always on (was SB_ALIASED_INTERLEAVE,
-        # default-on knob); SB_ALIASED_NTHREADS stays a live, genuine knob.
-        if get(ENV, "SB_ALIASED_NTHREADS", "1") == "1"
-            vcat(A_keep, B_keep, A_red, B_red)
-        else
-            return nothing
-        end
-    end
-    return vcat(keep_pre, red_pre, dense_order)
-end
-
-# Full-chain reduction-rank ordering (the GENERATOR used to derive the static
-# STATIC_OUTPUT_PERM tables). Sort each region (sparse prefix [1:Pc], dense tail
-# [Pc+1:end]) so that legs contracted SOONEST in the remaining chain land LAST and
-# never-contracted (output) legs come first. Stable sort ⇒ equal-rank legs keep
-# their incoming order, giving a consistent relative order at every node (so each
-# step's permA is the identity). Sorting within each region never crosses the
-# prefix/dense split, so `_align_output_order` accepts it; any A/B interleave in
-# the dense tail is realized by the kernel's `lmap` strided write. `remaining_ops`
-# = the chain operators AFTER the current step (OneITensors ignored).
-function _canon_by_rank(indsC, denseLinksC::Int, remaining_ops)
-    idsets = [Set(ITensors.id(I) for I in ITensors.inds(op))
-              for op in remaining_ops if op isa ITensors.ITensor]
-    function rkey(I)
-        d = ITensors.id(I)
-        @inbounds for k in 1:length(idsets)
-            (d in idsets[k]) && return -k     # contracted at remaining step k → -k (soonest = last)
-        end
-        return typemin(Int)                   # never contracted → first
-    end
-    N = length(indsC); Pc = N - denseLinksC
-    pre = sort(collect(indsC[1:Pc]);   by=rkey, alg=Base.Sort.MergeSort)
-    den = sort(collect(indsC[Pc+1:N]); by=rkey, alg=Base.Sort.MergeSort)
-    return vcat(pre, den)
-end
-
-# Permute-minimizing output order (NRED; hardened always-on). Unlike _canon_by_rank (which
-# sorts ALL dense by reduction rank → interleaves A/B origins → forces the 9.6 GiB
-# output permute), this PRESERVES the [keepA; keepB] dense grouping (⇒ mode AthenB,
-# out_dense_perm = identity) and sorts ONLY:
-#   • the sparse PREFIX axes by is_reduced_next (reduced-next last)  — free key-walk reorder
-#   • the keepB dense legs by is_reduced_next (reduced-next last)    — realized by the
-#     existing cheap permB on the small operator (no output permute)
-# keepA dense legs keep their incoming order (so THIS step's permA stays minimal).
-# Result: next step's permA is identity for every reduced leg EXCEPT a carried
-# keepA-dense leg (the terminal ×Renv residual). `next_op` = the next chain operator.
-function _canon_keepB_red(indsA, indsC, denseLinksC::Int, next_op)
-    nset = (next_op isa ITensors.ITensor) ?
-           Set(ITensors.id(I) for I in ITensors.inds(next_op)) : Set{UInt64}()
-    _isred(I) = ITensors.id(I) in nset      # reduced at the NEXT step
-    N = length(indsC); Pc = N - denseLinksC
-    pre   = sort(collect(indsC[1:Pc]); by=_isred, alg=Base.Sort.MergeSort)  # reduced-next last
-    dense = collect(indsC[Pc+1:N])
-    Aset  = Set(ITensors.id(I) for I in indsA)
-    keepA = [I for I in dense if  (ITensors.id(I) in Aset)]                 # A-order preserved
-    keepB = sort([I for I in dense if !(ITensors.id(I) in Aset)];           # keepB reduced-next last
-                 by=_isred, alg=Base.Sort.MergeSort)
-    return vcat(pre, keepA, keepB)
-end
-
 # (Removed STATIC_OUTPUT_PERM + static_output_perm — the aliased-ψ (Path-B) matvec
 # output-order table. Path-B was pruned; the dense-ψ × aliased-H matvec uses
 # STATIC_OUTPUT_PERM_DENSE below.)
@@ -1027,76 +880,12 @@ const STATIC_OUTPUT_PERM_DENSE = Dict{Tuple{Symbol,Int}, Vector{Int}}(
 static_output_perm_dense(bondtype::Symbol, step::Int)::Union{Nothing,Vector{Int}} =
     get(STATIC_OUTPUT_PERM_DENSE, (bondtype, step), nothing)
 
-# Reorder an aliased φ so the legs it shares with `op` sit LAST within its sparse
-# prefix and within its dense tail — i.e. φ laid out A-canonically for the
-# contraction φ·op. Used (in dmrg `position!`) to put the eigensolver seed /
-# recast template into the order the matvec's FIRST step (×Lenv) wants, so that
-# step's permA is the identity across every Krylov iteration. Layout-only (a
-# permute of φ's storage); the contraction math is unchanged. Returns φ unchanged
-# if it isn't aliased, op carries no inds, or φ is already in that order.
-function reorder_aliased_for_op(phi::ITensors.ITensor, op)
-    ITensors.has_external_storage(phi) || return phi
-    w = ITensors.get_external_storage(phi)
-    (w isa WrappedAliasedBlockSparse{T,N,N2,P} where {T,N,N2,P}) || return phi
-    (op isa ITensors.ITensor) || return phi
-    op_ids = Set(ITensors.id(I) for I in ITensors.inds(op))
-    isempty(op_ids) && return phi
-    Pc = _abs_head_len(w)
-    ph = collect(ITensors.inds(phi))
-    Nc = length(ph)
-    shared(I) = ITensors.id(I) in op_ids
-    pre_keep = ITensors.Index[ph[i] for i in 1:Pc     if !shared(ph[i])]
-    pre_red  = ITensors.Index[ph[i] for i in 1:Pc     if  shared(ph[i])]
-    den_keep = ITensors.Index[ph[i] for i in (Pc+1):Nc if !shared(ph[i])]
-    den_red  = ITensors.Index[ph[i] for i in (Pc+1):Nc if  shared(ph[i])]
-    target = vcat(pre_keep, pre_red, den_keep, den_red)
-    ph == target && return phi
-    # perm[i] = old position of the axis that belongs at new position i. By
-    # construction prefix↔dense never cross, so the alias schema is preserved.
-    perm = Int[findfirst(==(target[i]), ph) for i in 1:Nc]
-    new_ali = permutedims(w.aliased, perm)
-    new_w = WrappedAliasedBlockSparse{eltype(w), Nc, Nc - Pc, Pc}(new_ali, Tuple(target))
-    return ITensors._itensor_from_external_storage(new_w)
-end
-
-# φ reorder: lay out φ's prefix and dense blocks by full-chain reduction rank
-# (the operators `ops` are the matvec chain; a leg contracted soonest → last),
-# matching the per-step output ordering so step-1's permA is the identity. Called
-# once per bond from dmrg `position!` — a layout-only permute of φ's storage.
-function reorder_aliased_by_rank(phi::ITensors.ITensor, ops)
-    ITensors.has_external_storage(phi) || return phi
-    w = ITensors.get_external_storage(phi)
-    (w isa WrappedAliasedBlockSparse{T,N,N2,P} where {T,N,N2,P}) || return phi
-    idsets = [Set(ITensors.id(I) for I in ITensors.inds(op)) for op in ops if op isa ITensors.ITensor]
-    isempty(idsets) && return phi
-    rkey(I) = begin
-        d = ITensors.id(I)
-        @inbounds for k in 1:length(idsets); (d in idsets[k]) && return -k; end
-        typemin(Int)
-    end
-    Pc = _abs_head_len(w); ph = collect(ITensors.inds(phi)); Nc = length(ph)
-    pre = sort(ph[1:Pc];     by=rkey, alg=Base.Sort.MergeSort)
-    den = sort(ph[Pc+1:Nc];  by=rkey, alg=Base.Sort.MergeSort)
-    target = vcat(pre, den)
-    perm = Int[findfirst(==(target[i]), ph) for i in 1:Nc]
-    if _roofline_on()   # was SB_PERM_CAPTURE; folded into the roofline switch
-        println("[PERMCAP-PHI] bondtype=", get(ENV, "SB_BONDTYPE", "?"),
-                " ndims=", Nc, " Pc=", Pc, " perm=", perm)
-    end
-    ph == target && return phi
-    new_ali = permutedims(w.aliased, perm)
-    new_w = WrappedAliasedBlockSparse{eltype(w), Nc, Nc - Pc, Pc}(new_ali, Tuple(target))
-    return ITensors._itensor_from_external_storage(new_w)
-end
-
 function wrapped_contract_aliased(
     A :: WrappedTensorTypes{TA,NA},
     B :: WrappedTensorTypes{TB,NB};
     preserve_bs_output::Bool=false,
     preferred_output_labels::Union{Nothing,AbstractVector}=nothing,
     output_inds_hint::Union{Nothing,AbstractSet}=nothing,
-    next_op=nothing,
-    remaining_ops=nothing,
     output_perm::Union{Nothing,Vector{Int}}=nothing,
     in_position::Bool=false,
     emit_window_map::Bool=false,
@@ -1424,43 +1213,13 @@ function wrapped_contract_aliased(
         # default order (recast still fixes it ⇒ correctness preserved).
         # Output ordering, in priority:
         #   1. explicit caller preferred_output_labels (recast-align),
-        #   2. the hard-coded static table by (bond-type, step) — the production path,
-        #   3. the full-chain-rank generator (SB_PERM_CAPTURE only) used to (re)derive
-        #      the table; prints the permutation per (bond-type, step).
+        #   2. the caller's `output_perm` (static table by (bond-type, step)).
         # The chosen order is emitted by the kernel via _align_output_order (+ lmap for
         # interleaved layouts), making the NEXT step's permA the identity.
         _pref_align = preferred_output_labels
-        # SB_OUTSTAT_NATURAL=1 (experiment): skip the interleaving static schedule so
-        # the kernel emits its NATURAL [keepA;keepB] order (out_dense_perm → identity,
-        # no 9.6GiB output permute). The cost may migrate to the NEXT step's permA;
-        # this measures whether the relayout is reducible or just moves. recast_to_phi
-        # realigns the final output to φ ⇒ correctness preserved regardless.
-        _os_natural = get(ENV, "SB_OUTSTAT_NATURAL", "0") == "1"
-        # NRED permute-minimizing output order (HARDENED 2026-07, was the SB_OUTSTAT_NRED
-        # env gate — now unconditional whenever a next_op is available): sparse prefix +
-        # keepB sorted reduced-next-last, keepA grouping preserved. keepB order is realized
-        # by the cheap permB (out_dense_perm stays identity); next permA is identity except
-        # the terminal carried-keepA residual. Only fires for aliased contractions (this is
-        # the aliased kernel); bit-identical E, ~2.2x faster matvec vs the old _canon_by_rank
-        # order (kills the reduction-stationary scatter/accum path). See memory
-        # project_nred_output_ordering.
-        if _pref_align === nothing && next_op !== nothing
-            _pref_align = _canon_keepB_red(indsA, indsC, denseLinksC, next_op)
-        end
-        if _pref_align === nothing && !_os_natural && output_perm !== nothing &&
+        if _pref_align === nothing && output_perm !== nothing &&
            length(output_perm) == length(indsC)
             _pref_align = indsC[output_perm]
-        end
-        if _pref_align === nothing && !_os_natural && remaining_ops !== nothing
-            _pref_align = _canon_by_rank(indsC, denseLinksC, remaining_ops)
-            if _roofline_on()   # was SB_PERM_CAPTURE; folded into the roofline switch
-                _ic = collect(indsC)
-                _perm = Int[findfirst(==(_pref_align[i]), _ic) for i in 1:length(_ic)]
-                println("[PERMCAP] bondtype=", get(ENV, "SB_BONDTYPE", "?"),
-                        " step=", CURRENT_STEP[],
-                        " ndims=", length(_ic), " Pc=", length(_ic) - denseLinksC,
-                        " perm=", _perm)
-            end
         end
         if _pref_align !== nothing
             ord = _align_output_order(indsC, denseLinksC, _pref_align)
@@ -1510,14 +1269,11 @@ function contract(A::WrappedAliasedBlockSparse, B::WrappedTensorTypes;
                   preserve_bs_output::Bool=false,
                   preferred_output_labels::Union{Nothing,AbstractVector}=nothing,
                   output_inds_hint::Union{Nothing,AbstractSet}=nothing,
-                  next_op=nothing,
-                  remaining_ops=nothing,
                   output_perm::Union{Nothing,Vector{Int}}=nothing,
                   in_position::Bool=false,
                   kwargs...)
     return wrapped_contract_aliased(A, B; preserve_bs_output, preferred_output_labels,
-                                    output_inds_hint=output_inds_hint, next_op=next_op,
-                                    remaining_ops=remaining_ops, output_perm=output_perm,
+                                    output_inds_hint=output_inds_hint, output_perm=output_perm,
                                     in_position=in_position)
 end
 
@@ -1525,14 +1281,11 @@ function contract(A::WrappedTensorTypes, B::WrappedAliasedBlockSparse;
                   preserve_bs_output::Bool=false,
                   preferred_output_labels::Union{Nothing,AbstractVector}=nothing,
                   output_inds_hint::Union{Nothing,AbstractSet}=nothing,
-                  next_op=nothing,
-                  remaining_ops=nothing,
                   output_perm::Union{Nothing,Vector{Int}}=nothing,
                   in_position::Bool=false,
                   kwargs...)
     return wrapped_contract_aliased(A, B; preserve_bs_output, preferred_output_labels,
-                                    output_inds_hint=output_inds_hint, next_op=next_op,
-                                    remaining_ops=remaining_ops, output_perm=output_perm,
+                                    output_inds_hint=output_inds_hint, output_perm=output_perm,
                                     in_position=in_position)
 end
 
@@ -1540,14 +1293,11 @@ function contract(A::WrappedAliasedBlockSparse, B::WrappedAliasedBlockSparse;
                   preserve_bs_output::Bool=false,
                   preferred_output_labels::Union{Nothing,AbstractVector}=nothing,
                   output_inds_hint::Union{Nothing,AbstractSet}=nothing,
-                  next_op=nothing,
-                  remaining_ops=nothing,
                   output_perm::Union{Nothing,Vector{Int}}=nothing,
                   in_position::Bool=false,
                   kwargs...)
     return wrapped_contract_aliased(A, B; preserve_bs_output, preferred_output_labels,
-                                    output_inds_hint=output_inds_hint, next_op=next_op,
-                                    remaining_ops=remaining_ops, output_perm=output_perm,
+                                    output_inds_hint=output_inds_hint, output_perm=output_perm,
                                     in_position=in_position)
 end
 
@@ -1575,7 +1325,6 @@ function contract_aliased_itensor(
     denseLinksB :: Union{Nothing,Int} = nothing,
     preserve_bs_output :: Bool = true,
     preferred_output_labels :: Union{Nothing,AbstractVector} = nothing,
-    next_op = nothing,
     output_perm :: Union{Nothing,Vector{Int}} = nothing,
     emit_window_map :: Bool = false,
 )
@@ -1600,7 +1349,7 @@ function contract_aliased_itensor(
     end
 
     @timeit TIMER "wrapped_contract_aliased_call" begin
-        Cw = wrapped_contract_aliased(Aw, Bw; preserve_bs_output, preferred_output_labels, next_op, output_perm, emit_window_map)
+        Cw = wrapped_contract_aliased(Aw, Bw; preserve_bs_output, preferred_output_labels, output_perm, emit_window_map)
     end
     @timeit TIMER "wrap_output" begin
         Cw isa ITensors.ITensor && return Cw   # P_C = 0
