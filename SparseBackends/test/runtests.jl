@@ -11,5 +11,6 @@ using SparseBackends
   # include("tensoralgebra/coo_dense.jl")
   # include("tensoralgebra/bs_bs_multi_labels.jl")
   include("tensoralgebra/bs_dense.jl")
+  include("output_layout.jl")
   # edited_packages/SparseBackends/test/tensoralgebra/bs_bs_multi_labels.jl
 end

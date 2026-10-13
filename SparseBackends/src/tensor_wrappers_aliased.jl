@@ -889,7 +889,13 @@ function wrapped_contract_aliased(
     output_perm::Union{Nothing,Vector{Int}}=nothing,
     in_position::Bool=false,
     emit_window_map::Bool=false,
+    layout::Union{Nothing,OutputLayout}=nothing,
 ) where {TA,TB,NA,NB}
+    if layout !== nothing && (preferred_output_labels !== nothing ||
+                              output_inds_hint !== nothing || output_perm !== nothing)
+        throw(ArgumentError("wrapped_contract_aliased: pass either `layout` or the old " *
+            "preferred_output_labels/output_inds_hint/output_perm keywords, not both"))
+    end
     @timeit TIMER "get_data_info" begin
         Arep   = rep(A)
         Brep   = rep(B)
@@ -900,6 +906,12 @@ function wrapped_contract_aliased(
     end
 
     @timeit TIMER "output_inds" begin
+      if layout !== nothing
+        # Requested layout: it IS the output's index order and key/dense split.
+        validate_layout(layout, indsA, indsB)
+        indsC  = Tuple(layout_inds(layout))
+        denseC = layout.dense
+      else
         # Forward the hint to output_inds: it knows how to reorder indsC so
         # sparse-prefix axes come first and dense-tail axes come last, and
         # how to classify hint-marked axes as dense.
@@ -930,6 +942,7 @@ function wrapped_contract_aliased(
                 end
             end
         end
+      end
         dimsC  = ntuple(i -> ITensors.dim(indsC[i]), length(indsC))
         TC     = promote_type(eltype(Arep), eltype(Brep))
     end
@@ -985,7 +998,12 @@ function wrapped_contract_aliased(
         # returned ITensor carries the canonical-order indices; downstream
         # ITensors operations transparently handle the index reorder.
         if !preserve_bs_output
-            ali_dense_path = (Arep isa AliasedBlockSparse && Brep isa AbstractArray &&
+            if layout !== nothing && !isempty(layout.sparse)
+                throw(OutputLayoutError("this contraction returns a dense tensor, which has " *
+                    "no key: pass OutputLayout(sparse=Index[], dense=[full output order]) " *
+                    "(see as_dense)"))
+            end
+            ali_dense_path =(Arep isa AliasedBlockSparse && Brep isa AbstractArray &&
                             !(Brep isa AliasedBlockSparse) && !(Brep isa NewBlockSparseSorted) &&
                             !(Brep isa COOTensor)) ||
                             (Brep isa AliasedBlockSparse && Arep isa AbstractArray &&
@@ -1036,7 +1054,9 @@ function wrapped_contract_aliased(
                     # This RETIRES _canon_labels_for_next on the dense path. Non-matvec
                     # callers (e.g. MPO build) pass no output_perm → fall through to the
                     # preferred/heuristic branches below (unchanged).
-                    if output_perm !== nothing && length(output_perm) == length(labelsC_vec)
+                    if layout !== nothing
+                        canon_labels = collect(labelsC_vec)   # the requested order
+                    elseif output_perm !== nothing && length(output_perm) == length(labelsC_vec)
                         canon_labels = [labelsC_vec[output_perm[i]] for i in 1:length(labelsC_vec)]
                     elseif preferred_output_labels !== nothing
                         # Accept either Vector{Index} (natural for callers) or the
@@ -1142,9 +1162,11 @@ function wrapped_contract_aliased(
                 _DENSIFY_DOT_HITS[] += 1
                 tmpA = ITensors.ITensor(to_dense(Arep), indsA...)
                 tmpB = ITensors.ITensor(to_dense(Brep), indsB...)
-                return ITensors.contract(tmpA, tmpB)
+                res = ITensors.contract(tmpA, tmpB)
+                # honour a requested order (ITensors.contract picks its own)
+                return layout === nothing ? res : ITensors.permute(res, indsC...)
             end
-            Arep_bs = Arep isa AliasedBlockSparse ? to_blocksparse(Arep) : Arep
+            Arep_bs =Arep isa AliasedBlockSparse ? to_blocksparse(Arep) : Arep
             Brep_bs = Brep isa AliasedBlockSparse ? to_blocksparse(Brep) : Brep
             if Arep_bs isa NewBlockSparseSorted && Brep_bs isa NewBlockSparseSorted
                 contract_bs_bs_to_dense!(C_data, labelsC_vec, Arep_bs, labelsA_vec, Brep_bs, labelsB_vec)
@@ -1202,6 +1224,19 @@ function wrapped_contract_aliased(
         # Forward output_inds_hint so the inner kernel can trigger its
         # fission path (for aliased kernels: my _aliased_shared_via_bs_fission!;
         # for BS kernels: _contract_shared_hint!).
+        if layout !== nothing
+            # Requested layout: build C directly in it. The kernels only test whether a
+            # hint is present (it selects the path that can move an index into the key);
+            # its contents are not read.
+            C = WrappedAliasedBlockSparse(TC, dimsC, denseLinksC, indsC)
+            C.aliased = contract!(
+                C.aliased, labelsC_vec,
+                Arep, labelsA_vec,
+                Brep, labelsB_vec;
+                output_inds_hint=Set(label_key_for_ind(I) for I in layout.dense),
+            )
+            return C
+        end
         hint_labels = output_inds_hint === nothing ? nothing :
             Set(label_key_for_ind(I) for I in output_inds_hint)
         # #recast-kill (gated SB_ALIASED_ALIGN_OUTPUT): emit the output already in
@@ -1271,10 +1306,11 @@ function contract(A::WrappedAliasedBlockSparse, B::WrappedTensorTypes;
                   output_inds_hint::Union{Nothing,AbstractSet}=nothing,
                   output_perm::Union{Nothing,Vector{Int}}=nothing,
                   in_position::Bool=false,
+                  layout::Union{Nothing,OutputLayout}=nothing,
                   kwargs...)
     return wrapped_contract_aliased(A, B; preserve_bs_output, preferred_output_labels,
                                     output_inds_hint=output_inds_hint, output_perm=output_perm,
-                                    in_position=in_position)
+                                    in_position=in_position, layout=layout)
 end
 
 function contract(A::WrappedTensorTypes, B::WrappedAliasedBlockSparse;
@@ -1283,10 +1319,11 @@ function contract(A::WrappedTensorTypes, B::WrappedAliasedBlockSparse;
                   output_inds_hint::Union{Nothing,AbstractSet}=nothing,
                   output_perm::Union{Nothing,Vector{Int}}=nothing,
                   in_position::Bool=false,
+                  layout::Union{Nothing,OutputLayout}=nothing,
                   kwargs...)
     return wrapped_contract_aliased(A, B; preserve_bs_output, preferred_output_labels,
                                     output_inds_hint=output_inds_hint, output_perm=output_perm,
-                                    in_position=in_position)
+                                    in_position=in_position, layout=layout)
 end
 
 function contract(A::WrappedAliasedBlockSparse, B::WrappedAliasedBlockSparse;
@@ -1295,10 +1332,11 @@ function contract(A::WrappedAliasedBlockSparse, B::WrappedAliasedBlockSparse;
                   output_inds_hint::Union{Nothing,AbstractSet}=nothing,
                   output_perm::Union{Nothing,Vector{Int}}=nothing,
                   in_position::Bool=false,
+                  layout::Union{Nothing,OutputLayout}=nothing,
                   kwargs...)
     return wrapped_contract_aliased(A, B; preserve_bs_output, preferred_output_labels,
                                     output_inds_hint=output_inds_hint, output_perm=output_perm,
-                                    in_position=in_position)
+                                    in_position=in_position, layout=layout)
 end
 
 """
@@ -1327,10 +1365,13 @@ function contract_aliased_itensor(
     preferred_output_labels :: Union{Nothing,AbstractVector} = nothing,
     output_perm :: Union{Nothing,Vector{Int}} = nothing,
     emit_window_map :: Bool = false,
+    layout :: Union{Nothing,OutputLayout} = nothing,
 )
     Ab = to_backend(Abackend)
     Bb = to_backend(Bbackend)
     if Ab === DENSE && Bb === DENSE
+        layout === nothing || throw(OutputLayoutError(
+            "contract_aliased_itensor: both operands are dense; a layout cannot be honoured"))
         return ITensors.contract(A, B)
     end
 
@@ -1349,7 +1390,7 @@ function contract_aliased_itensor(
     end
 
     @timeit TIMER "wrapped_contract_aliased_call" begin
-        Cw = wrapped_contract_aliased(Aw, Bw; preserve_bs_output, preferred_output_labels, output_perm, emit_window_map)
+        Cw = wrapped_contract_aliased(Aw, Bw; preserve_bs_output, preferred_output_labels, output_perm, emit_window_map, layout)
     end
     @timeit TIMER "wrap_output" begin
         Cw isa ITensors.ITensor && return Cw   # P_C = 0
