@@ -26,37 +26,109 @@ function dense_from_aliased_operand(Aw::WrappedTensorTypes, Bw::WrappedTensorTyp
     return _layout_from_output_inds(indsC, denseC)
 end
 
-# The aliased-first operand order contract_and_fuse_links uses with a layout policy.
-_aliased_first(Aw, Bw) =
-    (Bw isa WrappedAliasedBlockSparse && !(Aw isa WrappedAliasedBlockSparse)) ? (Bw, Aw) : (Aw, Bw)
+# ── roles (see the vocabulary in output_layout.jl) ───────────────────────────
 
-"""
-    preserve_prefix(Aw, Bw; aLeft, aRight, bLeft, bRight) -> OutputLayout
+function _role_num(I, key::String)
+    for t in ITensors.tags(I)
+        m = match(Regex("^" * key * raw"=(\d+)$"), string(t))
+        m === nothing || return parse(Int, m.captures[1])
+    end
+    return nothing
+end
+_role_issite(I) = ITensors.hastags(I, "Site")
+_role_islink(I) = ITensors.hastags(I, "Link")
 
-Layout policy for MPO × MPS on an aliased ψ (TEBD; pass as `layout_policy=preserve_prefix`):
-keep the aliased operand's key and move the dense operand's site index into it, last.
-Same as the old `alias_hint = :preserve_prefix`.
-"""
-function preserve_prefix(Aw::WrappedTensorTypes, Bw::WrappedTensorTypes;
-                         aLeft=nothing, aRight=nothing, bLeft=nothing, bRight=nothing)
-    hint = _preserve_prefix_hint(Aw, Bw, aLeft, aRight, bLeft, bRight)
-    Xw, Yw = _aliased_first(Aw, Bw)
-    pref = _preserve_prefix_order(Xw, Yw, hint)
-    indsC, denseC = output_inds(Xw.inds, Yw.inds, dense_inds(Xw), dense_inds(Yw);
-                                output_inds_hint=hint)
-    # the order the old preferred_output_labels produced (same acceptance test)
-    want = collect(ITensors.Index, pref)
-    if length(want) == length(indsC) && Set(ITensors.id.(want)) == Set(ITensors.id.(indsC))
-        dset = Set(ITensors.id(I) for I in denseC)
-        ntail = count(I -> ITensors.id(I) in dset, want)
-        if all(I -> ITensors.id(I) in dset, want[(end - ntail + 1):end])
-            indsC = Tuple(want)
+# kind of each index of `inds` (:l, :r, :s, :sp, or nothing), from the site numbers n=
+function _role_kinds(inds)
+    ns = [_role_num(I, "n") for I in inds if _role_issite(I)]
+    ns = filter(!isnothing, ns)
+    nmin, nmax = isempty(ns) ? (nothing, nothing) : (minimum(ns), maximum(ns))
+    map(inds) do I
+        if _role_issite(I)
+            ITensors.plev(I) == 0 ? :s : ITensors.plev(I) == 1 ? :sp : nothing
+        elseif _role_islink(I) && nmin !== nothing
+            j = _role_num(I, "l")
+            j === nothing ? nothing : j == nmin - 1 ? :l : j == nmax ? :r : nothing
+        else
+            nothing
         end
     end
-    nd = length(denseC)
-    return OutputLayout(collect(ITensors.Index, indsC[1:end-nd]),
-                        collect(ITensors.Index, indsC[end-nd+1:end]))
 end
+
+# (kind, k) => Index for one operand
+function _role_map(inds)
+    kinds = _role_kinds(inds)
+    rm = Dict{Tuple{Symbol,Int},ITensors.Index}()
+    cnt = Dict{Symbol,Int}()
+    for (I, kd) in zip(inds, kinds)
+        kd === nothing && continue
+        k = cnt[kd] = get(cnt, kd, 0) + 1
+        rm[(kd, k)] = I
+    end
+    return rm
+end
+
+function _parse_role(r::Role)
+    op, kind = r[1], r[2]
+    k = length(r) == 3 ? r[3] : 1
+    (op in (:A, :B) && kind in (:l, :r, :s, :sp) && k >= 1) ||
+        throw(OutputLayoutError("bad role $r: expected (op, kind[, k]) with op :A or :B, " *
+                                "kind :l, :r, :s or :sp, k ≥ 1 (see show_roles)"))
+    return (op === :A ? 1 : 2), kind, k
+end
+
+"""
+    resolve_layout(L, Aw, Bw) -> OutputLayout
+
+Replace the roles in `L` by the Index objects they mean for this contraction (`Aw`
+first operand, `Bw` second). Roles absent at this site are skipped; Index entries are
+kept. The result is checked later by `validate_layout`.
+"""
+function resolve_layout(L::OutputLayout, Aw::WrappedTensorTypes, Bw::WrappedTensorTypes)
+    isresolved(L) && return L
+    sA, sB = Set(Aw.inds), Set(Bw.inds)
+    outs = (Set(I for I in Aw.inds if !(I in sB)), Set(I for I in Bw.inds if !(I in sA)))
+    rms  = (_role_map(collect(Aw.inds)), _role_map(collect(Bw.inds)))
+    function res(list)
+        got = ITensors.Index[]
+        for x in list
+            if x isa ITensors.Index
+                push!(got, x)
+            else
+                o, kind, k = _parse_role(x)
+                I = get(rms[o], (kind, k), nothing)
+                (I === nothing || !(I in outs[o])) && continue     # absent here: skip
+                push!(got, I)
+            end
+        end
+        return got
+    end
+    return OutputLayout(res(L.sparse), res(L.dense))
+end
+
+"""
+    show_roles(T; as=:A)
+
+Print each index of `T` (ITensor or wrapped tensor) in stored order with its role for
+an OutputLayout (`as=:A` if T is the first operand of the contraction, `:B` the second),
+whether it is in the key or the dense block, dimension, prime level and tags.
+"""
+function show_roles(io::IO, w::WrappedTensorTypes; as::Symbol=:A)
+    rm  = _role_map(collect(w.inds))
+    inv = Dict(I => r for (r, I) in rm)
+    d   = dense_inds(w)
+    println(io, typeof(w).name.name, " with ", length(w.inds), " indices")
+    for I in w.inds
+        role = haskey(inv, I) ? "(:$as, :$(inv[I][1]), $(inv[I][2]))" : "(no role)"
+        println(io, "  ", rpad(role, 14), rpad(I in d ? "dense" : "key", 6),
+                " dim=", rpad(ITensors.dim(I), 5), " plev=", ITensors.plev(I),
+                "  ", ITensors.tags(I))
+    end
+end
+show_roles(io::IO, T::ITensors.ITensor; as::Symbol=:A) =
+    show_roles(io, ITensors.has_external_storage(T) ? ITensors.get_external_storage(T) :
+                   wrap_itensor(T; backend=:dense); as=as)
+show_roles(T; as::Symbol=:A) = show_roles(stdout, T; as=as)
 
 """
     matvec_dense_layout(bondtype, step, A, B) -> Union{Nothing,OutputLayout}

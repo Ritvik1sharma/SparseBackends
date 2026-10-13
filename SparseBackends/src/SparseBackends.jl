@@ -142,7 +142,7 @@ export WrappedAliasedBlockSparse, contract_aliased_itensor,
 @enum Backend DENSE COO BLOCKSPARSE ALIASED
 export Backend, DENSE, COO, BLOCKSPARSE, ALIASED, to_backend
 export OutputLayout, OutputLayoutError, as_dense, validate_layout,
-       dense_from_aliased_operand, preserve_prefix, matvec_dense_layout
+       dense_from_aliased_operand, matvec_dense_layout, resolve_layout, show_roles
 
 @inline to_backend(b::Backend) = b
 @inline function to_backend(s::Symbol)::Backend

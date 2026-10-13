@@ -19,12 +19,33 @@
 
 import ITensors
 
+# Entries are Index objects, or ROLES resolved against the two operands of the
+# contraction (A = first operand, B = second, as written by the caller):
+#   (op, kind, k)    op   :A or :B
+#                    kind :l   link to the previous site (tag l = n-1)
+#                         :r   link to the next site     (tag l = n)
+#                         :s   site index, prime level 0
+#                         :sp  site index, prime level 1
+#                    k    the k-th index of that kind in op's stored order (the key comes
+#                         first, so on an aliased ψ = P·core, (:B,:l,1) is P's left link
+#                         in the key and (:B,:l,2) core's left link in the dense block)
+#   (op, kind)       short for (op, kind, 1)
+# n is the operand's site number (its Site index tag n=). A role absent at this site
+# (e.g. (:A,:l) on the first site, or a contracted index) is skipped, so one layout
+# serves every site of an MPO × MPS contraction. show_roles prints a tensor's roles.
+const Role = Union{Tuple{Symbol,Symbol},Tuple{Symbol,Symbol,Int}}
+const LayoutEntry = Union{ITensors.Index,Role}
+
 struct OutputLayout
-    sparse::Vector{ITensors.Index}
-    dense::Vector{ITensors.Index}
+    sparse::Vector{LayoutEntry}
+    dense::Vector{LayoutEntry}
 end
 OutputLayout(; sparse, dense) =
-    OutputLayout(collect(ITensors.Index, sparse), collect(ITensors.Index, dense))
+    OutputLayout(collect(LayoutEntry, sparse), collect(LayoutEntry, dense))
+
+"""True when every entry is an Index (no roles left to resolve)."""
+isresolved(L::OutputLayout) = all(x -> x isa ITensors.Index, L.sparse) &&
+                              all(x -> x isa ITensors.Index, L.dense)
 
 struct OutputLayoutError <: Exception
     msg::String
@@ -46,6 +67,8 @@ Throw `OutputLayoutError` unless `L` lists exactly the uncontracted indices of A
 (full Index equality, prime level included), each once.
 """
 function validate_layout(L::OutputLayout, indsA, indsB)
+    isresolved(L) || throw(OutputLayoutError(
+        "validate_layout: layout still contains roles; resolve it first (resolve_layout)"))
     sA, sB = Set(indsA), Set(indsB)
     expected = ITensors.Index[I for I in indsA if !(I in sB)]
     append!(expected, ITensors.Index[I for I in indsB if !(I in sA)])

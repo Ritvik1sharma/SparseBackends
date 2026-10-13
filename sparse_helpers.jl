@@ -172,25 +172,18 @@ site_last(psi::MPS) = MPS([site_last(psi[i]) for i in 1:length(psi)])
 """Aliased-preserving ITensor product, following the convention DMRG already uses
 (`_mul_preserve_aliased`, ITensorMPS.jl/src/abstractprojmpo/abstractprojmpo.jl:46).
 
-The hint is the ALIASED operand's dense TAIL only, so the dense operand's site/link
-axes are pulled into the sparse PREFIX rather than demoting the prefix into the tail.
-`output_inds_hint` inverts semantics: it is the complete dense-tail set, everything
-else forced sparse.
-
-This is why the DMRG PHP path keeps its template sharing and our MPO*MPS path does
-not: contract(MPO, psi, ...) goes through top_level_contract/contract_and_fuse_links,
-which accept NO hint, while DMRG calls wrapped_contract_aliased directly."""
+The output layout is `SparseBackends.dense_from_aliased_operand`: the output's dense
+block holds only the ALIASED operand's dense indices, so the dense operand's site/link
+indices go into the key rather than demoting the key into the dense block."""
 function mul_aliased(A::ITensor, B::ITensor; in_position::Bool = false)
     a_ali = storage_kind(A) === :aliased
     b_ali = storage_kind(B) === :aliased
     (a_ali || b_ali) || return A * B
     Aw = a_ali ? ITensors.get_external_storage(A) : SparseBackends.wrap_itensor(A; backend = :dense)
     Bw = b_ali ? ITensors.get_external_storage(B) : SparseBackends.wrap_itensor(B; backend = :dense)
-    hint = Set{Index}()
-    a_ali && union!(hint, SparseBackends.dense_inds(Aw))
-    b_ali && union!(hint, SparseBackends.dense_inds(Bw))
     Cw = SparseBackends.wrapped_contract_aliased(Aw, Bw;
-            preserve_bs_output = true, output_inds_hint = hint, in_position = in_position)
+            preserve_bs_output = true, in_position = in_position,
+            layout = SparseBackends.dense_from_aliased_operand(Aw, Bw))
     return Cw isa ITensor ? Cw : ITensors._itensor_from_external_storage(Cw)
 end
 
@@ -237,7 +230,9 @@ over channels."""
 function apply_layer_sparse(psi::MPS, M::MPO; maxdim::Int, cutoff::Real = 0.0,
                             merge::Union{Bool,Symbol} = :before,
                             ortho_frame::Symbol = :left,
-                            alias_hint::Union{Nothing,Symbol} = :preserve_prefix)
+                            layout = SparseBackends.OutputLayout(
+                                sparse = [(:B,:l,1), (:B,:r,1), (:A,:sp)],
+                                dense  = [(:B,:l,2), (:B,:r,2), (:A,:r), (:A,:l)]))
     mode = merge isa Bool ? (merge ? :before : :none) : merge
     mode in (:none, :before, :after, :both) ||
         error("apply_layer_sparse: merge must be :none/:before/:after/:both (or a Bool); got $merge")
@@ -245,8 +240,11 @@ function apply_layer_sparse(psi::MPS, M::MPO; maxdim::Int, cutoff::Real = 0.0,
         error("apply_layer_sparse: ortho_frame must be :left or :right; got $ortho_frame")
 
     bk = storage_kind(psi[1])
+    # Output of each site product gate[i] (A) * ψ[i] (B), for an aliased ψ = P·core:
+    # key = P's links + the gate's output site s' (moved into the key); dense = core's
+    # links + the gate links. Other storage kinds use the stock layout.
     phi = replaceprime(contract(M, psi, :dense, bk; Cbackend = bk,
-                                alias_hint = alias_hint), 1 => 0)
+                                layout = bk === :aliased ? layout : nothing), 1 => 0)
     # MERGE FIRST. The output-stationary kernel emits one template per output block
     # (dedup 1.00x by construction), and the single-site aliased factorize inherits its schema
     # from the INPUT tensors -- so merging here hands the sweep the small schema, whereas
@@ -332,7 +330,9 @@ function step_sparse(psi::MPS, layers::Vector{MPO}; maxdim::Int, cutoff::Real = 
                      merge::Union{Bool,Symbol} = :before,
                      ortho_frame::Symbol = :left,
                      layer0::Int = 0,
-                     alias_hint::Union{Nothing,Symbol} = :preserve_prefix)
+                     layout = SparseBackends.OutputLayout(
+                         sparse = [(:B,:l,1), (:B,:r,1), (:A,:sp)],
+                         dense  = [(:B,:l,2), (:B,:r,2), (:A,:r), (:A,:l)]))
     ortho_frame in (:left, :right, :alternate) ||
         error("step_sparse: ortho_frame must be :left, :right or :alternate; got $ortho_frame")
     p = psi
@@ -344,7 +344,7 @@ function step_sparse(psi::MPS, layers::Vector{MPO}; maxdim::Int, cutoff::Real = 
                 (iseven(layer0 + k - 1) ? :left : :right) : ortho_frame
         p = apply_layer_sparse(p, M; maxdim = maxdim, cutoff = cutoff,
                                merge = merge, ortho_frame = frame,
-                               alias_hint = alias_hint)
+                               layout = layout)
     end
     return p
 end
