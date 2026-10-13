@@ -361,7 +361,7 @@ function top_level_contract(
   bLeft::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing,
   bRight::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing,
   alias_hint::Union{Nothing,Symbol}=nothing,
-  layout_policy=nothing
+  layout::Union{Nothing,OutputLayout}=nothing
 )
   # Parse the public Symbol API to the canonical Backend enum (strict: a
   # non-canonical name like the old :aliasedblocksparse throws here).
@@ -378,8 +378,8 @@ function top_level_contract(
     Cb = ALIASED
   end
   if Ab === DENSE && Bb === DENSE
-    layout_policy === nothing || throw(OutputLayoutError(
-        "top_level_contract: both operands are dense; a layout policy cannot be honoured"))
+    layout === nothing || throw(OutputLayoutError(
+        "top_level_contract: both operands are dense; a layout cannot be honoured"))
     if Cb === DENSE
       return ITensors.contract(A, B), bondmap
     end
@@ -406,7 +406,7 @@ function top_level_contract(
   end
   return contract_and_fuse_links(Aw, Bw, Cb, bondmap;
                                  aLeft=aLeft, aRight=aRight, bLeft=bLeft, bRight=bRight,
-                                 alias_hint=alias_hint, layout_policy=layout_policy)
+                                 alias_hint=alias_hint, layout=layout)
 end
 
 @inline _bs_head_len(::WrappedBlockSparse{T,N,N2,P}) where {T,N,N2,P} = P
@@ -493,22 +493,22 @@ function contract_and_fuse_links(
   bLeft::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing,
   bRight::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing,
   alias_hint::Union{Nothing,Symbol}=nothing,
-  layout_policy=nothing
+  layout::Union{Nothing,OutputLayout}=nothing
 )
   Cb = Cbackend === nothing ? nothing : to_backend(Cbackend)
-  layout_policy !== nothing && alias_hint !== nothing && throw(ArgumentError(
-      "contract_and_fuse_links: pass either layout_policy or alias_hint, not both"))
-  if layout_policy !== nothing
-    # A layout policy: a function of the operands (and bond links) returning an
-    # OutputLayout, e.g. preserve_prefix. The aliased operand goes first.
-    L = layout_policy(Aw, Bw; aLeft=aLeft, aRight=aRight, bLeft=bLeft, bRight=bRight)
-    Xw, Yw = _aliased_first(Aw, Bw)
+  layout !== nothing && alias_hint !== nothing && throw(ArgumentError(
+      "contract_and_fuse_links: pass either layout or alias_hint, not both"))
+  if layout !== nothing
+    # Roles (op, kind, k) name the operands as passed here: :A = Aw (the MPO site).
+    (Aw isa WrappedAliasedBlockSparse || Bw isa WrappedAliasedBlockSparse) ||
+      throw(OutputLayoutError("contract_and_fuse_links: a layout needs an aliased " *
+                              "operand; got $(typeof(Aw).name.name) × $(typeof(Bw).name.name)"))
     if Cb === ALIASED
-      Cw = wrapped_contract_aliased(Xw, Yw; preserve_bs_output=true, layout=L)
+      Cw = wrapped_contract_aliased(Aw, Bw; preserve_bs_output=true, layout=layout)
     elseif Cb === DENSE
-      Cw = wrapped_contract_aliased(Xw, Yw; layout=as_dense(L))
+      Cw = wrapped_contract_aliased(Aw, Bw; layout=as_dense(layout))
     else
-      throw(OutputLayoutError("contract_and_fuse_links: a layout policy needs Cbackend " *
+      throw(OutputLayoutError("contract_and_fuse_links: a layout needs Cbackend " *
                               ":aliased or :dense, got $Cb"))
     end
   elseif Aw isa WrappedAliasedBlockSparse || Bw isa WrappedAliasedBlockSparse || Cb === ALIASED

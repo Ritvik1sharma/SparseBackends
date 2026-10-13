@@ -896,6 +896,17 @@ function wrapped_contract_aliased(
         throw(ArgumentError("wrapped_contract_aliased: pass either `layout` or the old " *
             "preferred_output_labels/output_inds_hint/output_perm keywords, not both"))
     end
+    if layout !== nothing
+        # Roles name the operands as passed (:A = first). Resolve them now, then put the
+        # aliased operand first: the aliased × dense kernel moves indices into the key
+        # only from its second operand. A resolved layout lists Index objects, so the
+        # swap does not change what it means.
+        layout = resolve_layout(layout, A, B)
+        if B isa WrappedAliasedBlockSparse && !(A isa WrappedAliasedBlockSparse)
+            return wrapped_contract_aliased(B, A; preserve_bs_output, in_position,
+                                            emit_window_map, layout)
+        end
+    end
     @timeit TIMER "get_data_info" begin
         Arep   = rep(A)
         Brep   = rep(B)
@@ -909,8 +920,8 @@ function wrapped_contract_aliased(
       if layout !== nothing
         # Requested layout: it IS the output's index order and key/dense split.
         validate_layout(layout, indsA, indsB)
-        indsC  = Tuple(layout_inds(layout))
-        denseC = layout.dense
+        indsC  = Tuple(ITensors.Index[I for I in layout_inds(layout)])
+        denseC = collect(ITensors.Index, layout.dense)
       else
         # Forward the hint to output_inds: it knows how to reorder indsC so
         # sparse-prefix axes come first and dense-tail axes come last, and
