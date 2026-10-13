@@ -489,7 +489,8 @@ function contract(A::ITensors.ITensor, B::ITensors.ITensor,
                   preserve_bs_output::Bool=true,
                   preferred_output_labels::Union{Nothing,AbstractVector}=nothing,
                   output_perm::Union{Nothing,Vector{Int}}=nothing,
-                  emit_window_map::Bool=false)
+                  emit_window_map::Bool=false,
+                  layout::Union{Nothing,OutputLayout}=nothing)
   Cb = to_backend(Cbackend)
   if Cb === ALIASED
     return contract_aliased_itensor(A, B, Abackend, Bbackend;
@@ -497,8 +498,11 @@ function contract(A::ITensors.ITensor, B::ITensors.ITensor,
                                     preserve_bs_output=preserve_bs_output,
                                     preferred_output_labels=preferred_output_labels,
                                     output_perm=output_perm,
-                                    emit_window_map=emit_window_map)
+                                    emit_window_map=emit_window_map,
+                                    layout=layout)
   end
+  layout === nothing || throw(OutputLayoutError(
+      "contract(…, Cbackend=$Cbackend): a layout is only supported for aliased output"))
   return contract(A, B, Abackend, Bbackend;
                   denseLinksA=denseLinksA, denseLinksB=denseLinksB,
                   preserve_bs_output=preserve_bs_output)

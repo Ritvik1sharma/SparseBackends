@@ -141,6 +141,8 @@ export WrappedAliasedBlockSparse, contract_aliased_itensor,
 # dispatch compares the enum.
 @enum Backend DENSE COO BLOCKSPARSE ALIASED
 export Backend, DENSE, COO, BLOCKSPARSE, ALIASED, to_backend
+export OutputLayout, OutputLayoutError, as_dense, validate_layout,
+       dense_from_aliased_operand, preserve_prefix, matvec_dense_layout
 
 @inline to_backend(b::Backend) = b
 @inline function to_backend(s::Symbol)::Backend
@@ -193,10 +195,12 @@ include("ops_factorize_qr.jl")
 # tensor_wrappers.jl (owned-SVD variant never exercised by any script). Uncomment
 # this include + that wrapper + the mps.jl/verify_iso.jl dispatch branches to re-enable.
 # include("ops_factorize_svd_owned.jl")
+include("output_layout.jl")      # OutputLayout: requested output key/dense split + order
 include("tensor_wrappers.jl")
 include("tensor_index.jl")
 include("tensor_contraction.jl")
 include("tensor_wrappers_aliased.jl")   # WrappedAliasedBlockSparse + top-level aliased contract functions
+include("output_layout_builders.jl")  # OutputLayout builders for the known callers
 include("aliased/factorize.jl")         # Aliased-aware factorize (Tier 1: dense SVD + re-aliasify)
 include("core_helpers/factor_core.jl")  # factor-core read_core/write_core_window!/slice_to_template (ψ=P·core)
 
