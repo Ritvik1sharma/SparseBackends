@@ -39,13 +39,16 @@ _role_issite(I) = ITensors.hastags(I, "Site")
 _role_islink(I) = ITensors.hastags(I, "Link")
 
 # kind of each index of `inds` (:l, :r, :s, :sp, or nothing), from the site numbers n=
+# and the site prime levels of this operand (:s = lowest, :sp = highest)
 function _role_kinds(inds)
     ns = [_role_num(I, "n") for I in inds if _role_issite(I)]
     ns = filter(!isnothing, ns)
     nmin, nmax = isempty(ns) ? (nothing, nothing) : (minimum(ns), maximum(ns))
+    pls = [ITensors.plev(I) for I in inds if _role_issite(I)]
+    plo, phi = isempty(pls) ? (0, 0) : (minimum(pls), maximum(pls))
     map(inds) do I
         if _role_issite(I)
-            ITensors.plev(I) == 0 ? :s : ITensors.plev(I) == 1 ? :sp : nothing
+            ITensors.plev(I) == plo ? :s : ITensors.plev(I) == phi ? :sp : nothing
         elseif _role_islink(I) && nmin !== nothing
             j = _role_num(I, "l")
             j === nothing ? nothing : j == nmin - 1 ? :l : j == nmax ? :r : nothing

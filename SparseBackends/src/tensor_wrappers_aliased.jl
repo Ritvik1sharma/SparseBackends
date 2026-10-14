@@ -802,7 +802,7 @@ end
 # NATURAL output labels (labelsC_vec) giving the chosen output order:
 # `canon_labels = labelsC_vec[perm]`. Only the two aliased matvec steps (2,3) hit
 # the ali_dense_path; env steps (1,4) are dense. Deterministic across ALL sweeps
-# because φ is pinned to [:l,:s2,:r,:s] at dmrg phi_build (reorder_to_roles) AND
+# because φ is pinned to [link1, s(b+1), link2, s(b)] at dmrg phi_build AND
 # step 1 runs `env * φ` (swapped) with env pre-ordered [ket,dense-H,fused,bra] by
 # _permute_env_to_canonical!, so step-1 emits T1 in "Layout C". `ndims` is fixed by
 # bondtype (leg count is bd-independent), so (bondtype, step) is a sufficient key.
