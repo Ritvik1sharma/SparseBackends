@@ -143,18 +143,64 @@ _same(X::ITensor, Y::ITensor; atol=1e-12) =
         @test_throws OutputLayoutError wrapped_contract_aliased(Gw, Psw; preserve_bs_output=true,
             layout=OutputLayout(sparse=[(:B,:l,1), (:B,:r,1), (:A,:sp)],
                                 dense =[(:B,:l,2), (:B,:r,2), (:A,:l), (:A,:r)]))
-        # COO × dense: a dense index of H in the key is not supported yet
-        @test_throws OutputLayoutError SparseBackends.contract(P, H, :coo, :dense, :aliased;
-            layout=OutputLayout(sparse=[s, p, t], dense=[h]))
-        # COO × aliased: C's dense block must be B's dense block in B's order
+        # COO × aliased, contracted index in B's key: any dense order, dense indices of B
+        # moved into the key at any position (checked against plain ITensors)
         w  = Index(2, "Site,n=2,W")
-        Qz = zeros(2, 2); Qz[1,2] = 1; Qz[2,1] = 1
+        Qz = zeros(2, 2); Qz[1,2] = 1; Qz[2,1] = 1; Qz[2,2] = 0.5
         Q  = ITensor(Qz, w, z)
-        Cq = SparseBackends.contract(Q, Ps, :coo, :aliased, :aliased)    # stock order works
-        @test _same(_as_dense(ITensors.get_external_storage(Cq)), Q * ITensor(SparseBackends.to_dense(Psw.aliased), Psw.inds...))
+        Psd = ITensor(SparseBackends.to_dense(Psw.aliased), Psw.inds...)
+        refQ = Q * Psd
+        for (sp, de) in (([w, pl, pr], [cl, cr]), ([w, pl, pr], [cr, cl]),
+                         ([w, pl, pr, cl], [cr]), ([w, cr, pl, pr], [cl]),
+                         ([cl, w, pl, pr, cr], ITensors.Index[]))
+            Cq = SparseBackends.contract(Q, Ps, :coo, :aliased, :aliased;
+                                         layout=OutputLayout(sparse=sp, dense=de))
+            Cqw = ITensors.get_external_storage(Cq)
+            @test collect(Cqw.inds) == vcat(sp, de)
+            @test _same(_as_dense(Cqw), refQ)
+        end
+        # contracted index in B's dense block (core link cl)
+        y  = Index(3, "Site,n=3,Y")
+        Q2 = ITensor(Float64[i == j || (i, j) == (1, 3) ? 1.0 : 0.0 for i in 1:3, j in 1:3], y, cl)
+        ref2 = Q2 * Psd
+        for (sp, de) in (([y, z, pl, pr], [cr]), ([y, z, pl, pr, cr], ITensors.Index[]),
+                         ([cr, z, y, pl, pr], ITensors.Index[]))
+            C2 = SparseBackends.contract(Q2, Ps, :coo, :aliased, :aliased;
+                                         layout=OutputLayout(sparse=sp, dense=de))
+            C2w = ITensors.get_external_storage(C2)
+            @test collect(C2w.inds) == vcat(sp, de)
+            @test _same(_as_dense(C2w), ref2)
+        end
+        # an index of A in the dense block is an error
         @test_throws OutputLayoutError SparseBackends.contract(Q, Ps, :coo, :aliased, :aliased;
-            layout=OutputLayout(sparse=[w, pl, pr], dense=[cr, cl]))
+            layout=OutputLayout(sparse=[pl, pr], dense=[w, cl, cr]))
         # matvec table entries that do not fit the contraction are errors
         @test_throws OutputLayoutError SparseBackends.matvec_dense_layout(:left, 3, A, B)
+    end
+
+    @testset "COO × dense: dense indices moved into the key" begin
+        refPH = P * H                                      # plain ITensors reference
+        A0w = ITensors.get_external_storage(A)             # stock: key (s, p), dense (t, h)
+        for (sp, de) in (([s, p, t], [h]), ([s, t, p], [h]), ([t, s, p], [h]),
+                         ([s, p, t, h], ITensors.Index[]), ([s, p, h], [t]))
+            C  = SparseBackends.contract(P, H, :coo, :dense, :aliased;
+                                         layout=OutputLayout(sparse=sp, dense=de))
+            Cw = ITensors.get_external_storage(C)
+            @test collect(Cw.inds) == vcat(sp, de)
+            @test _same(_as_dense(Cw), refPH)
+            # every stock template is split by the moved values (aliasing kept per (rv, m))
+            Mprod = prod(dim.(setdiff(sp, [s, p])); init=1)
+            @test Cw.aliased.n_templates == A0w.aliased.n_templates * Mprod
+            @test isempty(Cw.aliased.slice_to_template)    # factor-core map absent when split
+        end
+        # no moved index: identical to the stock call
+        Cs = SparseBackends.contract(P, H, :coo, :dense, :aliased;
+                                     layout=OutputLayout(sparse=[s, p], dense=[t, h]))
+        Csw = ITensors.get_external_storage(Cs)
+        @test Csw.aliased.keys == A0w.aliased.keys && Csw.aliased.templates == A0w.aliased.templates
+        @test Csw.aliased.slice_to_template == A0w.aliased.slice_to_template
+        # a COO index in the dense block is still an error
+        @test_throws OutputLayoutError SparseBackends.contract(P, H, :coo, :dense, :aliased;
+            layout=OutputLayout(sparse=[p], dense=[s, t, h]))
     end
 end
