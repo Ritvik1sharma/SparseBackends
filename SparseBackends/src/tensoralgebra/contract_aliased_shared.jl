@@ -84,51 +84,6 @@ end
 end
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Fission fallback helper (used by both Dense and AliasedBS overloads)
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Fission fallback: when output_inds_hint pushes B labels into C's prefix
-# (which the aliased kernel doesn't yet support natively), delegate the
-# contract to the BS path (which DOES implement hint+fission), then
-# trivially re-aliasify the BS result (one template per block).
-#
-# Loses alias compression for this single contract step but preserves C's
-# requested axis classification, so subsequent contracts in the matvec
-# chain don't see cross-region label mismatches.
-function _aliased_shared_via_bs_fission!(
-    C             :: AliasedBlockSparse{TC,NC,N2C,PC},
-    labelsC       :: AbstractVector,
-    A             :: AliasedBlockSparse{TA,NA,N2A,PA},
-    labelsA       :: AbstractVector,
-    B,
-    labelsB       :: AbstractVector,
-    mapA          :: Dict,
-    mapB          :: Dict,
-    shared_labels :: Vector;
-    output_inds_hint=nothing,
-    allowed_keys_C=nothing,
-) where {TC,NC,N2C,PC,TA,NA,N2A,PA}
-    A_bs = to_blocksparse(A)
-    # If B is also aliased, demote it too.
-    B_bs = (B isa AliasedBlockSparse) ? to_blocksparse(B) : B
-    Kt = eltype(eltype(A_bs.keys))
-    C_bs = NewBlockSparseSorted{TC,NC,N2C,PC,Kt}(C.dims, C.blksize,
-        NTuple{PC,Kt}[], Int[], TC[])
-    contract!(C_bs, labelsC, A_bs, labelsA, B_bs, labelsB;
-        output_inds_hint=output_inds_hint, allowed_keys_C=allowed_keys_C)
-    # Re-aliasify: one template per non-empty block (trivial alias, no
-    # compression). Compression can be recovered by a later optimization.
-    nb = length(C_bs.keys)
-    C.dims    = C_bs.dims
-    C.blksize = C_bs.blksize
-    C.templates = copy(C_bs.data)   # fresh exact-size copy
-    C.n_templates = nb
-    empty!(C.keys);      append!(C.keys, C_bs.keys)
-    empty!(C.alias_ids); append!(C.alias_ids, _alias_id_range(eltype(C.alias_ids), nb))
-    empty!(C.scalars);   append!(C.scalars, ones(TC, nb))
-    return C
-end
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -161,8 +116,6 @@ function contract_shared!(
     mapA          :: Dict,
     mapB          :: Dict,
     shared_labels :: Vector;
-    output_inds_hint::Union{Nothing,AbstractSet}=nothing,
-    allowed_keys_C=nothing,
     emit_window_map::Bool=false,
 ) where {TC,NC,N2C,PC,TA,NA,N2A,PA,TB,NB,N2B,PB}
 
@@ -193,8 +146,8 @@ function contract_shared!(
         elseif (!a_pref) && (!b_pref)
             push!(shared_dense, lab)
         else
-            error("shared label $lab crosses prefix/dense boundary " *
-                  "(A pos=$a_pos PA=$PA, B pos=$b_pos PB=$PB); not supported")
+            _layout_error("aliased × aliased", "shared label $lab is in one operand's key " *
+                  "and the other's dense block (A pos=$a_pos PA=$PA, B pos=$b_pos PB=$PB)")
         end
     end
 
@@ -209,24 +162,13 @@ function contract_shared!(
 
     Cdense = labelsC[PC+1:NC]
     mode, desired_keepA, desired_keepB = _cdense_grouping_and_orders(Cdense, keepA0, keepB0)
-    mode == :interleaved &&
-        error("Cdense interleaves A/B kept dims; unsupported — reorder C labels so A-kept and B-kept form contiguous groups")
-
-    # Fission fallback (same as Aliased × Dense branch above) — delegate to
-    # BS contract when hint moves labels into C's prefix.
-    has_hint = output_inds_hint !== nothing || allowed_keys_C !== nothing
-    actually_needs_fission = has_hint &&
-        (length(desired_keepA) != length(keepA0) ||
-         length(desired_keepB) != length(keepB0) ||
-         allowed_keys_C !== nothing)
-    if actually_needs_fission
-        return _aliased_shared_via_bs_fission!(C, labelsC, A, labelsA, B, labelsB,
-            mapA, mapB, shared_labels;
-            output_inds_hint=output_inds_hint, allowed_keys_C=allowed_keys_C)
-    end
-
-    @assert length(desired_keepA) == length(keepA0) && Set(desired_keepA) == Set(keepA0)
-    @assert length(desired_keepB) == length(keepB0) && Set(desired_keepB) == Set(keepB0)
+    mode == :interleaved && _layout_error("aliased × aliased",
+        "C's dense block interleaves A's and B's indices; list them as two groups")
+    # Moving a dense index into C's key (fission) is not implemented here.
+    (length(desired_keepA) == length(keepA0) && Set(desired_keepA) == Set(keepA0) &&
+     length(desired_keepB) == length(keepB0) && Set(desired_keepB) == Set(keepB0)) ||
+        _layout_error("aliased × aliased", "C's dense block must hold every uncontracted " *
+            "dense index of A and B; moving a dense index into the key is not supported")
 
     
     # ── 3) Permute A and B ────────────────────────────────────────────────────
@@ -427,12 +369,9 @@ function contract_shared!(
     labelsB       :: AbstractVector,
     mapA          :: Dict,
     mapB          :: Dict,
-    shared_labels :: Vector;
-    output_inds_hint::Union{Nothing,AbstractSet}=nothing,
-    allowed_keys_C=nothing,
+    shared_labels :: Vector,
 ) where {TC,NC,N2C,PC,TA,NA,TB,NB,N2B,PB}
-    return contract_shared!(C, labelsC, B, labelsB, A, labelsA, mapB, mapA, shared_labels;
-                            output_inds_hint=output_inds_hint, allowed_keys_C=allowed_keys_C)
+    return contract_shared!(C, labelsC, B, labelsB, A, labelsA, mapB, mapA, shared_labels)
 end
 
 # AliasedBS × AliasedBS → AliasedBS  (single shared label)

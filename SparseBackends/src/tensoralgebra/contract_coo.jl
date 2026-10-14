@@ -193,9 +193,7 @@ function contract_shared!(
     labelsB::Vector{Label},
     mapA::Dict{Label,Int},
     mapB::Dict{Label,Int},
-    shared::AbstractVector{Label};
-    output_inds_hint=nothing,   # COO ignores index-order hints
-    allowed_keys_C=nothing,     # not used on the COO path
+    shared::AbstractVector{Label},
 ) where {TC,NC,TA,NA,TB,NB}
   if false  # SB_TRACE — flip to true here for debug output
     println("[SB_TRACE] contract_coo.contract_shared!  COO(nnz=", length(A.keys),

@@ -9,6 +9,9 @@ function aligned_A_to_Cprefix(A::COOTensor{TA,NA},
                               rlab::Label) where {TA,NA}
   desired = vcat(labelsC[1:PC], rlab)
   mapA = Dict(labelsA[i] => i for i in eachindex(labelsA))
+  all(lab -> haskey(mapA, lab), desired) && length(desired) == length(labelsA) ||
+    _layout_error("COO × dense", "C's key must be exactly the COO operand's uncontracted " *
+        "indices (moving a dense index into the key is not supported yet)")
   perm = [mapA[lab] for lab in desired]   # new axes -> old axes
   A2 = permutedims(A, perm)               # <-- NON-mutating version
   labelsA2 = copy(desired)

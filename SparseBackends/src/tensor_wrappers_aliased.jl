@@ -620,14 +620,11 @@ const _DENSIFY_DOT_HITS = Ref(0)
 const _RECAST_DBG       = false      # flip to true to enable recast perm dumps (was SB_RECAST_DBG)
 const _RECAST_DBG_N     = Ref(0)     # one-shot recast perm dump counter, budgeted to 6
 const _RECAST_PERMUTE_HITS = Ref(0)  # # of actual (non-identity) recast permutedims calls
-const _ALIGN_OK         = Ref(0)     # SB_ALIASED_ALIGN_OUTPUT: native emitted aligned output
-const _ALIGN_FALLBACK   = Ref(0)     # align attempted but kernel couldn't honor it → default order
-const _ALIGN_DBG_N      = Ref(0)     # SB_ALIASED_ALIGN_DBG: one-shot fallback-exception dump
 const _DOT_CHECK_MAXABS = Ref(0.0)   # SB_ALIASED_DOT_CHECK: max ABSOLUTE |native−dense| per dot
 const _DOT_CHECK_MAXMAG = Ref(0.0)   # |dense| at the worst-abs dot (context for the abs error)
 reset_dot_hits!() = (_NATIVE_DOT_HITS[] = 0; _DENSIFY_DOT_HITS[] = 0;
                      _DOT_CHECK_MAXABS[] = 0.0; _DOT_CHECK_MAXMAG[] = 0.0;
-                     _RECAST_PERMUTE_HITS[] = 0; _ALIGN_OK[] = 0; _ALIGN_FALLBACK[] = 0)
+                     _RECAST_PERMUTE_HITS[] = 0)
 
 # schema_dbg: print the aliased P-classification (sparse keys vs dense tail) of
 # a tensor at a labelled point, to trace WHERE the constructed schema (e.g. P=3:
@@ -801,42 +798,6 @@ function _aliased_lean_scalar_dot(A::AliasedBlockSparse{TA,NA,N2A,PA},
     return s
 end
 
-# #recast-kill: reorder output indices to a desired order (the template's ordered
-# inds) while PRESERVING the sparse-prefix / dense-tail split. Returns a perm
-# `ord` (ord[i] = position in `inds` of the axis that belongs at output position
-# i) or `nothing` if `preferred` doesn't cover `inds` exactly or would cross the
-# prefix/dense boundary. Used to make the native contract emit aligned output so
-# the downstream align_aliased_axes becomes a no-op.
-# Match by id+dim, IGNORING plev: the contract output is aligned pre-replaceprime,
-# where Link axes are still primed (plev=1) relative to the unprimed template;
-# the subsequent replaceprime(1=>0) only flips plev (preserving id), so id+dim
-# matching maps the pre-replaceprime output order onto the template order.
-_ind_match_pref(I::ITensors.Index, p::ITensors.Index) =
-    (ITensors.id(I) == ITensors.id(p) && ITensors.dim(I) == ITensors.dim(p))
-_ind_match_pref(I::ITensors.Index, p) = (label_key_for_ind(I) == p)
-function _align_output_order(inds, denseLinks::Int, preferred)
-    N = length(inds)
-    length(preferred) == N || return nothing
-    Pc = N - denseLinks
-    ord = Vector{Int}(undef, N)
-    used = fill(false, N)
-    @inbounds for i in 1:N
-        p = preferred[i]; j = 0
-        for k in 1:N
-            if !used[k] && _ind_match_pref(inds[k], p); j = k; break; end
-        end
-        j == 0 && return nothing
-        ((i <= Pc) == (j <= Pc)) || return nothing   # keep prefix/dense split
-        ord[i] = j; used[j] = true
-    end
-    all(i -> ord[i] == i, 1:N) && return nothing       # already aligned; no-op
-    return ord
-end
-
-# (Removed STATIC_OUTPUT_PERM + static_output_perm — the aliased-ψ (Path-B) matvec
-# output-order table. Path-B was pruned; the dense-ψ × aliased-H matvec uses
-# STATIC_OUTPUT_PERM_DENSE below.)
-
 # Dense-ψ × aliased-H matvec output-order table. Value = perm of the kernel's
 # NATURAL output labels (labelsC_vec) giving the chosen output order:
 # `canon_labels = labelsC_vec[perm]`. Only the two aliased matvec steps (2,3) hit
@@ -869,7 +830,7 @@ end
 #                 -> T3(sa¹,l1²¹,sb¹)                     [permB: keepB{sa¹,l1²¹} split by sb⁰]
 # So the ground strided read fires at (bulk,2) and (right,2); the rest permute
 # (the (·,3) fires are the intrinsic forced 2→3 transpose; (left,2) is edge geometry).
-const STATIC_OUTPUT_PERM_DENSE = Dict{Tuple{Symbol,Int}, Vector{Int}}(
+const _STATIC_OUTPUT_PERM_DENSE = Dict{Tuple{Symbol,Int}, Vector{Int}}(
     (:bulk,  2) => [3, 1, 5, 6, 4, 2],   # -> T2(l2⁴¹,s2¹,s3⁰,l3⁰,l1³¹,F2)
     (:bulk,  3) => [4, 5, 6, 3, 1, 2],   # -> T3(s2¹,l3⁰,l1³¹,l3⁴¹,s3¹,F3)
     (:left,  2) => [3, 1, 5, 4, 2],      # -> T2(l1⁴¹,s2¹,s1⁰,l2²¹,F1)
@@ -877,32 +838,25 @@ const STATIC_OUTPUT_PERM_DENSE = Dict{Tuple{Symbol,Int}, Vector{Int}}(
     (:right, 2) => [3, 1, 5, 4, 2],      # -> T2(l2⁴¹,sa¹,sb⁰,l1²¹,F2)
     (:right, 3) => [2, 3, 1],            # -> T3(sa¹,l1²¹,sb¹)
 )
-static_output_perm_dense(bondtype::Symbol, step::Int)::Union{Nothing,Vector{Int}} =
-    get(STATIC_OUTPUT_PERM_DENSE, (bondtype, step), nothing)
+# Private: read only by matvec_dense_layout (output_layout_builders.jl).
+_static_output_perm_dense(bondtype::Symbol, step::Int)::Union{Nothing,Vector{Int}} =
+    get(_STATIC_OUTPUT_PERM_DENSE, (bondtype, step), nothing)
 
 function wrapped_contract_aliased(
     A :: WrappedTensorTypes{TA,NA},
     B :: WrappedTensorTypes{TB,NB};
     preserve_bs_output::Bool=false,
-    preferred_output_labels::Union{Nothing,AbstractVector}=nothing,
-    output_inds_hint::Union{Nothing,AbstractSet}=nothing,
-    output_perm::Union{Nothing,Vector{Int}}=nothing,
     in_position::Bool=false,
     emit_window_map::Bool=false,
     layout::Union{Nothing,OutputLayout}=nothing,
 ) where {TA,TB,NA,NB}
-    if layout !== nothing && (preferred_output_labels !== nothing ||
-                              output_inds_hint !== nothing || output_perm !== nothing)
-        throw(ArgumentError("wrapped_contract_aliased: pass either `layout` or the old " *
-            "preferred_output_labels/output_inds_hint/output_perm keywords, not both"))
-    end
     if layout !== nothing
-        # Roles name the operands as passed (:A = first). Resolve them now, then put the
-        # aliased operand first: the aliased × dense kernel moves indices into the key
-        # only from its second operand. A resolved layout lists Index objects, so the
-        # swap does not change what it means.
+        # Roles name the operands as passed (:A = first). Resolve them now; then, for
+        # dense × aliased, put the aliased operand first: the aliased × dense kernel
+        # moves indices into the key only from its second operand. A resolved layout
+        # lists Index objects, so the swap does not change what it means.
         layout = resolve_layout(layout, A, B)
-        if B isa WrappedAliasedBlockSparse && !(A isa WrappedAliasedBlockSparse)
+        if B isa WrappedAliasedBlockSparse && A isa WrappedTensor
             return wrapped_contract_aliased(B, A; preserve_bs_output, in_position,
                                             emit_window_map, layout)
         end
@@ -923,36 +877,9 @@ function wrapped_contract_aliased(
         indsC  = Tuple(ITensors.Index[I for I in layout_inds(layout)])
         denseC = collect(ITensors.Index, layout.dense)
       else
-        # Forward the hint to output_inds: it knows how to reorder indsC so
-        # sparse-prefix axes come first and dense-tail axes come last, and
-        # how to classify hint-marked axes as dense.
-        indsC, denseC = output_inds(indsA, indsB, denseA, denseB;
-            output_inds_hint=output_inds_hint)
-        # Caller-controlled output ordering for the ALIASED-output path.
-        # output_inds emits a fixed bucket order
-        #   [sparse_nonlink, moved_dense_links, sparse_link, dense_tail]
-        # which has no slot for a sparse NON-LINK axis after the sparse links. The
-        # MPO x MPS case needs exactly that: the gate's site index s' must sit in the
-        # LAST prefix slot, because contract_aliased.jl maps C prefix slots
-        # PC+1-n_fission .. PC onto B's fission axes. Left first, it throws
-        # "fission axes count mismatch".
-        #
-        # This mirrors what output_perm already does on the aliased -> DENSE (matvec)
-        # path; that hook was never wired into this branch. nothing => untouched, so
-        # every existing caller (DMRG/PHP) keeps the historical layout.
-        if preferred_output_labels !== nothing
-            want = first(preferred_output_labels) isa ITensors.Index ?
-                   collect(preferred_output_labels) : nothing
-            if want !== nothing && length(want) == length(indsC) &&
-               Set(ITensors.id.(want)) == Set(ITensors.id.(indsC))
-                # Dense-tail axes must stay last, or the prefix/tail split breaks.
-                dset = Set(ITensors.id(I) for I in denseC)
-                ntail = count(I -> ITensors.id(I) in dset, want)
-                if all(I -> ITensors.id(I) in dset, want[(end - ntail + 1):end])
-                    indsC = Tuple(want)
-                end
-            end
-        end
+        # Stock layout: the key/dense split is inherited from the operands, the order
+        # is output_inds' fixed grouping.
+        indsC, denseC = output_inds(indsA, indsB, denseA, denseB)
       end
         dimsC  = ntuple(i -> ITensors.dim(indsC[i]), length(indsC))
         TC     = promote_type(eltype(Arep), eltype(Brep))
@@ -1046,47 +973,18 @@ function wrapped_contract_aliased(
 
                 @timeit TIMER "ali_dense_prep_labels" begin
                     label_to_ind = Dict(l => indsC[mapC_local[l]] for l in labelsC_vec)
-                    # Canonical-C ordering selection (priority order):
-                    #   1. Caller-provided `preferred_output_labels` — explicit hint.
-                    #   2. Link-fusion heuristic (the permanent fallback) — data-driven
-                    #      order so the NEXT sparse-H × dense kernel sees its B input as
-                    #      [red_dense, keepB, shared_prefix] with permB = identity.
-                    #      Mapping (from SB_PERMB_DBG diagnosis):
-                    #        upstream's b_other   → next call's red_dense
-                    #        upstream's keepA     → next call's keepB
-                    #        upstream's b_to_next → next call's keepB
-                    #        upstream's c_prefix  → next call's shared_prefix
-                    #      So the right canonical order is
-                    #        [b_other, keepA_labs, b_to_next, c_prefix_labs].
-                    # Priority 0: the hardcoded dense-ψ table (`output_perm`), passed by
-                    # the matvec via static_output_perm_dense(bondtype, step). φ is pinned
-                    # upstream (reorder_to_roles) so labelsC_vec is deterministic every
-                    # sweep, making this a pure lookup: canon_labels = labelsC_vec[perm].
-                    # This RETIRES _canon_labels_for_next on the dense path. Non-matvec
-                    # callers (e.g. MPO build) pass no output_perm → fall through to the
-                    # preferred/heuristic branches below (unchanged).
+                    # Output order: the requested layout if given; otherwise this path's
+                    # stock order, the link-fusion heuristic: the order the NEXT sparse-H ×
+                    # dense kernel wants for its B input ([red_dense, keepB, shared_prefix]
+                    # with permB = identity):
+                    #   upstream's b_other   → next call's red_dense
+                    #   upstream's keepA     → next call's keepB
+                    #   upstream's b_to_next → next call's keepB
+                    #   upstream's c_prefix  → next call's shared_prefix
+                    # i.e. [b_other, keepA_labs, b_to_next, c_prefix_labs].
                     if layout !== nothing
                         canon_labels = collect(labelsC_vec)   # the requested order
-                    elseif output_perm !== nothing && length(output_perm) == length(labelsC_vec)
-                        canon_labels = [labelsC_vec[output_perm[i]] for i in 1:length(labelsC_vec)]
-                    elseif preferred_output_labels !== nothing
-                        # Accept either Vector{Index} (natural for callers) or the
-                        # internal label tuple format. Convert as needed.
-                        canon_labels = if !isempty(preferred_output_labels) &&
-                                        first(preferred_output_labels) isa ITensors.Index
-                            [label_key_for_ind(I) for I in preferred_output_labels]
-                        else
-                            collect(preferred_output_labels)
-                        end
                     else
-                        # Fallback when no explicit next_op / preferred order is given
-                        # (e.g. the last step in a chain, or a non-aliased next op):
-                        # link-fusion-aware heuristic that puts the axis the NEXT
-                        # sparse-H × dense kernel will keep on its B-site (non-Link,
-                        # plev 0) in the keepB slot, so its permB stays identity.
-                        # Formerly gated by SB_FUSE_LINKS; now the permanent default
-                        # (the precise `next_op` branch above supersedes it whenever
-                        # the next operator is known).
                         is_b_site_to_next(l) = begin
                             I = label_to_ind[l]
                             ts = string(ITensors.tags(I))
@@ -1232,73 +1130,10 @@ function wrapped_contract_aliased(
             println("[SB_ALIASED_TRACE wrapped_contract_aliased] preserve_bs_output=$preserve_bs_output  A=", string(typeof(Arep)), "  B=", string(typeof(Brep)),
                 "  N_C=$(length(indsC))  N2_C=$denseLinksC  P_C=$(length(indsC)-denseLinksC)")
         end
-        # Forward output_inds_hint so the inner kernel can trigger its
-        # fission path (for aliased kernels: my _aliased_shared_via_bs_fission!;
-        # for BS kernels: _contract_shared_hint!).
-        if layout !== nothing
-            # Requested layout: build C directly in it. The kernels only test whether a
-            # hint is present (it selects the path that can move an index into the key);
-            # its contents are not read.
-            C = WrappedAliasedBlockSparse(TC, dimsC, denseLinksC, indsC)
-            C.aliased = contract!(
-                C.aliased, labelsC_vec,
-                Arep, labelsA_vec,
-                Brep, labelsB_vec;
-                output_inds_hint=Set(label_key_for_ind(I) for I in layout.dense),
-            )
-            return C
-        end
-        hint_labels = output_inds_hint === nothing ? nothing :
-            Set(label_key_for_ind(I) for I in output_inds_hint)
-        # #recast-kill (gated SB_ALIASED_ALIGN_OUTPUT): emit the output already in
-        # the template's axis order so the downstream align_aliased_axes is
-        # a no-op. Reorders indsC/labelsC_vec within the prefix and dense blocks,
-        # then lets contract! write in that order.
-        # try/catch: if the kernel can't
-        # produce that order (e.g. interleaved A/B kept dims), fall back to the
-        # default order (recast still fixes it ⇒ correctness preserved).
-        # Output ordering, in priority:
-        #   1. explicit caller preferred_output_labels (recast-align),
-        #   2. the caller's `output_perm` (static table by (bond-type, step)).
-        # The chosen order is emitted by the kernel via _align_output_order (+ lmap for
-        # interleaved layouts), making the NEXT step's permA the identity.
-        _pref_align = preferred_output_labels
-        if _pref_align === nothing && output_perm !== nothing &&
-           length(output_perm) == length(indsC)
-            _pref_align = indsC[output_perm]
-        end
-        if _pref_align !== nothing
-            ord = _align_output_order(indsC, denseLinksC, _pref_align)
-            if ord !== nothing
-                try
-                    indsC2  = ntuple(i -> indsC[ord[i]], length(indsC))
-                    dimsC2  = ntuple(i -> ITensors.dim(indsC2[i]), length(indsC2))
-                    labelsC2 = [labelsC_vec[ord[i]] for i in 1:length(labelsC_vec)]
-                    Cc = WrappedAliasedBlockSparse(TC, dimsC2, denseLinksC, indsC2)
-                    Cc.aliased = contract!(Cc.aliased, labelsC2, Arep, labelsA_vec,
-                                           Brep, labelsB_vec; output_inds_hint=hint_labels)
-                    _ALIGN_OK[] += 1
-                    return Cc
-                catch e
-                    _ALIGN_FALLBACK[] += 1   # kernel couldn't honor order; default below
-                    if false && _ALIGN_DBG_N[] < 4  # SB_ALIASED_ALIGN_DBG removed 2026-06 — flip to true here for debug output
-                        _ALIGN_DBG_N[] += 1
-                        _tg(I) = (ITensors.dim(I), string(ITensors.tags(I)), ITensors.plev(I))
-                        println("[ALIGN FALLBACK #", _ALIGN_DBG_N[], "] Pc=", length(indsC)-denseLinksC,
-                                " ord=", ord, "\n   ERROR: ", sprint(showerror, e),
-                                "\n   indsC(default)=", [_tg(I) for I in indsC],
-                                "\n   preferred     =", [_tg(I) for I in _pref_align])
-                    end
-                end
-            end
-        end
+        # The kernel reads labelsC: indices of an operand's dense block that are listed
+        # in C's key are moved into it ("fission"); a request it cannot honour throws.
         C = WrappedAliasedBlockSparse(TC, dimsC, denseLinksC, indsC)
-        C.aliased = contract!(
-            C.aliased, labelsC_vec,
-            Arep, labelsA_vec,
-            Brep, labelsB_vec;
-            output_inds_hint=hint_labels,
-        )
+        C.aliased = contract!(C.aliased, labelsC_vec, Arep, labelsA_vec, Brep, labelsB_vec)
     end
     return C
 end
@@ -1313,41 +1148,23 @@ end
 
 function contract(A::WrappedAliasedBlockSparse, B::WrappedTensorTypes;
                   preserve_bs_output::Bool=false,
-                  preferred_output_labels::Union{Nothing,AbstractVector}=nothing,
-                  output_inds_hint::Union{Nothing,AbstractSet}=nothing,
-                  output_perm::Union{Nothing,Vector{Int}}=nothing,
                   in_position::Bool=false,
-                  layout::Union{Nothing,OutputLayout}=nothing,
-                  kwargs...)
-    return wrapped_contract_aliased(A, B; preserve_bs_output, preferred_output_labels,
-                                    output_inds_hint=output_inds_hint, output_perm=output_perm,
-                                    in_position=in_position, layout=layout)
+                  layout::Union{Nothing,OutputLayout}=nothing)
+    return wrapped_contract_aliased(A, B; preserve_bs_output, in_position, layout)
 end
 
 function contract(A::WrappedTensorTypes, B::WrappedAliasedBlockSparse;
                   preserve_bs_output::Bool=false,
-                  preferred_output_labels::Union{Nothing,AbstractVector}=nothing,
-                  output_inds_hint::Union{Nothing,AbstractSet}=nothing,
-                  output_perm::Union{Nothing,Vector{Int}}=nothing,
                   in_position::Bool=false,
-                  layout::Union{Nothing,OutputLayout}=nothing,
-                  kwargs...)
-    return wrapped_contract_aliased(A, B; preserve_bs_output, preferred_output_labels,
-                                    output_inds_hint=output_inds_hint, output_perm=output_perm,
-                                    in_position=in_position, layout=layout)
+                  layout::Union{Nothing,OutputLayout}=nothing)
+    return wrapped_contract_aliased(A, B; preserve_bs_output, in_position, layout)
 end
 
 function contract(A::WrappedAliasedBlockSparse, B::WrappedAliasedBlockSparse;
                   preserve_bs_output::Bool=false,
-                  preferred_output_labels::Union{Nothing,AbstractVector}=nothing,
-                  output_inds_hint::Union{Nothing,AbstractSet}=nothing,
-                  output_perm::Union{Nothing,Vector{Int}}=nothing,
                   in_position::Bool=false,
-                  layout::Union{Nothing,OutputLayout}=nothing,
-                  kwargs...)
-    return wrapped_contract_aliased(A, B; preserve_bs_output, preferred_output_labels,
-                                    output_inds_hint=output_inds_hint, output_perm=output_perm,
-                                    in_position=in_position, layout=layout)
+                  layout::Union{Nothing,OutputLayout}=nothing)
+    return wrapped_contract_aliased(A, B; preserve_bs_output, in_position, layout)
 end
 
 """
@@ -1373,8 +1190,6 @@ function contract_aliased_itensor(
     denseLinksA :: Union{Nothing,Int} = nothing,
     denseLinksB :: Union{Nothing,Int} = nothing,
     preserve_bs_output :: Bool = true,
-    preferred_output_labels :: Union{Nothing,AbstractVector} = nothing,
-    output_perm :: Union{Nothing,Vector{Int}} = nothing,
     emit_window_map :: Bool = false,
     layout :: Union{Nothing,OutputLayout} = nothing,
 )
@@ -1401,7 +1216,7 @@ function contract_aliased_itensor(
     end
 
     @timeit TIMER "wrapped_contract_aliased_call" begin
-        Cw = wrapped_contract_aliased(Aw, Bw; preserve_bs_output, preferred_output_labels, output_perm, emit_window_map, layout)
+        Cw = wrapped_contract_aliased(Aw, Bw; preserve_bs_output, emit_window_map, layout)
     end
     @timeit TIMER "wrap_output" begin
         Cw isa ITensors.ITensor && return Cw   # P_C = 0

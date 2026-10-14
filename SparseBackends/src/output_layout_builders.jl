@@ -1,8 +1,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# OutputLayout builders for the known callers. Each returns exactly the layout the
-# caller's old keyword arguments produced inside wrapped_contract_aliased, so moving
-# a caller from the old keywords to `layout=` changes no result.
-# (Included after tensor_wrappers.jl, tensor_contraction.jl, tensor_wrappers_aliased.jl.)
+# OutputLayout builders for the known callers, and role resolution (resolve_layout,
+# show_roles). (Included after tensor_wrappers.jl, tensor_contraction.jl,
+# tensor_wrappers_aliased.jl.)
 # ─────────────────────────────────────────────────────────────────────────────
 
 """
@@ -11,7 +10,8 @@
 Layout used by the DMRG environment/matvec products (`_mul_preserve_aliased`) and
 `mul_aliased`: the dense block holds only the aliased operand(s)' dense indices; every
 other output index (e.g. the dense operand's site/link indices) goes in the key.
-Same as passing `output_inds_hint = dense_inds(aliased operand(s))`.
+An output index is dense iff its id is one of those dense indices (matched by id,
+ignoring prime level).
 """
 function dense_from_aliased_operand(Aw::WrappedTensorTypes, Bw::WrappedTensorTypes)
     a_ali = Aw isa WrappedAliasedBlockSparse
@@ -22,7 +22,7 @@ function dense_from_aliased_operand(Aw::WrappedTensorTypes, Bw::WrappedTensorTyp
     a_ali && union!(hint, dense_inds(Aw))
     b_ali && union!(hint, dense_inds(Bw))
     indsC, denseC = output_inds(Aw.inds, Bw.inds, dense_inds(Aw), dense_inds(Bw);
-                                output_inds_hint=hint)
+                                dense_ids=hint)
     return _layout_from_output_inds(indsC, denseC)
 end
 
@@ -134,19 +134,20 @@ show_roles(T; as::Symbol=:A) = show_roles(stdout, T; as=as)
     matvec_dense_layout(bondtype, step, A, B) -> Union{Nothing,OutputLayout}
 
 Fixed, per-position output order for the DMRG dense-ψ × aliased-H matvec (steps 2 and 3;
-bond type `:left`, `:bulk` or `:right`), taken from the precomputed table
-`STATIC_OUTPUT_PERM_DENSE`. `A` is the aliased operator site, `B` the dense
-intermediate, as in the matvec call. Returns `nothing` where the table has no entry
-(steps 1 and 4), which means the stock order. Same as the old
-`output_perm = static_output_perm_dense(bondtype, step)`.
+bond type `:left`, `:bulk` or `:right`), from the precomputed table
+`_STATIC_OUTPUT_PERM_DENSE` (a permutation of the stock output order). `A` is the
+aliased operator site, `B` the dense intermediate, as in the matvec call. Returns
+`nothing` where the table has no entry (steps 1 and 4), meaning the stock order.
+Throws `OutputLayoutError` if the entry does not fit this contraction.
 """
 function matvec_dense_layout(bondtype::Symbol, step::Int, A::ITensors.ITensor, B::ITensors.ITensor)
-    perm = static_output_perm_dense(bondtype, step)
+    perm = _static_output_perm_dense(bondtype, step)
     perm === nothing && return nothing
     Aw = wrap_itensor_aliased(A)
     Bw = wrap_itensor(B; backend=:dense)
     indsC, _ = output_inds(Aw.inds, Bw.inds, dense_inds(Aw), dense_inds(Bw))
-    # the old output_perm was only applied when its length matched (stock order otherwise)
-    length(perm) == length(indsC) || return nothing
+    length(perm) == length(indsC) || throw(OutputLayoutError(
+        "matvec_dense_layout($bondtype, $step): table entry has $(length(perm)) positions, " *
+        "the output has $(length(indsC)) indices"))
     return OutputLayout(ITensors.Index[], collect(ITensors.Index, indsC)[perm])
 end

@@ -60,6 +60,10 @@ function contract_prefix!(
     rlab
 ) where {TC,NC,N2,PC,TA,NA,TB,NB,PB}
   @assert PC == NA + PB - 2  # output prefix dims
+  # B's blocks are copied as they are: C's dense block must be B's, in B's order.
+  collect(labelsC[PC+1:NC]) == collect(labelsB[PB+1:NB]) || _layout_error(
+      "COO × block-sparse (contracted index in B's key)",
+      "C's dense block must be B's dense indices in B's order")
   # println("In contract_prefix! ", A.keys, "|||", B.keys)
   # overwrite
   empty!(C.keys); empty!(C.ids); empty!(C.data)
@@ -178,7 +182,9 @@ function contract_dense_index!(
 
   # Sanity: C dense tail matches B dense tail without r
   expectedC_dense = labelsB_dense_p[1:end-1]
-  @assert collect(labelsC[PC+1:NC]) == expectedC_dense
+  collect(labelsC[PC+1:NC]) == expectedC_dense || _layout_error(
+      "COO × block-sparse (contracted index in B's dense block)",
+      "C's dense block must be B's dense indices (without the contracted one) in B's order")
   expectedC_dims = ntuple(i -> dimsB_dense_p[i], Val(N2C))
   @assert ntuple(i -> C.dims[PC+i], Val(N2C)) == expectedC_dims
   @assert C.blksize == chunklen

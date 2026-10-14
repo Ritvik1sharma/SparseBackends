@@ -57,9 +57,13 @@ function contract_aliased!(
     rpos = findfirst(==(rlab), labelsB)
     @assert rpos !== nothing "rlab not found in labelsB"
     perm = Vector{Int}(undef, NB)
+    length(desired_not_rlab) == NB - 1 || _layout_error("COO × dense → aliased",
+        "C's dense block must hold every uncontracted index of the dense operand")
     for (k, lab) in enumerate(desired_not_rlab)
         pos = findfirst(==(lab), labelsB)
-        @assert pos !== nothing "label $lab not found in labelsB"
+        pos === nothing && _layout_error("COO × dense → aliased", "C's dense block lists " *
+            "an index that is not in the dense operand (moving a COO index into the dense " *
+            "block is not supported)")
         perm[k] = pos
     end
     perm[NB] = rpos

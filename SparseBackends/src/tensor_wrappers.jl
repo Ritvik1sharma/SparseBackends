@@ -487,8 +487,6 @@ function contract(A::ITensors.ITensor, B::ITensors.ITensor,
                   denseLinksA::Union{Nothing,Int}=nothing,
                   denseLinksB::Union{Nothing,Int}=nothing,
                   preserve_bs_output::Bool=true,
-                  preferred_output_labels::Union{Nothing,AbstractVector}=nothing,
-                  output_perm::Union{Nothing,Vector{Int}}=nothing,
                   emit_window_map::Bool=false,
                   layout::Union{Nothing,OutputLayout}=nothing)
   Cb = to_backend(Cbackend)
@@ -496,8 +494,6 @@ function contract(A::ITensors.ITensor, B::ITensors.ITensor,
     return contract_aliased_itensor(A, B, Abackend, Bbackend;
                                     denseLinksA=denseLinksA, denseLinksB=denseLinksB,
                                     preserve_bs_output=preserve_bs_output,
-                                    preferred_output_labels=preferred_output_labels,
-                                    output_perm=output_perm,
                                     emit_window_map=emit_window_map,
                                     layout=layout)
   end
@@ -748,7 +744,7 @@ function recast_bs_to_template(Cw::WrappedBlockSparse{TC,N,N2c,Pc},
   # find C's block (via permuted key lookup), permute that small block's dense
   # axes into T's order, write to new_data. Cost O(num_keys × blksize) vs slow
   # path's O(prod(dims)) densify+permute. Triggers automatically whenever the
-  # allowed_keys_C filter has made C.keys a subset of T.keys (after axis perm).
+  # C.keys are a subset of T.keys (after axis perm).
   if N2c == N2t
     fast2 = @timeit TIMER "recast.layer2_try" _recast_per_block(Cw, Tw, c_inds, t_inds)
     if fast2 !== nothing
@@ -895,7 +891,7 @@ function output_inds(
     indsB::NTuple{NB,ITensors.Index{T}},
     denseA::Set{ITensors.Index{T}},
     denseB::Set{ITensors.Index{T}};
-    output_inds_hint::Union{Nothing,AbstractSet}=nothing,
+    dense_ids::Union{Nothing,AbstractSet}=nothing,
 ) where {NA,NB,T}
     # Build membership set for intersection test with minimal allocation
     setA = Set{ITensors.Index{T}}()
@@ -906,7 +902,7 @@ function output_inds(
     # Preallocate buckets with decent upper bounds
     sparse_nonlink = Vector{ITensors.Index}(undef, 0); sizehint!(sparse_nonlink, NA + NB)
     sparse_link    = Vector{ITensors.Index}(undef, 0); sizehint!(sparse_link,    NA + NB)
-    # moved_dense_links: when hint is provided, axes that were dense in operands
+    # moved_dense_links: with `dense_ids`, axes that were dense in operands
     # but classified sparse in output (kernel will FISSION them). Placed LAST
     # in the sparse section so lex-sort of C keys puts A_pref axes FIRST →
     # consecutive sorted C blocks for one A_pref differ only in moved axes →
@@ -914,13 +910,14 @@ function output_inds(
     moved_dense_links = Vector{ITensors.Index}(undef, 0); sizehint!(moved_dense_links, NA + NB)
     dense_tail        = Vector{ITensors.Index}(undef, 0); sizehint!(dense_tail,        NA + NB)
 
-    # helper: classify a single index
-    # Match hint by Index id (ignoring plev) — the contract output may have
-    # axes at plev=1 that get replaceprime'd to plev=0 downstream, but they
-    # have the SAME id as the hint entries (plev=0). So id-matching is correct.
-    hint_ids = output_inds_hint === nothing ?
+    # helper: classify a single index.
+    # `dense_ids` (used by dense_from_aliased_operand) overrides the inherited split:
+    # an output index is dense iff its id is in the set, matched by id ignoring plev
+    # (an output axis at plev=1 has the same id as the plev-0 entry); everything else
+    # is key. nothing = inherit each index's kind from its operand.
+    hint_ids = dense_ids === nothing ?
                nothing :
-               Set(ITensors.id(I) for I in output_inds_hint)
+               Set(ITensors.id(I) for I in dense_ids)
     @inline function push_classified!(I::ITensors.Index)
         if hint_ids !== nothing
             if ITensors.id(I) in hint_ids
@@ -932,9 +929,8 @@ function output_inds(
                 # NOTE: a DENSE-wrapped operand reports an EMPTY dense_inds, so a
                 # moved axis coming from a dense operand (MPO x MPS: the gate's s')
                 # is NOT caught here and lands in sparse_nonlink. Callers that need a
-                # particular prefix layout must state it via preferred_output_labels;
-                # do not re-purpose this classification for ordering, it is shared
-                # with the DMRG/PHP path.
+                # particular layout pass an OutputLayout; do not re-purpose this
+                # classification for ordering, it is shared with the DMRG/PHP path.
                 from_dense = (I in denseA) || (I in denseB)
                 if from_dense && is_link(I)
                     push!(moved_dense_links, I)
@@ -979,11 +975,8 @@ function output_inds(
     # gave only ~14% permA_identity hits and the per-call sort overhead
     # negated savings. The current ordering is a no-op cost-wise. Larger gain
     # would require eliminating the permutedims COPY (in-place / data-share).
-    # NOTE: contract_aliased.jl's fission detector requires hint-moved axes to sit in
-    # the LAST prefix slots (see src_B_fission_pos there), which this default order
-    # does not give when both moved and sparse_link axes are present. Callers that
-    # need a specific layout say so via `preferred_output_labels` / `output_perm`
-    # rather than having a policy hardcoded here.
+    # Callers that need a specific layout pass an OutputLayout rather than having a
+    # policy hardcoded here.
     indsC_vec = vcat(sparse_nonlink, moved_dense_links, sparse_link, dense_tail)
     return Tuple(indsC_vec), dense_tail
 end
@@ -993,11 +986,11 @@ function output_inds(
     indsB::NTuple{NB,ITensors.Index{T}},
     denseA_in::AbstractSet{<:ITensors.Index},
     denseB_in::AbstractSet{<:ITensors.Index};
-    output_inds_hint::Union{Nothing,AbstractSet}=nothing,
+    dense_ids::Union{Nothing,AbstractSet}=nothing,
 ) where {NA,NB,T}
     denseA = Set{ITensors.Index{T}}(denseA_in)  # OK: iterable ctor
     denseB = Set{ITensors.Index{T}}(denseB_in)
-    return output_inds(indsA, indsB, denseA, denseB; output_inds_hint=output_inds_hint)
+    return output_inds(indsA, indsB, denseA, denseB; dense_ids=dense_ids)
 end
 
 # Reorder indsC so it matches the canonical layout that `contract_bs_dense_to_dense!`
@@ -1140,7 +1133,6 @@ function wrapped_contract(A::WrappedTensorTypes{TA,NA},
                           B::WrappedTensorTypes{TB,NB};
                           output_backend::Symbol=:blocksparse,
                           preserve_bs_output::Bool=false,
-                          output_inds_hint::Union{Nothing,AbstractSet}=nothing,
                           in_position::Bool=false) where {TA,TB,NA,NB}
   # `preserve_bs_output=true` is an opt-in pathway that forces the result of
   # a BlockSparse-involving contraction to remain WrappedBlockSparse, even
@@ -1164,12 +1156,7 @@ function wrapped_contract(A::WrappedTensorTypes{TA,NA},
               "  → C=", infer_C_backend(A, B))
     end
     @timeit TIMER "wc.output_inds" begin
-      # Gate: hint path only supported by the BS×Dense kernel. For BS×BS or
-      # other paths, suppress the hint so output_inds + kernel run the
-      # natural ordering (no regression on those paths).
-      hint_for_kernel = (Arep isa NewBlockSparseSorted && Brep isa NewBlockSparseSorted) ?
-                       nothing : output_inds_hint
-      indsC, denseC = output_inds(indsA, indsB, denseA, denseB; output_inds_hint=hint_for_kernel)
+      indsC, denseC = output_inds(indsA, indsB, denseA, denseB)
     end
     @timeit TIMER "wc.labels" begin
       dimsC = ntuple(i -> ITensors.dim(indsC[i]), length(indsC))
@@ -1312,8 +1299,7 @@ function wrapped_contract(A::WrappedTensorTypes{TA,NA},
             C.blocksparse = SparseBackends.contract!(
                 C.blocksparse, labelsC_vec,
                 Arep, labelsA_vec,
-                Brep, labelsB_vec;
-                output_inds_hint=hint_for_kernel,
+                Brep, labelsB_vec,
             )
           end
         end
