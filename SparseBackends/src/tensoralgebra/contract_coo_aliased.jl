@@ -70,7 +70,10 @@ function _contract_coo_aliased_prefix!(
     rlab,
 ) where {TC,NC,N2C,PC,TA,NA,TB,NB,N2B,PB}
     @assert !(rlab in labelsC) "rlab must be reduced"
-    @assert N2C == N2B  "C dense rank must match B dense rank when r is in B's prefix"
+    # C's dense block is B's dense block, in B's order (B's templates are reused as is).
+    collect(labelsC[PC+1:NC]) == collect(labelsB[PB+1:NB]) || _layout_error("COO × aliased (contracted index in B's key)",
+        "C's dense block must be B's dense indices in B's order (moving an index into the " *
+        "key or reordering the dense block is not supported yet)")
     @assert C.blksize == B.blksize  "C and B block sizes must match"
     axisAr = mapA[rlab]
     @assert axisAr == NA
@@ -85,8 +88,9 @@ function _contract_coo_aliased_prefix!(
         if haskey(mapA, lab) && lab != rlab
             srcA[j] = mapA[lab]
         else
-            ax = mapB[lab]
-            @assert ax <= PB && lab != rlab "C prefix label $lab must come from a non-r prefix axis"
+            ax = get(mapB, lab, 0)
+            (1 <= ax <= PB && lab != rlab) || _layout_error("COO × aliased (contracted index in B's key)",
+                "C's key may only list indices of A and B's key indices")
             srcB[j] = ax
         end
     end
@@ -119,7 +123,7 @@ function _contract_coo_aliased_prefix!(
 
         for bi in bi_list
             bkey   = B.keys[bi]
-            tidB   = B.alias_ids[bi]
+            tidB   = Int(B.alias_ids[bi])   # alias ids may be compacted (UInt8)
             αB     = convert(TC, B.scalars[bi])
             ckey   = ntuple(j -> (srcA[j] != 0 ? acoord[srcA[j]] : bkey[srcB[j]]), Val(PC))
             scalar = α * αB
@@ -161,7 +165,6 @@ function _contract_coo_aliased_dense!(
     rlab,
 ) where {TC,NC,N2C,PC,TA,NA,TB,NB,N2B,PB}
     @assert !(rlab in labelsC) "rlab must be reduced"
-    @assert N2C == N2B - 1 "C dense rank must equal B dense rank − 1 when r is in B's dense tail"
 
     # Permute B so r is the last dense axis (chunk layout: (chunk, R)).
     redpos = mapB[rlab] - PB        # 1..N2B
@@ -174,6 +177,10 @@ function _contract_coo_aliased_dense!(
         mapB    = Dict(lab => i for (i, lab) in enumerate(labelsB))
     end
     @assert mapB[rlab] == NB
+    # C's dense block is B's dense block without r, in B's order.
+    collect(labelsC[PC+1:NC]) == collect(labelsB[PB+1:NB-1]) || _layout_error("COO × aliased (contracted index in B's dense block)",
+        "C's dense block must be B's dense indices (without the contracted one) in B's " *
+        "order (moving an index into the key or reordering is not supported yet)")
     dimsB_dense = ntuple(i -> B.dims[PB+i], Val(N2B))
     Rdim     = dimsB_dense[end]
     chunklen = prod(dimsB_dense[1:end-1]; init=1)
@@ -192,8 +199,9 @@ function _contract_coo_aliased_dense!(
         if haskey(mapA, lab) && lab != rlab
             srcA[j] = mapA[lab]
         else
-            ax = mapB[lab]
-            @assert ax <= PB && lab != rlab "C prefix label $lab must come from A (non-r) or B prefix"
+            ax = get(mapB, lab, 0)
+            (1 <= ax <= PB && lab != rlab) || _layout_error("COO × aliased (contracted index in B's dense block)",
+                "C's key may only list indices of A and B's key indices")
             srcB[j] = ax
         end
     end
@@ -217,7 +225,7 @@ function _contract_coo_aliased_dense!(
 
         for j in eachindex(B.keys)
             bkey = B.keys[j]
-            tidB = B.alias_ids[j]
+            tidB = Int(B.alias_ids[j])   # alias ids may be compacted (UInt8)
             αB   = convert(TC, B.scalars[j])
 
             combined_tid = get(combined_tid_map, (tidB, rv), 0)

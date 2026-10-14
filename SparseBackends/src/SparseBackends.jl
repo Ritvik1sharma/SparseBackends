@@ -157,6 +157,7 @@ end
     b === DENSE ? :dense : b === COO ? :coo : b === BLOCKSPARSE ? :blocksparse : :aliased
 
 include("base.jl")
+include("output_layout.jl")      # OutputLayout + OutputLayoutError (kernels throw it)
 
 # ── BlockSparse ──────────────────────────────────────────────────────────────
 include("blocksparse/storage.jl")
@@ -184,7 +185,6 @@ include("tensoralgebra/contract_aliased_coo_dense.jl")   # COOTensor × Dense �
 include("tensoralgebra/contract_aliased.jl")              # AliasedBS × Dense / AliasedBS × AliasedBS (single label)
 include("tensoralgebra/contract_aliased_shared.jl")       # helpers + AliasedBS × AliasedBS (multi-label)
 include("tensoralgebra/contract_aliased_dense_shared.jl") # AliasedBS × Dense (multi-label, threaded + serial)
-include("tensoralgebra/contract_aliased_dense_legacy.jl") # legacy reduction-stationary serial kernel (A/B only, SB_ALIASED_LEGACY=1)
 include("tensoralgebra/contract_coo_aliased.jl")          # COOTensor × AliasedBS → AliasedBS (single label, r in B prefix)
 include("tensoralgebra/contract_aliased_dense_to_dense.jl") # AliasedBS × Dense → Dense (alias-amplified, for matvec)
 
@@ -195,7 +195,6 @@ include("ops_factorize_qr.jl")
 # tensor_wrappers.jl (owned-SVD variant never exercised by any script). Uncomment
 # this include + that wrapper + the mps.jl/verify_iso.jl dispatch branches to re-enable.
 # include("ops_factorize_svd_owned.jl")
-include("output_layout.jl")      # OutputLayout: requested output key/dense split + order
 include("tensor_wrappers.jl")
 include("tensor_index.jl")
 include("tensor_contraction.jl")

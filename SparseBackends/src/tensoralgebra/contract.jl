@@ -40,9 +40,7 @@ function contract!(
     A,
     labelsA::AbstractVector{Label},
     B,
-    labelsB::AbstractVector{Label};
-    output_inds_hint::Union{Nothing,AbstractSet}=nothing,
-    allowed_keys_C::Union{Nothing,AbstractSet}=nothing,
+    labelsB::AbstractVector{Label},
 )
  @timeit TIMER "disp.body_full" begin
   @timeit TIMER "disp.preamble" begin
@@ -104,15 +102,11 @@ function contract!(
     @assert !any(lc -> lc == rlab, labelsC) "Reduction label $rlab must NOT appear in output labels"
 
     @timeit TIMER "kbd.single_contract" begin
-      # Hint path not yet implemented for single-shared-label kernel.
-      # Fall through to original; hint will be a no-op here.
       return contract!(C, labelsC, A, labelsA, B, labelsB, mapA, mapB, rlab)
     end
   else
     @timeit TIMER "kbd.general_contract" begin
-      return contract_shared!(C, labelsC, A, labelsA, B, labelsB, mapA, mapB, shared;
-                              output_inds_hint=output_inds_hint,
-                              allowed_keys_C=allowed_keys_C)
+      return contract_shared!(C, labelsC, A, labelsA, B, labelsB, mapA, mapB, shared)
     end
   end
  end  # disp.body_full

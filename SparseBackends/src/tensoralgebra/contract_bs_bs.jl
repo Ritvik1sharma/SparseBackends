@@ -492,7 +492,8 @@ end
     elseif lab in keepBset
       originA[i] = false
     else
-      error("Cdense label $lab not found in keepA/keepB")
+      _layout_error("dense block", "C dense label $lab is not an uncontracted dense " *
+          "index of A or B (moving a key index into the dense block is not supported)")
     end
   end
 
@@ -590,12 +591,8 @@ function contract_shared!(
     labelsB::AbstractVector,
     mapA::Dict,
     mapB::Dict,
-    shared_labels::Vector;
-    output_inds_hint::Union{Nothing,AbstractSet}=nothing,
-    allowed_keys_C::Union{Nothing,AbstractSet}=nothing,
+    shared_labels::Vector,
 ) where {TC,NC,N2C,PC,TA,NA,N2A,PA,TB,NB,N2B,PB}
-  # BS×BS hint path not yet implemented; accept kwargs to keep dispatch consistent.
-  # Original assertions still fire if Cdense doesn't fully match keepA0+keepB0.
 
   @timeit TIMER "kbb.contract_shared.label!" begin
   
@@ -645,11 +642,13 @@ function contract_shared!(
 
     Cdense = labelsC[PC+1:NC]
     mode, desired_keepA, desired_keepB = _cdense_grouping_and_orders(Cdense, keepA0, keepB0)
-    mode == :interleaved && error("Cdense interleaves A/B kept dims; would require permuting C (unsupported; sort/fallback)")
-
-    # sanity: desired orders must include all kept dims exactly once
-    @assert length(desired_keepA) == length(keepA0) && Set(desired_keepA) == Set(keepA0)
-    @assert length(desired_keepB) == length(keepB0) && Set(desired_keepB) == Set(keepB0)
+    mode == :interleaved && _layout_error("block-sparse × block-sparse",
+        "C's dense block interleaves A's and B's indices; list them as two groups")
+    # Moving a dense index into C's key (fission) is not implemented here.
+    (length(desired_keepA) == length(keepA0) && Set(desired_keepA) == Set(keepA0) &&
+     length(desired_keepB) == length(keepB0) && Set(desired_keepB) == Set(keepB0)) ||
+        _layout_error("block-sparse × block-sparse", "C's dense block must hold every " *
+            "uncontracted dense index of A and B; moving a dense index into the key is not supported")
 
     # -----------------------------
     # 2) Build ONE perm for A and ONE perm for B that satisfy BOTH:

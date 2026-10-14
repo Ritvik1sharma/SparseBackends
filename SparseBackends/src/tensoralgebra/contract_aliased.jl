@@ -356,27 +356,18 @@ function _contract_aliased_prefix_outer_ad!(
         mapB    = Dict(lab => i for (i, lab) in enumerate(labelsB))
     end
 
-    # ── FISSION DETECTION ─────────────────────────────────────────────────────
-    # C's prefix may include axes that came from B (when the caller passed an
-    # output_inds_hint forcing them into the sparse prefix). Partition B's
-    # non-r dims into:
-    #   - fission_pos_in_B : B dims that land in C's prefix (→ fissioned)
-    #   - remaining_pos_in_B : B dims that stay in C's dense tail
+    # ── FISSION, read from labelsC ────────────────────────────────────────────
+    # C's key may list indices of B (the dense operand): those are moved into the key
+    # ("fissioned"). Partition B's non-r dims into
+    #   - fission_pos_in_B   : B dims listed in C's key
+    #   - remaining_pos_in_B : B dims that stay in C's dense block
+    # Supported key order: A's key indices (minus r) first, then the moved B indices.
+    # TODO: address C key slots by label so moved indices can sit anywhere.
     n_A_prefix_in_C = PA - 1  # A's prefix axes excluding rlab
     n_fission       = PC - n_A_prefix_in_C
-    @assert n_fission >= 0 "PC=$PC less than A's non-r prefix count $n_A_prefix_in_C"
+    n_fission >= 0 || _layout_error("aliased × dense (contracted index in A's key)", "C's key has $PC indices, fewer " *
+        "than A's $n_A_prefix_in_C surviving key indices; an index of A's key cannot move to the dense block")
     Cpref_labels    = labelsC[1:PC]
-    # Fissioned axes are the C-prefix labels that ORIGINATE IN B -- a property the
-    # caller's output_inds_hint already determines exactly. Previously this was a
-    # positional guess (the last n_fission prefix entries), which reported a
-    # confusing "count mismatch" whenever the layout put a fissioned axis elsewhere.
-    #
-    # TODO: this only fixes DETECTION. Full position-independence also needs src_A /
-    # src_B_fission_pos below (and the key assembly that follows) to address C-prefix
-    # slots by label instead of assuming [A's prefix..., fission...] contiguous order.
-    # The cleaner fix is to let callers control the output index ordering on the
-    # aliased -> aliased path: output_perm / preferred_output_labels exist but are
-    # wired only into the aliased -> dense (matvec) path today.
     fission_labels  = Set(lab for lab in Cpref_labels if haskey(mapB, lab))
     fission_pos_in_B   = Int[]
     remaining_pos_in_B = Int[]
@@ -387,7 +378,10 @@ function _contract_aliased_prefix_outer_ad!(
             push!(remaining_pos_in_B, i)
         end
     end
-    @assert length(fission_pos_in_B) == n_fission "fission axes count mismatch ($(length(fission_pos_in_B)) vs $n_fission)"
+    length(fission_pos_in_B) == n_fission || _layout_error("aliased × dense (contracted index in A's key)",
+        "C's key must be A's surviving key indices plus moved indices of B; it lists " *
+        "$(PC - length(fission_pos_in_B)) other indices where A has $n_A_prefix_in_C " *
+        "(a dense index of A cannot move into the key here)")
 
     # If fission dims aren't already at the front of B, permute them there so
     # B is laid out as (fission_prod, chunkB_remaining, R).
@@ -411,15 +405,19 @@ function _contract_aliased_prefix_outer_ad!(
     Cdense = labelsC[PC+1:NC]
     dense_order = Cdense == vcat(Adense, Bwo_remaining) ? :AB :
                   Cdense == vcat(Bwo_remaining, Adense) ? :BA :
-                  error("C dense tail must be [A_dense..., B_remaining...] or [B_remaining..., A_dense...]; got Cdense=$Cdense, Adense=$Adense, Bwo_remaining=$Bwo_remaining")
+                  _layout_error("aliased × dense (contracted index in A's key)", "C's dense block must be [A's dense " *
+                      "indices in A's order, B's remaining indices in B's order] or the two " *
+                      "groups swapped; reordering inside a group is not supported")
 
     # C prefix sourcing: first n_A_prefix_in_C entries come from A's prefix;
     # the remaining n_fission entries come from B's fission dims.
     src_A = Vector{Int}(undef, n_A_prefix_in_C)
     @inbounds for j in 1:n_A_prefix_in_C
         lab = Cpref_labels[j]
-        ax  = mapA[lab]
-        @assert ax <= PA && lab != rlab "C prefix label $lab (pos $j) must come from A sparse prefix excluding rlab"
+        ax  = get(mapA, lab, 0)
+        (1 <= ax <= PA && lab != rlab) || _layout_error("aliased × dense (contracted index in A's key)",
+            "C's key must list A's surviving key indices first, then the moved indices " *
+            "of B (key slot $j holds an index that is not in A's key)")
         src_A[j] = ax
     end
     src_B_fission_pos = Vector{Int}(undef, n_fission)  # which fission axis (1..n_fission) each Cpref slot at PC+1-n_fission..PC maps to
@@ -515,7 +513,8 @@ function _contract_aliased_dense_ad!(
 ) where {TC,NC,N2C,PC,TA,NA,N2A,PA,TB,NB}
     @assert mapA[rlab] == NA "rlab must be the last axis of A (call _aliased_r_to_last_dense first)"
     @assert !(rlab in labelsC)
-    @assert PC == PA "C sparse prefix must equal A sparse prefix for dense-tail reduction"
+    PC == PA || _layout_error("aliased × dense (contracted index in A's dense block)", "C's key must be exactly A's key " *
+        "indices (moving an index into or out of the key is not supported here)")
 
     # Permute B so rlab is last
     axisBr = mapB[rlab]
@@ -540,13 +539,13 @@ function _contract_aliased_dense_ad!(
     Cdense = labelsC[PC+1:NC]
     dense_order = Cdense == vcat(Awo, Bwo) ? :AB :
                   Cdense == vcat(Bwo, Awo) ? :BA :
-                  error("C dense tail must be [A_dense_wo_r...,B_wo_r...] or [B_wo_r...,A_dense_wo_r...]")
+                  _layout_error("aliased × dense (contracted index in A's dense block)", "C's dense block must be [A's dense indices in A's order, B's in B's order] or the two groups swapped; reordering inside a group, or moving an index between key and dense block, is not supported")
 
     # C prefix sourcing (must be a reordering of A's prefix axes)
     src = Vector{Int}(undef, PC)
     @inbounds for j in 1:PC
-        lab = labelsC[j]; ax = mapA[lab]
-        @assert ax <= PA "C prefix label must come from A sparse prefix"
+        lab = labelsC[j]; ax = get(mapA, lab, 0)
+        1 <= ax <= PA || _layout_error("aliased × dense (contracted index in A's dense block)", "C's key may only list A's key indices")
         src[j] = ax
     end
 
@@ -700,18 +699,20 @@ function _contract_aliased_prefix_outer_aa!(
     Cdense = labelsC[PC+1:NC]
     dense_order = Cdense == vcat(Adense, Bdense) ? 1 :
                   Cdense == vcat(Bdense, Adense) ? 2 :
-                  error("C dense must be [A_dense...,B_dense...] or [B_dense...,A_dense...]")
+                  _layout_error("aliased × aliased (contracted index in both keys)", "C's dense block must be [A's dense indices in A's order, B's in B's order] or the two groups swapped; reordering inside a group, or moving an index between key and dense block, is not supported")
 
     # C prefix sourcing:  src[j] > 0 → A.key[src[j]];  src[j] < 0 → B.key[-src[j]]
     src = Vector{Int}(undef, PC)
     @inbounds for j in 1:PC
         lab = labelsC[j]
         if haskey(mapA, lab) && mapA[lab] != mapA[rlab]
-            ax = mapA[lab]; @assert ax <= PA
+            ax = mapA[lab]
+            ax <= PA || _layout_error("aliased × aliased (contracted index in both keys)", "C's key may only list key indices of A and B")
             src[j] = ax
         else
-            @assert haskey(mapB, lab) "C prefix label $lab not found in A or B"
-            ax = mapB[lab]; @assert ax <= PB && lab != rlab
+            ax = get(mapB, lab, 0)
+            (1 <= ax <= PB && lab != rlab) ||
+                _layout_error("aliased × aliased (contracted index in both keys)", "C's key may only list key indices of A and B")
             src[j] = -ax
         end
     end
@@ -822,18 +823,20 @@ function _contract_aliased_dense_aa!(
     Cdense = labelsC[PC+1:NC]
     dense_order = Cdense == vcat(Awo, Bwo) ? :AB :
                   Cdense == vcat(Bwo, Awo) ? :BA :
-                  error("C dense tail must be [A_dense_wo_r...,B_dense_wo_r...] or swapped")
+                  _layout_error("aliased × aliased (contracted index in both dense blocks)", "C's dense block must be [A's dense indices in A's order, B's in B's order] or the two groups swapped; reordering inside a group, or moving an index between key and dense block, is not supported")
 
     # C prefix sourcing
     srcA = zeros(Int, PC)
     srcB = zeros(Int, PC)
     @inbounds for j in 1:PC
         lab = labelsC[j]
-        if haskey(mapA, lab)
-            ax = mapA[lab]; @assert ax <= PA; srcA[j] = ax
+        ax = haskey(mapA, lab) ? mapA[lab] : -get(mapB, lab, 0)
+        if 1 <= ax <= PA
+            srcA[j] = ax
+        elseif 1 <= -ax <= PB
+            srcB[j] = -ax
         else
-            @assert haskey(mapB, lab)
-            ax = mapB[lab]; @assert ax <= PB; srcB[j] = ax
+            _layout_error("aliased × aliased (contracted index in both dense blocks)", "C's key may only list key indices of A and B")
         end
     end
 

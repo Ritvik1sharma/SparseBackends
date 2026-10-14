@@ -157,9 +157,7 @@ function show_roofline()
             " s  (classify + A/B permute + build maps/strides/scratch; redundant per-call within a bond)")
     println("[ROOFLINE]   A-permute (input ψ reorg, line 859)=", round(_RF_PERMA_NS[]/1e9,digits=3),
             " s   fired ", _RF_PERMA_HITS[], "/", _RF_PERMA_CALLS[], " calls (non-identity permA)")
-    println("[ROOFLINE]   align: ALIGN_OK=", _ALIGN_OK[], " fallback=", _ALIGN_FALLBACK[],
-            "   recast_permutes=", _RECAST_PERMUTE_HITS[],
-            "   (ALIGN_OK>0 ⇒ output reorder fired)")
+    println("[ROOFLINE]   recast_permutes=", _RECAST_PERMUTE_HITS[])
     if _RF_BLAS_SWITCH_NS[] + _RF_SPAWN_NS[] + _RF_REDUCE_NS[] > 0.0
         println("[ROOFLINE] threaded overhead:  blas_switch=", round(_RF_BLAS_SWITCH_NS[]/1e9,digits=3),
                 " s  parallel_exec=", round(_RF_SPAWN_NS[]/1e9,digits=3),
@@ -1054,14 +1052,6 @@ column-major linear index into B's shared-prefix dimensions.  When there are
 no shared-prefix labels `sp_lin == 1` always, giving at most `n_A_templates`
 combined templates (perfect aliasing preservation).
 """
-# Fission fallback: when output_inds_hint pushes B labels into C's prefix
-# (which the aliased kernel doesn't yet support natively), delegate the
-# contract to the BS path (which DOES implement hint+fission), then
-# trivially re-aliasify the BS result (one template per block).
-#
-# Loses alias compression for this single contract step but preserves C's
-# requested axis classification, so subsequent contracts in the matvec
-# chain don't see cross-region label mismatches.
 function contract_shared!(
     C             :: AliasedBlockSparse{TC,NC,N2C,PC},
     labelsC       :: AbstractVector,
@@ -1071,9 +1061,7 @@ function contract_shared!(
     labelsB       :: AbstractVector,
     mapA          :: Dict,
     mapB          :: Dict,
-    shared_labels :: Vector;
-    output_inds_hint::Union{Nothing,AbstractSet}=nothing,
-    allowed_keys_C=nothing,
+    shared_labels :: Vector,
 ) where {TC,NC,N2C,PC,TA,NA,N2A,PA,TB,NB}
 
     # ── 0) Preconditions ──────────────────────────────────────────────────────
@@ -1137,23 +1125,12 @@ function contract_shared!(
     _interleaved = (mode === :interleaved)
     _interleaved && (mode = :AthenB)
 
-    # Fission detection: some keepA / keepB labels may have been moved to C's
-    # prefix (caller used output_inds_hint at the wrapper level). Compute the
-    # moved label lists. The native fission path is taken when either moved
-    # set is non-empty.
+    # Fission: keepA / keepB labels listed in C's key are moved into it (native: each
+    # moved index's values split a block into several C blocks).
     desired_keepA_set = Set(desired_keepA)
     desired_keepB_set = Set(desired_keepB)
     moved_keepA = [lab for lab in keepA0 if !(lab in desired_keepA_set)]
     moved_keepB = [lab for lab in keepB0 if !(lab in desired_keepB_set)]
-    has_fission = !isempty(moved_keepA) || !isempty(moved_keepB) || allowed_keys_C !== nothing
-    # Native fission kernel hardened 2026-06 — always on (was
-    # SB_ALIASED_NATIVE_FISSION, default-on knob; the BS-delegation fallback
-    # below is now reached only when allowed_keys_C requires it).
-    if has_fission && allowed_keys_C !== nothing
-        return _aliased_shared_via_bs_fission!(C, labelsC, A, labelsA, B, labelsB,
-            mapA, mapB, shared_labels;
-            output_inds_hint=output_inds_hint, allowed_keys_C=allowed_keys_C)
-    end
 
     @assert Set(vcat(desired_keepA, moved_keepA)) == Set(keepA0)
     @assert Set(vcat(desired_keepB, moved_keepB)) == Set(keepB0)
@@ -1254,10 +1231,10 @@ function contract_shared!(
                 c_src_kind[j] = :movB
                 c_src_idx[j]  = findfirst(==(lab), moved_keepB)
             else
-                @assert haskey(mapA, lab) "C prefix label $lab must exist in A"
+                (haskey(mapA, lab) && mapA[lab] <= PA && !(lab in shared_p_set)) ||
+                    _layout_error("aliased × dense", "C key label $lab must be a surviving " *
+                        "key index of A or a moved dense index of A or B")
                 apos = mapA[lab]
-                @assert apos <= PA "C prefix label $lab must come from A sparse prefix"
-                @assert !(lab in shared_p_set) "C prefix label $lab cannot be a reduced shared-prefix label"
                 c_src_kind[j] = :A
                 c_src_idx[j]  = apos
             end
@@ -1360,8 +1337,9 @@ function contract_shared!(
     # serial, so it must not reach the threaded/generic paths.
     lmap = nothing
     if _interleaved
-        (_threaded || !can_blas) &&
-            error("interleaved Cdense reached non-serial/non-BLAS path (should be gated in _canon_inds_for_next_A)")
+        (_threaded || !can_blas) && _layout_error("aliased × dense",
+            "an interleaved dense block (A's and B's indices mixed) is only supported on " *
+            "the serial BLAS path; list them as two groups")
         cdims = Int[C.dims[PC + i] for i in 1:length(Cdense)]
         lmap  = _build_interleave_lmap(Cdense, desired_keepA, desired_keepB, cdims)
     end

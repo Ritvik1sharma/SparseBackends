@@ -52,6 +52,10 @@ struct OutputLayoutError <: Exception
 end
 Base.showerror(io::IO, e::OutputLayoutError) = print(io, "OutputLayoutError: ", e.msg)
 
+"""Throw an OutputLayoutError for a request kernel `kernel` cannot honour."""
+_layout_error(kernel::AbstractString, msg::AbstractString) =
+    throw(OutputLayoutError(string(kernel, ": ", msg)))
+
 """All output indices of `L` in storage order (key first, then dense block)."""
 layout_inds(L::OutputLayout) = vcat(L.sparse, L.dense)
 
