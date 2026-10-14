@@ -146,7 +146,7 @@ FIRST -- has a different layout from every later step. Same tensor either way; t
 only makes the two schemas comparable.
 
 Within-region permute, so prefix/tail membership and the alias schema are untouched
-(same argument as `reorder_aliased_for_op`, tensor_wrappers_aliased.jl:1015)."""
+(permuting inside the key or inside the dense block only relabels axes)."""
 function site_last(T::ITensor)
     storage_kind(T) === :aliased || return T
     w  = ITensors.get_external_storage(T)

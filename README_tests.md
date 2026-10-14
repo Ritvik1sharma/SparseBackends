@@ -98,33 +98,6 @@ julia test_kernel_precision.jl    # no args; uses hardcoded synthetic tensors
 
 ---
 
-### `test_path_b_microbench.jl`
-**What:** Timing breakdown of Path B operator variants (Arnoldi/M⁻¹ vs Lanczos/M^(±½)) and eigsolve iterations at specific bonds. Hardcoded at N=2,3.
-
-```
-julia test_path_b_microbench.jl
-```
-
----
-
-### `test_recast_microbench.jl`
-**What:** Diagnoses whether `recast_bs_to_template` cost is allocation- or compute-dominated. Times baseline, pre-allocated, and GC-disabled variants. Relevant if optimizing the M-build / gram_envs path.
-
-```
-julia test_recast_microbench.jl <N> [ITERS=200]
-```
-
----
-
-### `test_linv_compare.jl`
-**What:** Per-bond comparison of dense Linv vs BlockSparse Linv to quantify discrepancy. Hardcoded at N=2,3. Relevant while `path_b_helpers.jl` BS-Linv work is in progress.
-
-```
-julia test_linv_compare.jl
-```
-
----
-
 ## Archived tests
 
 Old or superseded tests live in `auto_archived/` and `test_archive/`. They are not expected to run without further setup but preserve research history.
