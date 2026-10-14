@@ -429,9 +429,9 @@ function contract_and_fuse_links(
   Cb = Cbackend === nothing ? nothing : to_backend(Cbackend)
   if layout !== nothing
     # Roles (op, kind, k) name the operands as passed here: :A = Aw (the MPO site).
-    (Aw isa WrappedAliasedBlockSparse || Bw isa WrappedAliasedBlockSparse) ||
-      throw(OutputLayoutError("contract_and_fuse_links: a layout needs an aliased " *
-                              "operand; got $(typeof(Aw).name.name) × $(typeof(Bw).name.name)"))
+    (Aw isa WrappedAliasedBlockSparse || Bw isa WrappedAliasedBlockSparse || Cb === ALIASED) ||
+      throw(OutputLayoutError("contract_and_fuse_links: a layout needs an aliased operand " *
+          "or aliased output; got $(typeof(Aw).name.name) × $(typeof(Bw).name.name) -> $Cb"))
     if Cb === ALIASED
       Cw = wrapped_contract_aliased(Aw, Bw; preserve_bs_output=true, layout=layout)
     elseif Cb === DENSE

@@ -203,5 +203,4 @@ include("output_layout_builders.jl")  # OutputLayout builders for the known call
 include("aliased/factorize.jl")         # Aliased-aware factorize (Tier 1: dense SVD + re-aliasify)
 include("core_helpers/factor_core.jl")  # factor-core read_core/write_core_window!/slice_to_template (ψ=P·core)
 
-include("../../utils.jl")                 # reorder_to_roles: symbolic (role-based) index-order permuter
 end

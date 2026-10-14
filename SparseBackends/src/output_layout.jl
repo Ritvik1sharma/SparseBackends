@@ -24,8 +24,10 @@ import ITensors
 #   (op, kind, k)    op   :A or :B
 #                    kind :l   link to the previous site (tag l = n-1)
 #                         :r   link to the next site     (tag l = n)
-#                         :s   site index, prime level 0
-#                         :sp  site index, prime level 1
+#                         :s   site index at op's LOWER site prime level  (input)
+#                         :sp  site index at op's HIGHER site prime level (output)
+#                         (relative to the operand, so a primed MPO H' with sites at
+#                          levels 1 and 2 still has :s = level 1, :sp = level 2)
 #                    k    the k-th index of that kind in op's stored order (the key comes
 #                         first, so on an aliased ψ = P·core, (:B,:l,1) is P's left link
 #                         in the key and (:B,:l,2) core's left link in the dense block)

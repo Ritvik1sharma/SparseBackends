@@ -114,6 +114,10 @@ _same(X::ITensor, Y::ITensor; atol=1e-12) =
         # absent (:A,:l,2), contracted (:B,:s) and out-of-range (:B,:r,3) roles are skipped
         L = R(OutputLayout(sparse=[(:B,:s), (:A,:l,2), (:B,:r,3), (:B,:l)], dense=ITensors.Index[]))
         @test L.sparse == [pl]
+        # :s / :sp are the operand's lower / higher site prime level (a primed G' has
+        # sites at levels 1 and 2)
+        rmp = SparseBackends._role_map(collect(inds(prime(G))))
+        @test rmp[(:s, 1)] == z' && rmp[(:sp, 1)] == z''
         # left/right come from the site number, not the l= order: on site 1 the l=1 link is r
         y  = Index(2, "Site,n=1"); y1 = Index(2, "Link,l=1")
         rm = SparseBackends._role_map([y, y1])
