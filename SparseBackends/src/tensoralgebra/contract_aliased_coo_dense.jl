@@ -49,16 +49,28 @@ function contract_aliased!(
               "  → AliasedBS{NC=", NC, ",N2=", N2, ",PC=", PC, ", blksize=", C.blksize, "}")
     end
 
-    # ── Align A so prefix order matches labelsC[1:PC], r is last ──
-    A, labelsA, mapA = aligned_A_to_Cprefix(A, labelsA, mapA, labelsC, PC, rlab)
+    # ── C's key: indices of A (COO), plus indices of B (dense) listed in it, which are
+    #    moved into the key ("fission"). Read from labelsC; the key slots are filled by
+    #    label, so moved indices may sit at any key position. ──
+    Ckey = labelsC[1:PC]
+    setA = Set(labelsA)
+    keyA = [lab for lab in Ckey if lab in setA]
+    keyM = [lab for lab in Ckey if !(lab in setA)]          # moved dense indices of B
+    all(lab -> lab != rlab && lab in labelsB, keyM) || _layout_error("COO × dense → aliased",
+        "C's key lists an index that is in neither operand")
+    nM = length(keyM)
 
-    # ── Align B so non-r dims match labelsC[PC+1:end], r is last ──
-    desired_not_rlab = [lab for lab in labelsC[PC+1:end] if lab != rlab]
+    # ── Align A so its axes are [keyA..., r] ──
+    A, labelsA, mapA = aligned_A_to_Cprefix(A, labelsA, mapA, keyA, length(keyA), rlab)
+
+    # ── Align B as [C dense..., moved..., r]: for a moved value m and reduction value rv
+    #    the slice B[:, m, rv] is contiguous and becomes one template ──
+    desired_not_rlab = vcat([lab for lab in labelsC[PC+1:end] if lab != rlab], keyM)
     rpos = findfirst(==(rlab), labelsB)
     @assert rpos !== nothing "rlab not found in labelsB"
-    perm = Vector{Int}(undef, NB)
     length(desired_not_rlab) == NB - 1 || _layout_error("COO × dense → aliased",
-        "C's dense block must hold every uncontracted index of the dense operand")
+        "C's dense block and key must together hold every uncontracted index of the dense operand")
+    perm = Vector{Int}(undef, NB)
     for (k, lab) in enumerate(desired_not_rlab)
         pos = findfirst(==(lab), labelsB)
         pos === nothing && _layout_error("COO × dense → aliased", "C's dense block lists " *
@@ -74,47 +86,68 @@ function contract_aliased!(
 
     dimsB   = size(B)
     R       = dimsB[end]
-    blksize = prod(dimsB[1:end-1]; init=1)
-    @assert C.blksize == blksize "C.blksize=$(C.blksize) must equal prod(B dims without r)=$blksize"
-    Bvec = vec(B)   # column-major; slice for fixed rv is contiguous
+    mdims   = Int[dimsB[NB - 1 - nM + d] for d in 1:nM]
+    Mprod   = prod(mdims; init=1)
+    blksize = prod(dimsB[1:NB-1-nM]; init=1)
+    @assert C.blksize == blksize "C.blksize=$(C.blksize) must equal prod(B dims without r and moved)=$blksize"
+    Bvec = vec(B)   # column-major; slice (m, rv) starts at ((rv-1)*Mprod + (m-1))*blksize
 
     axisAr = NA   # r is the last axis of A after alignment
 
+    # C key slot j comes from A's axis srcA[j] (> 0) or from moved index srcM[j] (> 0)
+    srcA = zeros(Int, PC); srcM = zeros(Int, PC)
+    @inbounds for j in 1:PC
+        ia = findfirst(==(Ckey[j]), keyA)
+        if ia !== nothing
+            srcA[j] = ia
+        else
+            srcM[j] = findfirst(==(Ckey[j]), keyM)
+        end
+    end
+    mstrides = ones(Int, max(nM, 1))
+    @inbounds for d in 2:nM
+        mstrides[d] = mstrides[d-1] * mdims[d-1]
+    end
+    @inline _mdigit(m, d) = ((m - 1) ÷ mstrides[d]) % mdims[d] + 1
+    @inline _ckey(acoord, m) =
+        ntuple(j -> srcA[j] != 0 ? acoord[srcA[j]] : _mdigit(m, srcM[j]), Val(PC))
+
     # ── Exact template count from A's integer keys alone (no dense data touched).
-    #    Clean P (every ckey hit once, e.g. P·core): one template per distinct rv.
-    #    Otherwise mirror the main loop: distinct rv among first contributions to a
-    #    ckey, plus one accumulated template per ckey hit >= 2 times.
+    #    Clean P (every A key hit once, e.g. P·core): one template per distinct (rv, m).
+    #    Otherwise mirror the main loop: distinct rv among first contributions to an A
+    #    key, plus one accumulated template per A key hit >= 2 times; each × Mprod (every
+    #    moved value m repeats the A-key pattern). ──
     rvs   = Set{Int}()
-    ckeys = Set{NTuple{PC,Int}}()
+    akeys = Set{NTuple{NA-1,Int}}()
     n_nz  = 0
     @inbounds for acoord in A.keys
         rv = acoord[axisAr]
         (1 <= rv <= R) || continue
         n_nz += 1
-        push!(rvs, rv); push!(ckeys, ntuple(j -> acoord[j], Val(PC)))
+        push!(rvs, rv); push!(akeys, ntuple(j -> acoord[j], Val(NA-1)))
     end
-    if length(ckeys) == n_nz
-        n_tmpl_final = length(rvs)
+    if length(akeys) == n_nz
+        n_tmpl_final = length(rvs) * Mprod
     else
-        ckey_count = Dict{NTuple{PC,Int},Int}()
+        akey_count = Dict{NTuple{NA-1,Int},Int}()
         first_rvs  = Set{Int}()
         @inbounds for acoord in A.keys
             rv = acoord[axisAr]
             (1 <= rv <= R) || continue
-            ckey = ntuple(j -> acoord[j], Val(PC))
-            c = get(ckey_count, ckey, 0) + 1
-            ckey_count[ckey] = c
+            akey = ntuple(j -> acoord[j], Val(NA-1))
+            c = get(akey_count, akey, 0) + 1
+            akey_count[akey] = c
             c == 1 && push!(first_rvs, rv)
         end
-        n_tmpl_final = length(first_rvs) + count(>=(2), values(ckey_count))
+        n_tmpl_final = (length(first_rvs) + count(>=(2), values(akey_count))) * Mprod
     end
 
     # ── Clear output; templates allocated at their exact final size ──
     C.templates = Vector{TC}(undef, n_tmpl_final * blksize); C.n_templates = 0
     empty!(C.keys); empty!(C.alias_ids); empty!(C.scalars)
 
-    # Template deduplication: rv index -> template id
-    rv_to_tid = Dict{Int,Int}()
+    # Template deduplication: (rv, m) -> template id
+    rv_to_tid = Dict{Tuple{Int,Int},Int}()
 
     # Two intermediate maps (resolved into C arrays after all COO entries processed):
     #   key_to_alias[k] = (tid, α)    — block has a single contribution  (aliased)
@@ -127,12 +160,13 @@ function contract_aliased!(
         α      = convert(TC, A.vals[idx])
         rv     = acoord[axisAr]
         (1 <= rv <= R) || continue
-        ckey   = ntuple(j -> acoord[j], Val(PC))
+        for m in 1:Mprod
+        ckey    = _ckey(acoord, m)
+        src_off = ((rv - 1) * Mprod + (m - 1)) * blksize
 
         if haskey(key_to_accum, ckey)
-            # ── Key already accumulating: add α * B[:,rv] to running block ──
+            # ── Key already accumulating: add α * B[:,m,rv] to running block ──
             acc     = key_to_accum[ckey]
-            src_off = (rv - 1) * blksize
             @simd for j in 1:blksize
                 acc[j] += α * convert(TC, Bvec[src_off + j])
             end
@@ -146,7 +180,6 @@ function contract_aliased!(
             delete!(key_to_alias, ckey)
             acc      = Vector{TC}(undef, blksize)
             tmpl_off = (tid_prev - 1) * blksize
-            src_off  = (rv - 1) * blksize
             @simd for j in 1:blksize
                 acc[j] = α_prev * C.templates[tmpl_off + j] +
                          α      * convert(TC, Bvec[src_off + j])
@@ -155,19 +188,19 @@ function contract_aliased!(
 
         else
             # ── First contribution: register/reuse a template ──
-            tid = get(rv_to_tid, rv, 0)
+            tid = get(rv_to_tid, (rv, m), 0)
             if tid == 0
-                # New template: copy B[:,rv] into C.templates
+                # New template: copy B[:,m,rv] into C.templates
                 C.n_templates += 1
                 tid = C.n_templates
-                rv_to_tid[rv] = tid
-                src_off = (rv - 1) * blksize
+                rv_to_tid[(rv, m)] = tid
                 dst_off = (tid - 1) * blksize
                 for j in 1:blksize
                     C.templates[dst_off + j] = convert(TC, Bvec[src_off + j])
                 end
             end
             key_to_alias[ckey] = (tid, α)
+        end
         end
     end
 
@@ -201,9 +234,15 @@ function contract_aliased!(
     # (Diagonal P has rv == output site, so this equals the group-by-s' derivation ⇒ PXP
     # stays bit-identical.) Accumulated (multi-rv) templates are absent from rv_to_tid —
     # a clean P·core has none. Unset rv slots stay 0 (that pre-P slice absent).
-    s2t = zeros(Int, R)
-    for (rv, tid) in rv_to_tid; s2t[rv] = tid; end
-    C.slice_to_template = s2t
+    # With moved indices one rv has Mprod templates, which this map cannot express: it is
+    # left empty (absent), so the factor-core helpers refuse rather than guess.
+    if Mprod == 1
+        s2t = zeros(Int, R)
+        for ((rv, _), tid) in rv_to_tid; s2t[rv] = tid; end
+        C.slice_to_template = s2t
+    else
+        C.slice_to_template = Int[]
+    end
 
     @assert C.n_templates == n_tmpl_final
     return C

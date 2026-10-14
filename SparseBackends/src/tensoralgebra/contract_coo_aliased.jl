@@ -53,6 +53,59 @@ function contract!(
 end
 
 
+
+# Lay out B's dense block for a COO × aliased contraction, from labelsC: permute it to
+# [C's dense indices in C's order..., moved..., tail...], where "moved" are B dense
+# indices listed in C's key (split into it) and `tail` is the contracted index if it sits
+# in B's dense block. Returns B, labelsB, mapB, the moved labels and their dims.
+# No permute when B is already in that order (the stock layout).
+function _coo_aliased_layout_B(B::AliasedBlockSparse{TB,NB,N2B,PB}, labelsB, labelsC,
+                               PC::Int, tail::Vector, kernel::String) where {TB,NB,N2B,PB}
+    Bdense = labelsB[PB+1:NB]
+    Ckey   = labelsC[1:PC]
+    Cdense = collect(labelsC[PC+1:end])
+    keyM   = [lab for lab in Ckey if lab in Bdense]
+    want   = vcat(Cdense, keyM, tail)
+    (length(want) == N2B && Set(want) == Set(Bdense)) || _layout_error(kernel,
+        "C's dense block and moved key indices must be exactly B's uncontracted dense " *
+        "indices (an index of A or of B's key cannot go in the dense block)")
+    if want != Bdense
+        perm_dense  = [findfirst(==(lab), Bdense) for lab in want]
+        perm_global = vcat(collect(1:PB), PB .+ perm_dense)
+        B       = permutedims(B, perm_global)
+        labelsB = labelsB[perm_global]
+    end
+    mapB  = Dict(lab => i for (i, lab) in enumerate(labelsB))
+    mdims = Int[B.dims[mapB[lab]] for lab in keyM]
+    return B, labelsB, mapB, keyM, mdims
+end
+
+# C key slot j comes from A's axis srcA[j], B's key axis srcB[j], or moved index srcM[j].
+function _coo_aliased_key_sources(labelsC, PC::Int, mapA, mapB, PB::Int, keyM, rlab, kernel)
+    srcA = zeros(Int, PC); srcB = zeros(Int, PC); srcM = zeros(Int, PC)
+    @inbounds for j in 1:PC
+        lab = labelsC[j]
+        if haskey(mapA, lab) && lab != rlab
+            srcA[j] = mapA[lab]
+        elseif (im = findfirst(==(lab), keyM)) !== nothing
+            srcM[j] = im
+        else
+            ax = get(mapB, lab, 0)
+            (1 <= ax <= PB && lab != rlab) || _layout_error(kernel,
+                "C's key may only list indices of A, B's key indices and B's dense indices")
+            srcB[j] = ax
+        end
+    end
+    return srcA, srcB, srcM
+end
+
+@inline _mdigit(m::Int, d::Int, mstrides, mdims) = ((m - 1) ÷ mstrides[d]) % mdims[d] + 1
+function _mstrides(mdims)
+    st = ones(Int, max(length(mdims), 1))
+    for d in 2:length(mdims); st[d] = st[d-1] * mdims[d-1]; end
+    return st
+end
+
 # ─────────────────────────────────────────────────────────────────────────────
 # r in B's sparse prefix.  C dense tail = B dense tail.
 # Merge A's r-runs against B's r-keys; for each match, accumulate
@@ -70,37 +123,27 @@ function _contract_coo_aliased_prefix!(
     rlab,
 ) where {TC,NC,N2C,PC,TA,NA,TB,NB,N2B,PB}
     @assert !(rlab in labelsC) "rlab must be reduced"
-    # C's dense block is B's dense block, in B's order (B's templates are reused as is).
-    collect(labelsC[PC+1:NC]) == collect(labelsB[PB+1:NB]) || _layout_error("COO × aliased (contracted index in B's key)",
-        "C's dense block must be B's dense indices in B's order (moving an index into the " *
-        "key or reordering the dense block is not supported yet)")
-    @assert C.blksize == B.blksize  "C and B block sizes must match"
+    K = "COO × aliased (contracted index in B's key)"
+    # B's dense block as [C dense..., moved...]: template tidB's chunk for moved value m
+    # is then contiguous, and is combined template (tidB - 1) * Mprod + m.
+    B, labelsB, mapB, keyM, mdims = _coo_aliased_layout_B(B, labelsB, labelsC, PC, Any[], K)
+    Mprod = prod(mdims; init=1)
+    @assert C.blksize * Mprod == B.blksize  "C block size × moved dims must equal B's block size"
     axisAr = mapA[rlab]
     @assert axisAr == NA
     axisBr = mapB[rlab]
     @assert axisBr == PB
 
-    # Source map for each C prefix axis.
-    srcA = zeros(Int, PC)
-    srcB = zeros(Int, PC)
-    @inbounds for j in 1:PC
-        lab = labelsC[j]
-        if haskey(mapA, lab) && lab != rlab
-            srcA[j] = mapA[lab]
-        else
-            ax = get(mapB, lab, 0)
-            (1 <= ax <= PB && lab != rlab) || _layout_error("COO × aliased (contracted index in B's key)",
-                "C's key may only list indices of A and B's key indices")
-            srcB[j] = ax
-        end
-    end
+    srcA, srcB, srcM = _coo_aliased_key_sources(labelsC, PC, mapA, mapB, PB, keyM, rlab, K)
+    mstrides = _mstrides(mdims)
 
-    # Clear C; lazy: stage all of B's templates in `pending` (indexed 1..n_pending
-    # = 1..B.n_templates).  Only the referenced ones are copied at commit time.
+    # Clear C; lazy: stage all of B's templates in `pending`, viewed as n_templates × Mprod
+    # chunks of C.blksize (indexed 1..n_pending). Only the referenced ones are copied at
+    # commit time.
     empty!(C.templates); C.n_templates = 0
     empty!(C.keys); empty!(C.alias_ids); empty!(C.scalars)
     pending = copy(B.templates)
-    n_pending = B.n_templates
+    n_pending = B.n_templates * Mprod
 
     key_to_alias = Dict{NTuple{PC,Int}, Tuple{Int,TC}}()
     key_to_accum = Dict{NTuple{PC,Int}, Vector{TC}}()
@@ -125,10 +168,14 @@ function _contract_coo_aliased_prefix!(
             bkey   = B.keys[bi]
             tidB   = Int(B.alias_ids[bi])   # alias ids may be compacted (UInt8)
             αB     = convert(TC, B.scalars[bi])
-            ckey   = ntuple(j -> (srcA[j] != 0 ? acoord[srcA[j]] : bkey[srcB[j]]), Val(PC))
             scalar = α * αB
-            _aliased_contribute!(key_to_alias, key_to_accum, pending,
-                                 ckey, tidB, scalar, C.blksize)
+            for m in 1:Mprod
+                ckey = ntuple(j -> srcA[j] != 0 ? acoord[srcA[j]] :
+                                   srcB[j] != 0 ? bkey[srcB[j]] :
+                                   _mdigit(m, srcM[j], mstrides, mdims), Val(PC))
+                _aliased_contribute!(key_to_alias, key_to_accum, pending,
+                                     ckey, (tidB - 1) * Mprod + m, scalar, C.blksize)
+            end
         end
     end
 
@@ -165,52 +212,29 @@ function _contract_coo_aliased_dense!(
     rlab,
 ) where {TC,NC,N2C,PC,TA,NA,TB,NB,N2B,PB}
     @assert !(rlab in labelsC) "rlab must be reduced"
-
-    # Permute B so r is the last dense axis (chunk layout: (chunk, R)).
-    redpos = mapB[rlab] - PB        # 1..N2B
-    @assert 1 <= redpos <= N2B
-    if redpos != N2B
-        perm_dense = vcat([d for d in 1:N2B if d != redpos], redpos)
-        perm_global = vcat(collect(1:PB), PB .+ perm_dense)
-        B       = permutedims(B, perm_global)
-        labelsB = labelsB[perm_global]
-        mapB    = Dict(lab => i for (i, lab) in enumerate(labelsB))
-    end
+    K = "COO × aliased (contracted index in B's dense block)"
+    # B's dense block as [C dense..., moved..., r]: for a moved value m and reduction value
+    # rv, template tidB's chunk (m, rv) is contiguous and becomes one combined template.
+    B, labelsB, mapB, keyM, mdims = _coo_aliased_layout_B(B, labelsB, labelsC, PC, Any[rlab], K)
     @assert mapB[rlab] == NB
-    # C's dense block is B's dense block without r, in B's order.
-    collect(labelsC[PC+1:NC]) == collect(labelsB[PB+1:NB-1]) || _layout_error("COO × aliased (contracted index in B's dense block)",
-        "C's dense block must be B's dense indices (without the contracted one) in B's " *
-        "order (moving an index into the key or reordering is not supported yet)")
+    Mprod = prod(mdims; init=1)
     dimsB_dense = ntuple(i -> B.dims[PB+i], Val(N2B))
     Rdim     = dimsB_dense[end]
-    chunklen = prod(dimsB_dense[1:end-1]; init=1)
-    @assert chunklen == C.blksize "C.blksize=$(C.blksize) must equal B-dense-without-r product=$chunklen"
-    @assert B.blksize == chunklen * Rdim
+    chunklen = prod(dimsB_dense[1:end-1-length(keyM)]; init=1)
+    @assert chunklen == C.blksize "C.blksize=$(C.blksize) must equal B-dense-without-r-and-moved product=$chunklen"
+    @assert B.blksize == chunklen * Mprod * Rdim
 
     axisAr = mapA[rlab]
     @assert axisAr == NA
 
-    # Source map for each C prefix axis: each label comes from A's non-r axes
-    # OR from B's prefix.
-    srcA = zeros(Int, PC)
-    srcB = zeros(Int, PC)
-    @inbounds for j in 1:PC
-        lab = labelsC[j]
-        if haskey(mapA, lab) && lab != rlab
-            srcA[j] = mapA[lab]
-        else
-            ax = get(mapB, lab, 0)
-            (1 <= ax <= PB && lab != rlab) || _layout_error("COO × aliased (contracted index in B's dense block)",
-                "C's key may only list indices of A and B's key indices")
-            srcB[j] = ax
-        end
-    end
+    srcA, srcB, srcM = _coo_aliased_key_sources(labelsC, PC, mapA, mapB, PB, keyM, rlab, K)
+    mstrides = _mstrides(mdims)
 
     # Clear C; lazy: collect combined templates in `pending`, only commit referenced ones.
     empty!(C.templates); C.n_templates = 0
     empty!(C.keys); empty!(C.alias_ids); empty!(C.scalars)
 
-    combined_tid_map = Dict{Tuple{Int,Int}, Int}()
+    combined_tid_map = Dict{Tuple{Int,Int,Int}, Int}()
     pending = TC[]
     n_pending = 0
 
@@ -228,21 +252,25 @@ function _contract_coo_aliased_dense!(
             tidB = Int(B.alias_ids[j])   # alias ids may be compacted (UInt8)
             αB   = convert(TC, B.scalars[j])
 
-            combined_tid = get(combined_tid_map, (tidB, rv), 0)
-            if combined_tid == 0
-                n_pending += 1
-                combined_tid = n_pending
-                combined_tid_map[(tidB, rv)] = combined_tid
-                t_off = (tidB - 1) * B.blksize + (rv - 1) * chunklen
-                @inbounds for k in 1:chunklen
-                    push!(pending, convert(TC, B.templates[t_off + k]))
-                end
-            end
-
-            ckey   = ntuple(k -> (srcA[k] != 0 ? acoord[srcA[k]] : bkey[srcB[k]]), Val(PC))
             scalar = α * αB
-            _aliased_contribute!(key_to_alias, key_to_accum, pending,
-                                 ckey, combined_tid, scalar, C.blksize)
+            for m in 1:Mprod
+                combined_tid = get(combined_tid_map, (tidB, rv, m), 0)
+                if combined_tid == 0
+                    n_pending += 1
+                    combined_tid = n_pending
+                    combined_tid_map[(tidB, rv, m)] = combined_tid
+                    t_off = (tidB - 1) * B.blksize + ((rv - 1) * Mprod + (m - 1)) * chunklen
+                    @inbounds for k in 1:chunklen
+                        push!(pending, convert(TC, B.templates[t_off + k]))
+                    end
+                end
+
+                ckey = ntuple(k -> srcA[k] != 0 ? acoord[srcA[k]] :
+                                   srcB[k] != 0 ? bkey[srcB[k]] :
+                                   _mdigit(m, srcM[k], mstrides, mdims), Val(PC))
+                _aliased_contribute!(key_to_alias, key_to_accum, pending,
+                                     ckey, combined_tid, scalar, C.blksize)
+            end
         end
     end
 
