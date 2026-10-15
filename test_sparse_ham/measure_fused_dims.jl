@@ -7,16 +7,11 @@ using LinearAlgebra: BLAS
 BLAS.set_num_threads(1)
 include("aliased_helpers.jl")
 include("../test_sparse_psi/utils.jl")
+include(joinpath(@__DIR__, "..", "..", "experiments", "utils", "cotenn_utils.jl"))
 
-function sandwich_mpo(P::MPO, H::MPO; output_hint::Symbol = :default)
-    H1    = contract(P'', H', :coo, :dense; Cbackend=output_hint)
-    H_eff = contract(P, H1, :coo, output_hint; Cbackend=output_hint)
-    return replaceprime(H_eff, 3 => 1)
-end
-mulMPO(A::MPO, B::MPO) = replaceprime(contract(A, prime(B, "Site"), :coo, :coo), 2 => 1)
 function multiplyVecMPOtoMPO(vec::Vector{MPO})
     result = vec[1]
-    for j in 2:length(vec); result = mulMPO(result, vec[j]); end
+    for j in 2:length(vec); result = multiply_mpos(result, vec[j]; Abackend = :coo, Bbackend = :coo); end
     return result
 end
 
@@ -49,7 +44,7 @@ let
     ConsOpsCombined = multiplyVecMPOtoMPO(ConsOps1)
     H = MPO(os, sites)
 
-    H_new_aliased = sandwich_mpo(ConsOpsCombined, copy(H); output_hint = :aliased)
+    H_new_aliased = sandwich_mpo(ConsOpsCombined, copy(H); datastructure = :aliased)
     fuse_sparse_links!(H_new_aliased)
     prepermute_aliased_mpo!(H_new_aliased)
 

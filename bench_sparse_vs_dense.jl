@@ -1,6 +1,7 @@
 using SparseBackends, Random
 using ITensors, ITensorMPS
 using TimerOutputs: reset_timer!
+include(joinpath(@__DIR__, "..", "experiments", "utils", "cotenn_utils.jl"))
 
 # Sweep N, spin, maxdim and time DMRG sweeps for both sparse and dense projected H.
 # Lifted from test_check_working.jl utilities and inlined for self-containment.
@@ -45,26 +46,10 @@ function _build_H_and_P(N::Int, spin::Int; lambda=0.0, spin_sector=1.0)
     return sites, MPO(os, sites), ConsOps1, ConsOps2
 end
 
-function _mulMPO(A::MPO, B::MPO)
-    Bp = prime(B, "Site")
-    C = contract(A, Bp, :coo, :coo)
-    return replaceprime(C, 2 => 1)
-end
-
 function _multiplyVec(vec::Vector{MPO})
     result = vec[1]
     for j in 2:length(vec)
-        result = _mulMPO(result, vec[j])
-    end
-    return result
-end
-
-function _multiplydense(vec::Vector{MPO})
-    result = vec[1]
-    for j in 2:length(vec)
-        Bp = prime(vec[j], "Site")
-        result = contract(result, Bp; is_ctn_compression=true)
-        result = replaceprime(result, 2 => 1)
+        result = multiply_mpos(result, vec[j]; Abackend = :coo, Bbackend = :coo)
     end
     return result
 end
@@ -72,12 +57,6 @@ end
 function _sandwich_sparse(P, H)
     H1 = contract(P'', H', :coo, :dense)
     Heff = contract(P, H1, :coo, :blocksparse)
-    return replaceprime(Heff, 3 => 1)
-end
-
-function _sandwich_dense(P, H)
-    H1 = contract(P'', H'; is_ctn_compression=true)
-    Heff = contract(P, H1; is_ctn_compression=true)
     return replaceprime(Heff, 3 => 1)
 end
 
@@ -97,10 +76,10 @@ function bench_one(N::Int, spin::Int, mdim::Int; nsweeps=2, cutoff=1e-12, seed=4
     sites, H, ConsOps1, ConsOps2 = _build_H_and_P(N, spin)
 
     P_sparse = _multiplyVec(ConsOps1)
-    P_dense  = _multiplydense(ConsOps1)
 
     H_sparse = _sandwich_sparse(P_sparse, H)
-    H_dense  = _sandwich_dense(P_dense, H)
+    # exact dense P†HP: projectors merged exactly, sandwiched once, no SVD
+    H_dense  = sandwich_mpo(ConsOps1, H; cutoff1 = 0, cutoff2 = 0)
 
     sp_frac = _sparsity(H_sparse)
 

@@ -10,6 +10,7 @@
 
 using SparseBackends, Random
 using ITensors, ITensorMPS
+include(joinpath(@__DIR__, "..", "..", "experiments", "utils", "cotenn_utils.jl"))
 
 length(ARGS) < 1 && error("Usage: julia measure_env_aliasing.jl <N_plaq>")
 
@@ -43,15 +44,9 @@ function clean!(op::MPO; tol=1e-12)
     return op
 end
 
-function mulMPO(A::MPO, B::MPO)
-    Bp = prime(B, "Site")
-    C = contract(A, Bp, :coo, :coo)
-    return replaceprime(C, 2 => 1)
-end
-
 function multiplyVec(vec::Vector{MPO})
     result = vec[1]
-    for j in 2:length(vec); result = mulMPO(result, vec[j]); end
+    for j in 2:length(vec); result = multiply_mpos(result, vec[j]; Abackend = :coo, Bbackend = :coo); end
     return result
 end
 

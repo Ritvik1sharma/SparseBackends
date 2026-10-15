@@ -6,6 +6,7 @@ using LinearAlgebra: norm
 using Random
 using Printf
 include("../utils.jl")
+include(joinpath(@__DIR__, "..", "..", "..", "experiments", "utils", "cotenn_utils.jl"))
 
 let
     Random.seed!(42)
@@ -21,9 +22,8 @@ let
         push!(os2, t)
     end
     ConsOps1 = [clean!(MPO(os2[j], sites, [2*j-1, 2*j, 2*j+1, 2*j+2])) for j in 1:N]
-    function mulMPO(A, B); Bp = prime(B, "Site"); replaceprime(contract(A, Bp, :coo, :coo), 2 => 1); end
     P_sparse = ConsOps1[1]
-    for j in 2:length(ConsOps1); P_sparse = mulMPO(P_sparse, ConsOps1[j]); end
+    for j in 2:length(ConsOps1); P_sparse = multiply_mpos(P_sparse, ConsOps1[j]; Abackend = :coo, Bbackend = :coo); end
     psi0   = random_mps(sites)
     psi_sp = replaceprime(contract(P_sparse, copy(psi0), :coo, :dense), 1 => 0)
 

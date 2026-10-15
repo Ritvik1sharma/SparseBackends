@@ -6,6 +6,7 @@ using Random
 using ArgParse
 
 include("../utils.jl")
+include(joinpath(@__DIR__, "..", "..", "..", "experiments", "utils", "cotenn_utils.jl"))
 
 function parse_command_line()
     s = ArgParseSettings()
@@ -58,8 +59,7 @@ function build_setup(N::Int, psign::Int, spin::Int)
         push!(os2, t)
     end
     ConsOps1 = [clean!(MPO(os2[j], sites, [2*j-1, 2*j, 2*j+1, 2*j+2])) for j in 1:N]
-    function mulMPO(A, B); Bp = prime(B, "Site"); replaceprime(contract(A, Bp, :coo, :coo), 2 => 1); end
-    P_sparse = ConsOps1[1]; for j in 2:length(ConsOps1); P_sparse = mulMPO(P_sparse, ConsOps1[j]); end
+    P_sparse = ConsOps1[1]; for j in 2:length(ConsOps1); P_sparse = multiply_mpos(P_sparse, ConsOps1[j]; Abackend = :coo, Bbackend = :coo); end
     H        = MPO(os, sites)
     H1       = contract(P_sparse'', H', :coo, :dense)
     H_sparse = replaceprime(contract(P_sparse, H1, :coo, :blocksparse), 3 => 1)
