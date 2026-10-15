@@ -9,6 +9,8 @@
 # `mulMPO` defined in every sparse test driver.
 
 using ITensors, ITensorMPS, SparseBackends, Printf
+isdefined(@__MODULE__, :multiply_mpos) ||
+    include(joinpath(@__DIR__, "..", "experiments", "utils", "cotenn_utils.jl"))
 
 # --- storage introspection --------------------------------------------------
 
@@ -114,15 +116,12 @@ end
 
 # --- projector construction and application ---------------------------------
 
-"""MPO product through the COO backend. `prime(B,"Site")` lifts B to levels 1/2 so
-A's output legs meet B's input legs; `replaceprime(2=>1)` restores the 0/1 MPO
-convention. `:coo,:coo` keeps the product sparse -- without it, building
+"""P = prod_j Pi_j through the COO backend (cotenn_utils `multiply_mpos` with
+`:coo, :coo`). `:coo,:coo` keeps the product sparse -- without it, building
 P = prod_j Pi_j densifies at the first multiply."""
-mul_coo(A::MPO, B::MPO) = replaceprime(contract(A, prime(B, "Site"), :coo, :coo), 2 => 1)
-
 function mul_coo(v::Vector{MPO})
     P = v[1]
-    for j in 2:length(v); P = mul_coo(P, v[j]); end
+    for j in 2:length(v); P = multiply_mpos(P, v[j]; Abackend = :coo, Bbackend = :coo); end
     return P
 end
 

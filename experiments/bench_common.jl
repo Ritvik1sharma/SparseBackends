@@ -94,7 +94,7 @@ function build_problem(cfg::NamedTuple, variant::Symbol, seed::Int)
         error("build_problem: unknown model $(cfg.model)")
     end
     build_seconds = @elapsed begin
-        H_php = spec.php === :dense ? sandwich_mpo(Ps, H_raw) : sandwich_mpo_aliased(Ps, H_raw)
+        H_php = spec.php === :dense ? sandwich_mpo(Ps, H_raw; cutoff1 = 0, cutoff2 = 0) : sandwich_mpo_aliased(Ps, H_raw)
     end
 
     extras["sites"] = sites

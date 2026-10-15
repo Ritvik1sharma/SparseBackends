@@ -19,6 +19,7 @@ using SparseBackends, ITensors, ITensorMPS
 using LinearAlgebra
 using Random
 include("../utils.jl")
+include(joinpath(@__DIR__, "..", "..", "..", "experiments", "utils", "cotenn_utils.jl"))
 
 # Reproduce verify_iso.jl's setup. N plaquettes of (I + exp(iπSy)·exp(iπSx)·
 # exp(iπSx)·exp(iπSy)) on 4 sites each, overlapping at every other site.
@@ -34,9 +35,8 @@ function build_setup(N::Int; linkdim::Int=1)
         push!(os2, t)
     end
     ConsOps1 = [clean!(MPO(os2[j], sites, [2*j-1, 2*j, 2*j+1, 2*j+2])) for j in 1:N]
-    mulMPO(A, B) = (Bp = prime(B, "Site"); replaceprime(contract(A, Bp, :coo, :coo), 2 => 1))
     P_sparse = ConsOps1[1]
-    for j in 2:length(ConsOps1); P_sparse = mulMPO(P_sparse, ConsOps1[j]); end
+    for j in 2:length(ConsOps1); P_sparse = multiply_mpos(P_sparse, ConsOps1[j]; Abackend = :coo, Bbackend = :coo); end
     psi0   = random_mps(sites; linkdims=linkdim)
     psi_sp = replaceprime(contract(P_sparse, copy(psi0), :coo, :dense), 1 => 0)
     return psi_sp

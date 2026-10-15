@@ -1,59 +1,7 @@
 using ITensors, ITensorMPS, Random, LinearAlgebra
+include(joinpath(@__DIR__, "..", "..", "..", "experiments", "utils", "cotenn_utils.jl"))
 
 
-
-function sandwich_mpo(P::MPO, H::MPO)
-  H_eff = contract(contract(P'', H'; cutoff=1e-12), P; cutoff=1e-32)
-  H_eff = replaceprime(H_eff, 3 => 1)
-  return H_eff
-end
-
-function multiply_mpos(A::MPO, B::MPO; is_ctn_compression=false, cutoff=0.0, maxdim=typemax(Int), debug=false)
-  Bp = prime(B, "Site")
-  if is_ctn_compression
-    C  = contract(A, Bp; is_ctn_compression=is_ctn_compression, debug=debug, cutoff=cutoff, maxdim=maxdim)
-  else
-    C  = contract(A, Bp; cutoff=1e-12)
-  end
-  return replaceprime(C, 2 => 1)
-end
-
-function multiply_mpo_mps(A::MPO, B::MPS; is_ctn_compression=false, cutoff=0.0, maxdim=typemax(Int), debug=false)
-  C  = contract(A, B; cutoff=cutoff)
-  C = replaceprime(C, 1 => 0)
-  return C
-end
-
-function multiply_mpo_mps(A::Vector{MPO}, B::MPS)
-  for i in 1:length(A)
-    B = multiply_mpo_mps(A[i], B; cutoff=1e-12)
-  end
-  return B
-end
-
-function sandwich_mpo(P::Vector{MPO}, H::MPO)
-  H_eff = H
-  for i in 1:length(P)
-    H_eff = sandwich_mpo(P[i], H_eff)
-  end
-  return H_eff
-end
-
-function get_energy(H::MPO, psi::MPS)
-  return inner(psi', H, psi)
-end
-
-function add_to_constr!(P::Vector{MPO}, constr::MPO)
-    push!(P, constr)
-    return P
-end
-
-function add_to_constr!(P::Vector{MPO}, constr::Vector{MPO})
-    for c in constr
-        add_to_constr!(P, c)
-    end
-    return P
-end
 
 let
 	

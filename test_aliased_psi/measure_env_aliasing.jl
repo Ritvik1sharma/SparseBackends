@@ -13,6 +13,7 @@ using Random
 using Printf
 
 include("../test_sparse_psi/utils.jl")
+include(joinpath(@__DIR__, "..", "..", "experiments", "utils", "cotenn_utils.jl"))
 
 function build_setup(N::Int, psign::Int)
     Random.seed!(42)
@@ -32,8 +33,7 @@ function build_setup(N::Int, psign::Int)
         push!(os2, t)
     end
     ConsOps1 = [clean!(MPO(os2[j], sites, [2*j-1, 2*j, 2*j+1, 2*j+2])) for j in 1:N]
-    function mulMPO(A, B); Bp = prime(B, "Site"); replaceprime(contract(A, Bp, :coo, :coo), 2 => 1); end
-    P_sparse = ConsOps1[1]; for j in 2:length(ConsOps1); P_sparse = mulMPO(P_sparse, ConsOps1[j]); end
+    P_sparse = ConsOps1[1]; for j in 2:length(ConsOps1); P_sparse = multiply_mpos(P_sparse, ConsOps1[j]; Abackend = :coo, Bbackend = :coo); end
     H        = MPO(os, sites)
     psi0     = random_mps(sites)
     psi_ali  = replaceprime(contract(P_sparse, copy(psi0), :coo, :aliased; denseLinksB=0), 1 => 0)

@@ -12,6 +12,7 @@ using SparseBackends, ITensors, ITensorMPS
 using LinearAlgebra, Random, Printf
 using TimerOutputs: reset_timer!, print_timer
 include("../test_sparse_psi/utils.jl")
+include(joinpath(@__DIR__, "..", "..", "experiments", "utils", "cotenn_utils.jl"))
 
 function build_setup(N::Int, psign::Int, spin::Int)
     Random.seed!(42)
@@ -27,8 +28,7 @@ function build_setup(N::Int, psign::Int, spin::Int)
         push!(os2, t)
     end
     ConsOps1 = [clean!(MPO(os2[j], sites, [2*j-1,2*j,2*j+1,2*j+2])) for j in 1:N]
-    mulMPO(A,B) = replaceprime(contract(A, prime(B,"Site"), :coo,:coo), 2=>1)
-    P = ConsOps1[1]; for j in 2:length(ConsOps1); P = mulMPO(P, ConsOps1[j]); end
+    P = ConsOps1[1]; for j in 2:length(ConsOps1); P = multiply_mpos(P, ConsOps1[j]; Abackend = :coo, Bbackend = :coo); end
     H = MPO(os, sites); psi0 = random_mps(sites)
     psi = replaceprime(contract(P, copy(psi0), :coo,:aliased; denseLinksB=0), 1=>0)
     return H, psi

@@ -2,10 +2,8 @@
 #
 # Variant of ../test_check_working.jl that stores the projected Hamiltonian
 # (H_new in the original) using `AliasedBlockSparse` instead of
-# `NewBlockSparseSorted`. Both intermediates of `sandwich_mpo` are routed
-# through `contract_aliased_itensor` when `output_hint = :aliased`.
-#
-# Original behaviour is preserved when no output_hint is supplied.
+# `NewBlockSparseSorted`. Both intermediates of the shared cotenn_utils
+# `sandwich_mpo` go through the aliased kernel (`datastructure = :aliased`).
 
 using SparseBackends, Random
 using ITensors, ITensorMPS
@@ -18,6 +16,7 @@ const _DIAG = get(ENV, "DMRG_DIAG", "0") == "1"
 
 include("aliased_helpers.jl")
 include("../test_sparse_psi/utils.jl")
+include(joinpath(@__DIR__, "..", "..", "experiments", "utils", "cotenn_utils.jl"))
 
 function calcInner(Oper::Vector{MPO}, state::MPS)
     diff = 0
@@ -44,40 +43,14 @@ function reindex_mpo_siteinds(mpo::MPO, index_map::Vector{Pair{Index{Int64}, Ind
     return new_mpo
 end
 
+# P H P and the MPO products are the shared cotenn_utils ones:
+#   sandwich_mpo(P, H; datastructure = :aliased)   — COO P, dense H -> aliased
+#   sandwich_mpo(P, H; cutoff1 = 0, cutoff2 = 0)   — exact dense (is_ctn_compression)
 # ─────────────────────────────────────────────────────────────────────────────
-# sandwich_mpo — projected Hamiltonian P H P.
-#
-# `output_hint` controls the storage of intermediate / output tensors:
-#   :default              — original behaviour (NewBlockSparseSorted via
-#                           SparseBackends.contract with :coo / :blocksparse).
-#   :aliased              — both contractions go through
-#                           SparseBackends.contract_aliased_itensor so the
-#                           result is backed by AliasedBlockSparse.
-#   :dense                — plain ITensors.contract (no sparse storage).
-# ─────────────────────────────────────────────────────────────────────────────
-function sandwich_mpo(P::MPO, H::MPO; output_hint::Symbol = :default)
-    H1    = contract(P'', H', :coo, :dense; Cbackend=output_hint)
-    H_eff = contract(P, H1, :coo, output_hint; Cbackend=output_hint)
-    return replaceprime(H_eff, 3 => 1)
-    # end
-end
-
-function sandwich_mpo_dense(P::MPO, H::MPO)
-    H1    = contract(P'', H'; is_ctn_compression=true)
-    H_eff = contract(P, H1; is_ctn_compression=true)
-    return replaceprime(H_eff, 3 => 1)
-end
-
-function mulMPO(A::MPO, B::MPO; is_ctn_compression=false, cutoff=0.0, maxdim=typemax(Int), debug=false)
-    Bp = prime(B, "Site")
-    C  = contract(A, Bp, :coo, :coo)
-    return replaceprime(C, 2 => 1)
-end
-
 function multiplyVecMPOtoMPO(vec::Vector{MPO}; is_ctn_compression=false, cutoff=0.0, maxdim=typemax(Int))
     result = vec[1]
     for j in 2:length(vec)
-        result = mulMPO(result, vec[j]; is_ctn_compression, cutoff, maxdim)
+        result = multiply_mpos(result, vec[j]; Abackend = :coo, Bbackend = :coo)   # COO, exact (kwargs unused)
     end
     return result
 end
@@ -85,8 +58,7 @@ end
 function multiplydense(vec::Vector{MPO}; is_ctn_compression=false, cutoff=0.0, maxdim=typemax(Int))
     result = vec[1]
     for j in 2:length(vec)
-        Bp     = prime(vec[j], "Site")
-        result = replaceprime(contract(result, Bp; is_ctn_compression=true), 2 => 1)
+        result = multiply_mpos(result, vec[j]; cutoff = 0)   # dense, exact (kwargs unused)
     end
     return result
 end
@@ -199,8 +171,8 @@ let
     H                = MPO(os, sites)
 
     # ── Aliased path ──────────────────────────────────────────────────────────
-    println("\n[building H_new with output_hint = :aliased]")
-    H_new_aliased = sandwich_mpo(ConsOpsCombined, copy(H); output_hint = :aliased)
+    println("\n[building H_new with datastructure = :aliased]")
+    H_new_aliased = sandwich_mpo(ConsOpsCombined, copy(H); datastructure = :aliased)
 
     # Link fusion is always applied for the aliased path (was gated by
     # SB_FUSE_LINKS): it produces the compact "FusedSparse"-tagged links the
@@ -218,7 +190,7 @@ let
     prepermute_aliased_mpo!(H_new_aliased)
 
     # ── Reference dense path ──────────────────────────────────────────────────
-    H_new2 = sandwich_mpo_dense(ConsOpsCombined2, copy(H))
+    H_new2 = sandwich_mpo(ConsOpsCombined2, copy(H); cutoff1 = 0, cutoff2 = 0)
 
     # ── Memory footprint ──────────────────────────────────────────────────────
     println("\n── Memory footprint of PHP ──")

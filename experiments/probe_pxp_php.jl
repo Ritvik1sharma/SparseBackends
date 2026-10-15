@@ -93,7 +93,7 @@ println("\n", ok ? "==> EQUIVALENT — safe to keep the MPO-level call" :
 # every orig_dense PXP row on disk came from the driver's order.
 println("\n", "-"^78)
 println("3. dense sandwich operand order")
-H_pd    = sandwich_mpo(P, H_raw)                                    # contract(P, H1)
+H_pd    = sandwich_mpo(P, H_raw; cutoff1 = 0, cutoff2 = 0)          # contract(P, H1)
 H_drv   = replaceprime(contract(contract(P'', H_raw'; is_ctn_compression = true), P;
                                 is_ctn_compression = true), 3 => 1)  # contract(H1, P)
 println("   contract(P, H1) bonds : ", true_bond_dims(H_pd))

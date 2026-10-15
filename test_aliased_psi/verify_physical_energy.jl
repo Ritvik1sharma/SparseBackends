@@ -15,6 +15,7 @@ using LinearAlgebra: norm
 using Random, Printf
 
 include("../test_sparse_psi/utils.jl")
+include(joinpath(@__DIR__, "..", "..", "experiments", "utils", "cotenn_utils.jl"))
 
 # Canonical build_setup (verbatim from test_aliased_kl.jl line 83), also returning P.
 function build_setup(N::Int, psign::Int, spin::Int)
@@ -37,8 +38,7 @@ function build_setup(N::Int, psign::Int, spin::Int)
         push!(os2, t)
     end
     ConsOps1 = [clean!(MPO(os2[j], sites, [2*j-1, 2*j, 2*j+1, 2*j+2])) for j in 1:N]
-    mulMPO(A, B) = replaceprime(contract(A, prime(B, "Site"), :coo, :coo), 2 => 1)
-    P_sparse = ConsOps1[1]; for j in 2:length(ConsOps1); P_sparse = mulMPO(P_sparse, ConsOps1[j]); end
+    P_sparse = ConsOps1[1]; for j in 2:length(ConsOps1); P_sparse = multiply_mpos(P_sparse, ConsOps1[j]; Abackend = :coo, Bbackend = :coo); end
     H    = MPO(os, sites)
     psi0 = random_mps(sites)
     psi_ali = replaceprime(contract(P_sparse, copy(psi0), :coo, :aliased; denseLinksB=0), 1 => 0)
