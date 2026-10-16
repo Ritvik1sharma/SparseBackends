@@ -167,14 +167,13 @@ let
   maxdim = [_md]; mindim = [_md]
   cutoff = 1e-12
   target_energy = nothing
-  last_sweep_energy = nothing
   tensor_tracker = Any[]
 
   println("\n[diag=$_DIAG] PXP DENSE DMRG (H_new2) — N=$N, nsweeps=$_ns, maxdim=$_md ...")
   t = @elapsed begin
     energy_d, psi_d, sweeps_d, terr_d = run_dmrg_with_timers("PXP DENSE H_new2",
         H_new2, psi1; nsweeps=_ns, maxdim, mindim, cutoff, target_energy,
-        use_early_exit=false, last_sweep_energy=last_sweep_energy,
+        use_early_exit=false,
         outputlevel=1, tensor_tracker=tensor_tracker, only_store=true)
   end
   E_d = inner(psi_d', H, psi_d)
@@ -189,7 +188,7 @@ let
   t = @elapsed begin
     energy_s, psi_s, sweeps_s, terr_s = run_dmrg_with_timers("PXP SPARSE H_new",
         H_new, psi2; nsweeps=_ns, maxdim, mindim, cutoff, target_energy,
-        use_early_exit=false, last_sweep_energy=last_sweep_energy,
+        use_early_exit=false,
         outputlevel=1, tensor_tracker=tensor_tracker)
   end
   if get(ENV, "SB_CPFX_STATS", "0") == "1"
