@@ -1127,6 +1127,17 @@ end
 @inline rep(A::WrappedCOOTensor) = A.coo
 @inline rep(A::WrappedBlockSparse) = A.blocksparse  # adjust to your actual type name
 
+# footprint (see the storage files): a dense array stores every entry; an ITensor or a
+# wrapped tensor reports its storage's footprint.
+footprint(A::AbstractArray) =
+    (blocks = 0, templates = 0, dense_elems = length(A), bs_elems = length(A), stored_elems = length(A))
+footprint(w::WrappedTensorTypes) = footprint(rep(w))
+function footprint(T::ITensors.ITensor)
+    ITensors.has_external_storage(T) && return footprint(ITensors.get_external_storage(T))
+    n = prod(ITensors.dim.(ITensors.inds(T)); init = 1)
+    return (blocks = 0, templates = 0, dense_elems = n, bs_elems = n, stored_elems = n)
+end
+
 
 
 function wrapped_contract(A::WrappedTensorTypes{TA,NA},

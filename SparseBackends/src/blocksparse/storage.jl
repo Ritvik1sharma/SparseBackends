@@ -726,3 +726,11 @@ end
 #   end
 #   return NewBlockSparseSorted{T,N,N2}(dimsB, blksizeB, keysB, idsB, dataB)
 # end
+
+# footprint(storage) -> (blocks, templates, dense_elems, bs_elems, stored_elems): element
+# counts of one tensor's storage (dense_elems: every entry; bs_elems: one dense block per
+# key; stored_elems: what this storage actually holds). All are counts, so a tensor
+# network's footprint is the sum over its tensors.
+footprint(B::NewBlockSparseSorted) =
+    (blocks = length(B.keys), templates = 0, dense_elems = prod(B.dims),
+     bs_elems = length(B.data), stored_elems = length(B.data))

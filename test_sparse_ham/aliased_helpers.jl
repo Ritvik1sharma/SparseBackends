@@ -4,45 +4,12 @@
 # Include from a test driver with:  include("aliased_helpers.jl")
 #
 # Provides:
-#   report_aliased_footprint    — per-site memory table (dense / BS / aliased) for an aliased MPO
 #   run_dmrg_ground             — warmup + timed ground-state DMRG + timer reports
 #   run_dmrg_excited            — warmup + timed excited-state DMRG + timer reports
 
 using SparseBackends
 using ITensors, ITensorMPS
 using TimerOutputs: reset_timer!, print_timer
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-site memory footprint reporter for an aliased MPO.
-# Prints dense / BS / aliased element counts and compression ratios.
-# ─────────────────────────────────────────────────────────────────────────────
-function report_aliased_footprint(H::MPO, label::String)
-    total_bytes = sum(Base.summarysize(W) for W in H)
-    println("$label total MPO memory: $(round(total_bytes/1e6; digits=4)) MB")
-    println("  ", rpad("site", 5), rpad("nb", 6), rpad("ntmpl", 7),
-            rpad("blksize", 9), rpad("dense", 10), rpad("BS", 10),
-            rpad("aliased", 10), rpad("vs-dense", 10), "vs-BS")
-    tot_d = 0; tot_b = 0; tot_a = 0
-    for i in 1:length(H)
-        T = H[i]
-        ITensors.has_external_storage(T) &&
-            T.tensor.data isa SparseBackends.WrappedAliasedBlockSparse || continue
-        ali  = T.tensor.data.aliased
-        nb   = length(ali.keys); nt = ali.n_templates; bksz = ali.blksize
-        ds   = prod(ali.dims);   bs = nb * bksz;       as   = nt * bksz + nb
-        tot_d += ds; tot_b += bs; tot_a += as
-        println("  ", rpad(string(i), 5), rpad(string(nb), 6), rpad(string(nt), 7),
-                       rpad(string(bksz), 9), rpad(string(ds), 10),
-                       rpad(string(bs), 10), rpad(string(as), 10),
-                       rpad(string(round(ds/max(as,1); digits=2)), 10),
-                       round(bs/max(as,1); digits=2))
-    end
-    println("  ", rpad("TOT", 5), rpad("", 6), rpad("", 7), rpad("", 9),
-                  rpad(string(tot_d), 10), rpad(string(tot_b), 10),
-                  rpad(string(tot_a), 10),
-                  rpad(string(round(tot_d/max(tot_a,1); digits=2)), 10),
-                  round(tot_b/max(tot_a,1); digits=2))
-end
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DMRG runners — ground state and excited state are separate functions.

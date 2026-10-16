@@ -308,3 +308,12 @@ end
 
 Base.permutedims(A::AliasedBlockSparse{T,N,N2,P,K}, perm::NTuple{N,Int}) where {T,N,N2,P,K} =
     permutedims(A, collect(perm))
+
+# footprint(storage) -> (blocks, templates, dense_elems, bs_elems, stored_elems): element
+# counts of one tensor's storage (dense_elems: every entry; bs_elems: one dense block per
+# key; stored_elems: what this storage actually holds). All are counts, so a tensor
+# network's footprint is the sum over its tensors.
+footprint(A::AliasedBlockSparse) =
+    (blocks = length(A.keys), templates = A.n_templates, dense_elems = prod(A.dims),
+     bs_elems = length(A.keys) * A.blksize,
+     stored_elems = A.n_templates * A.blksize + length(A.keys))   # templates + one scalar per block
