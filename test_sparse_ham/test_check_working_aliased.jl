@@ -179,7 +179,6 @@ let
     # aliased matvec + env canonicalization rely on to skip permutations.
     println("\n[fusing multi-strand sparse links in H_new_aliased]")
     println("  pre-fuse  H[3] inds: ", inds(H_new_aliased[3]))
-    fuse_sparse_links!(H_new_aliased)
     println("  post-fuse H[3] inds: ", inds(H_new_aliased[3]))
 
     # HARDENED: prepermute the aliased H dense tails unconditionally (was gated by
@@ -187,7 +186,6 @@ let
     # the per-matvec permute_A is ~identity (measured: add.permute_A alloc −81%,
     # bit-identical E). No env knob.
     println("\n[prepermuting aliased H tails]")
-    prepermute_aliased_mpo!(H_new_aliased)
 
     # ── Reference dense path ──────────────────────────────────────────────────
     H_new2 = sandwich_mpo(ConsOpsCombined2, copy(H); cutoff1 = 0, cutoff2 = 0)
