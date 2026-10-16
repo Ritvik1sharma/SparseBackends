@@ -44,7 +44,7 @@ let
     H, P, psi = build_models(N_plaq, +1)
     @printf("KL model: %d sites (N_plaq=%d)\n", length(psi), N_plaq)
     try
-        E, _ = ITensorMPS.dmrg_core_php(H, P, psi; nsweeps=6, maxdim=40)
+        E, _ = ITensorMPS.dmrg_core_php(H, P, psi, Sweeps(6; maxdim=40, cutoff=1e-12); use_early_exit=false, eigsolve_krylovdim=30, eigsolve_tol=1e-12, eigsolve_maxiter=100)
         @printf("[KL core-mode] final E = %.10f  %s\n", E,
                 abs(E - (-7.764220969914)) < 1e-6 ? "PASS ✓" : "CHECK (ref -7.764220969914)")
     catch e

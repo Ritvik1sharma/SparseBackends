@@ -32,7 +32,7 @@ let
     N = 12
     # (a) natural maxdim=40 (PXP constrained ground is low-rank → converges below 40)
     H, psi, P = build_setup_pxp(N)
-    E1, psif = ITensorMPS.dmrg_core_php(H, P, psi; nsweeps=6, maxdim=40)
+    E1, psif = ITensorMPS.dmrg_core_php(H, P, psi, Sweeps(6; maxdim=40, cutoff=1e-12); use_early_exit=false, eigsolve_krylovdim=30, eigsolve_tol=1e-12, eigsolve_maxiter=100)
     @printf("\n[natural maxdim40] final E = %.8f  %s\n", E1,
             abs(E1 - (-14.77196927)) < 1e-5 ? "PASS ✓ (bit-identical to pre-kernel-change)" : "CHECK")
     nal = count(j -> ITensors.has_external_storage(psif[j]) &&
@@ -44,7 +44,7 @@ let
     # (b) FORCED bd=40 (mindim=maxdim=40) → true bd=40 per-sweep time
     println("\n--- forced bd=40 (mindim=maxdim=40) ---")
     H2, psi2, P2 = build_setup_pxp(N)
-    E2, _ = ITensorMPS.dmrg_core_php(H2, P2, psi2; nsweeps=6, mindim=40, maxdim=40)
+    E2, _ = ITensorMPS.dmrg_core_php(H2, P2, psi2, Sweeps(6; maxdim=40, mindim=40, cutoff=1e-12); use_early_exit=false, eigsolve_krylovdim=30, eigsolve_tol=1e-12, eigsolve_maxiter=100)
     @printf("[forced bd40] final E = %.8f  %s\n", E2,
             abs(E2 - (-14.77196927)) < 1e-5 ? "PASS ✓" : "CHECK")
 end
