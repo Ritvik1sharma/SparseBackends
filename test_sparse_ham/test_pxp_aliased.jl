@@ -141,7 +141,8 @@ let
     println("DENSE   PHP:  total MPO memory: $(round(dense_bytes/1e6;   digits=4)) MB   ($dense_bytes bytes)")
     println("ALIASED PHP:  total MPO memory: $(round(aliased_bytes/1e6; digits=4)) MB   ($aliased_bytes bytes)")
     println("  dense/aliased Base.summarysize ratio = $(round(dense_bytes/aliased_bytes; digits=3))")
-    report_aliased_footprint(H_aliased, "ALIASED PHP:")
+    println("ALIASED PHP footprint per site (elements): ", footprint.(H_aliased))
+    println("ALIASED PHP footprint total: ", footprint(H_aliased))
 
     # ── Pre-flight storage check ───────────────────────────────────────────────
     n_ali = 0; n_other = 0

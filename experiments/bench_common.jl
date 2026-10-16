@@ -23,8 +23,8 @@ using SparseBackends
 using ITensors, ITensorMPS
 using Random
 
-# fuse_sparse_links! / prepermute_aliased_mpo! / report_aliased_footprint /
-# sparse_prefix_inds — the same file the test drivers include, not a copy.
+# aliased_helpers.jl: the shared test-driver helpers (the same file the test drivers
+# include, not a copy).
 include(joinpath(@__DIR__, "..", "test_sparse_ham", "aliased_helpers.jl"))
 # inflate_mpo_bonds / pad_hamiltonian — zero-pads the bare H's bond dimension for
 # the chi_H experiment. No-op unless a config sets pad_h_chi.
@@ -41,34 +41,6 @@ const SB_VARIANTS = Dict(
     :sb_aliased => (php = :aliased, run_mode = :standard),
     :sb_fused   => (php = :aliased, run_mode = :fused),
 )
-
-"""
-Per-site aliased footprint (block count, template count, element counts). Only
-meaningful for :sb_aliased / :sb_fused; returns `nothing` otherwise. This is the
-compression evidence that Base.summarysize alone does not show.
-"""
-function aliased_footprint(H::MPO)
-    tot = Dict{String,Any}("n_aliased_sites" => 0, "dense_elems" => 0,
-                           "bs_elems" => 0, "aliased_elems" => 0, "n_blocks" => 0,
-                           "n_templates" => 0)
-    for i in 1:length(H)
-        T = H[i]
-        (ITensors.has_external_storage(T) &&
-         T.tensor.data isa SparseBackends.WrappedAliasedBlockSparse) || continue
-        a = T.tensor.data.aliased
-        nb, nt, bk = length(a.keys), a.n_templates, a.blksize
-        tot["n_aliased_sites"] += 1
-        tot["n_blocks"]        += nb
-        tot["n_templates"]     += nt
-        tot["dense_elems"]     += prod(a.dims)
-        tot["bs_elems"]        += nb * bk
-        tot["aliased_elems"]   += nt * bk + nb
-    end
-    tot["n_aliased_sites"] == 0 && return nothing
-    tot["compression_vs_dense"] = tot["dense_elems"] / max(tot["aliased_elems"], 1)
-    tot["compression_vs_bs"]    = tot["bs_elems"]    / max(tot["aliased_elems"], 1)
-    return tot
-end
 
 """
 Build the PHP operator, the raw Hamiltonian and the initial state for one
@@ -146,8 +118,8 @@ function run_config(config_id::AbstractString, variant::Symbol;
     )
     cfg.model === :kl && (result["nplaq"] = cfg.nplaq; result["psign"] = cfg.psign;
                           result["spin"] = cfg.spin)
-    fp = aliased_footprint(H_php)
-    fp !== nothing && (result["php"]["aliased_footprint"] = fp)
+    fp = footprint(H_php)
+    fp.templates > 0 && (result["php"]["aliased_footprint"] = Dict(pairs(fp)))   # aliased operators only
 
     @printf("[bench] PHP memory: %.4f MB   build %.3f s\n",
             result["php"]["summarysize_bytes"] / 1e6, build_seconds)

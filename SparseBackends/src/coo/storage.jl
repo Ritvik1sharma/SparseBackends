@@ -203,3 +203,11 @@ function sort!(A::COOTensor{T,N,K}, order::Base.Order.Ordering) where {T,N,K}
   A.dirty = false
   return A
 end
+
+# footprint(storage) -> (blocks, templates, dense_elems, bs_elems, stored_elems): element
+# counts of one tensor's storage (dense_elems: every entry; bs_elems: one dense block per
+# key; stored_elems: what this storage actually holds). All are counts, so a tensor
+# network's footprint is the sum over its tensors.
+footprint(C::COOTensor) =
+    (blocks = length(C.vals), templates = 0, dense_elems = prod(C.dims),
+     bs_elems = length(C.vals), stored_elems = length(C.vals))    # each nonzero a 1-element block

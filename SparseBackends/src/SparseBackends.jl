@@ -141,6 +141,7 @@ export WrappedAliasedBlockSparse, contract_aliased_itensor,
 # dispatch compares the enum.
 @enum Backend DENSE COO BLOCKSPARSE ALIASED
 export Backend, DENSE, COO, BLOCKSPARSE, ALIASED, to_backend
+export footprint
 export OutputLayout, OutputLayoutError, as_dense, validate_layout,
        dense_from_aliased_operand, matvec_dense_layout, resolve_layout, show_roles
 

@@ -193,7 +193,8 @@ let
     # ── Memory footprint ──────────────────────────────────────────────────────
     println("\n── Memory footprint of PHP ──")
     print("DENSE    PHP:  "); mpo_memory_bytes(H_new2)
-    report_aliased_footprint(H_new_aliased, "ALIASED PHP:")
+    println("ALIASED PHP footprint per site (elements): ", footprint.(H_new_aliased))
+    println("ALIASED PHP footprint total: ", footprint(H_new_aliased))
 
     # ── Pointwise comparison (sanity) ─────────────────────────────────────────
     for i in 1:length(H_new_aliased)
