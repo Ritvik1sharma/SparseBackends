@@ -51,7 +51,5 @@ function sandwich_mpo_aliased(Ps::Union{MPO,Vector{MPO}}, H::MPO)
     H1    = contract(P'', H', :coo, :dense;   Cbackend = :aliased)
     H_eff = contract(P,   H1, :coo, :aliased; Cbackend = :aliased)
     Hphp  = replaceprime(H_eff, 3 => 1)
-    fuse_sparse_links!(Hphp)
-    prepermute_aliased_mpo!(Hphp)
     return Hphp
 end

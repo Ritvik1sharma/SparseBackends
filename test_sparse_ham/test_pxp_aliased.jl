@@ -121,14 +121,14 @@ let
     # Link fusion always applied for the aliased path (was gated by SB_FUSE_LINKS).
     println("\n[fusing multi-strand sparse links in H_aliased]")
     length(H_aliased) >= 3 && println("  pre-fuse  H[3] inds: ", inds(H_aliased[3]))
-    fuse_sparse_links!(H_aliased)
+    ITensorMPS.fuse_aliased_bond_strands!(H_aliased)   # per-site build: not done by contract
     length(H_aliased) >= 3 && println("  post-fuse H[3] inds: ", inds(H_aliased[3]))
 
     # HARDENED: prepermute aliased H dense tails unconditionally (was gated by
     # SB_PREPERMUTE_H) → per-matvec permute_A ~identity, bit-identical E. No knob.
     println("\n[prepermuting aliased H tails]")
     length(H_aliased) >= 3 && println("  pre-perm  H[3] inds: ", inds(H_aliased[3]))
-    prepermute_aliased_mpo!(H_aliased)
+    ITensorMPS.order_aliased_dense_blocks!(H_aliased)
     length(H_aliased) >= 3 && println("  post-perm H[3] inds: ", inds(H_aliased[3]))
 
     println("\n[Building H_dense via sandwich_mpo_dense]")

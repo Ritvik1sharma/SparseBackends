@@ -4,8 +4,6 @@
 # Include from a test driver with:  include("aliased_helpers.jl")
 #
 # Provides:
-#   fuse_sparse_links!          — fuse each bond's key link strands (ITensorMPS fork)
-#   prepermute_aliased_mpo!     — dense blocks as [right, left] link (ITensorMPS fork)
 #   report_aliased_footprint    — per-site memory table (dense / BS / aliased) for an aliased MPO
 #   run_dmrg_ground             — warmup + timed ground-state DMRG + timer reports
 #   run_dmrg_excited            — warmup + timed excited-state DMRG + timer reports
@@ -13,21 +11,6 @@
 using SparseBackends
 using ITensors, ITensorMPS
 using TimerOutputs: reset_timer!, print_timer
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Bond layout of an aliased MPO. The implementation lives in the ITensorMPS.jl fork
-# (src/aliased_mpo_bonds.jl), and contract(A::MPO, B::MPO, backends...) already applies
-# both steps to an aliased product; calling these again is a no-op on such an MPO.
-# ─────────────────────────────────────────────────────────────────────────────
-"""Fuse each bond's same-tag key link strands into one key index."""
-fuse_sparse_links!(H::MPO) = ITensorMPS.fuse_aliased_bond_strands!(H)
-
-"""Store every aliased site's dense block as [right link, left link]."""
-function prepermute_aliased_mpo!(H::MPO)
-    n = ITensorMPS.order_aliased_dense_blocks!(H)
-    println("  prepermute_aliased_mpo!: permuted $n of $(length(H)) sites")
-    return H
-end
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-site memory footprint reporter for an aliased MPO.

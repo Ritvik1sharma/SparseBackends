@@ -52,8 +52,7 @@ let
     P     = NotEqlsLoop_R1(sites)
 
     H_aliased = sandwich_mpo_aliased(P, copy(H_raw))
-    fuse_sparse_links!(H_aliased)
-    prepermute_aliased_mpo!(H_aliased)
+    ITensorMPS.canonicalize_aliased_bonds!(H_aliased)   # per-site build: fuse bond strands, order dense blocks
 
     psi_raw  = random_mps(sites)
     psi_init = replaceprime(contract(P, psi_raw; cutoff=1e-12), 1 => 0)

@@ -45,8 +45,6 @@ let
     H = MPO(os, sites)
 
     H_new_aliased = sandwich_mpo(ConsOpsCombined, copy(H); datastructure = :aliased)
-    fuse_sparse_links!(H_new_aliased)
-    prepermute_aliased_mpo!(H_new_aliased)
 
     L = length(H_new_aliased)
     println("\n=== H_new_aliased: $L tensors (N=$N, states=$states) ===")

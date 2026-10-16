@@ -26,8 +26,7 @@ function sandwich_mpo_aliased_persite(P::MPO, H::MPO)
         Hi  = SparseBackends.contract_aliased_itensor(P[i],   H1,    :coo, :aliased)
         new_H[i] = replaceprime(Hi, 3 => 1)
     end
-    fuse_sparse_links!(new_H)
-    prepermute_aliased_mpo!(new_H)
+    ITensorMPS.canonicalize_aliased_bonds!(new_H)   # per-site build: fuse bond strands, order dense blocks
     return new_H
 end
 
