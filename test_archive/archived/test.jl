@@ -395,9 +395,8 @@ let
     mindim = [81]
     target_energy = nothing
     nsweeps = 7
-    last_sweep_energy = nothing
     t = @elapsed begin
-        energy, psi, sweeps, t_err = dmrg(H_new2, psi1; nsweeps, maxdim, mindim, cutoff, target_energy, use_early_exit=false, last_sweep_energy=last_sweep_energy, outputlevel=1, tensor_tracker=tensor_tracker, only_store=true)
+        energy, psi, sweeps, t_err = dmrg(H_new2, psi1; nsweeps, maxdim, mindim, cutoff, target_energy, use_early_exit=false, outputlevel=1, tensor_tracker=tensor_tracker, only_store=true)
     end
     E_0 = inner(copy(psi0)', H, copy(psi0))
     E_1 = inner(psi', H, psi)
@@ -410,9 +409,8 @@ let
   
     target_energy = nothing
     nsweeps = 7
-    last_sweep_energy = nothing
     t = @elapsed begin
-        energy, psi, sweeps, t_err = dmrg(H_new, psi2; nsweeps, maxdim, mindim, cutoff, target_energy, use_early_exit=false, last_sweep_energy=last_sweep_energy, outputlevel=1, tensor_tracker=tensor_tracker)
+        energy, psi, sweeps, t_err = dmrg(H_new, psi2; nsweeps, maxdim, mindim, cutoff, target_energy, use_early_exit=false, outputlevel=1, tensor_tracker=tensor_tracker)
     end
     E_0 = inner(copy(psi0)', H, copy(psi0))
     E_1 = inner(psi', H, psi)

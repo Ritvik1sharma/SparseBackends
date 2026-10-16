@@ -224,14 +224,14 @@ let
     _md = parse(Int, get(ENV, "BENCH_MAXDIM", string(_md_default)))
     _ns = parse(Int, get(ENV, "BENCH_NSWEEPS", string(_ns_default)))
     maxdim = [_md]; mindim = [_md]; nsweeps = _ns
-    target_energy = nothing; last_sweep_energy = nothing
+    target_energy = nothing
 
     # ── DENSE reference ───────────────────────────────────────────────────────
     println("\n[diag=$_DIAG] Running DENSE DMRG (H_new2) with nsweeps=$nsweeps, maxdim=$_md ...")
     (energy_d, psi_dense, sweeps_d, t_err_d), dense_wall =
         run_dmrg_ground("DENSE H_new2", H_new2, psi1;
                         nsweeps, maxdim, mindim, cutoff, target_energy,
-                        last_sweep_energy, outputlevel=1, run_label="DENSE")
+                        outputlevel=1, run_label="DENSE")
     E_0       = inner(copy(psi0)', H, copy(psi0))
     E_1_dense = inner(psi_dense', H, psi_dense)
     println("\n\t Energy at start $E_0 and at end $E_1_dense",
@@ -256,7 +256,7 @@ let
     (energy_a, psi_ali, sweeps_a, t_err_a), aliased_wall =
         run_dmrg_ground("ALIASED H_new_aliased", H_new_aliased, psi2;
                         nsweeps, maxdim, mindim, cutoff, target_energy,
-                        last_sweep_energy, outputlevel=1, run_label="ALIASED", run_mode=:standard)
+                        outputlevel=1, run_label="ALIASED", run_mode=:standard)
     E_1_ali = inner(psi_ali', H, psi_ali)
     println("\n\t Energy at start $E_0 and at end $E_1_ali",
             " in sweeps $sweeps_a and truncation error $t_err_a")
