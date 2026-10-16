@@ -116,15 +116,6 @@ end
 
 # --- projector construction and application ---------------------------------
 
-"""P = prod_j Pi_j through the COO backend (cotenn_utils `multiply_mpos` with
-`:coo, :coo`). `:coo,:coo` keeps the product sparse -- without it, building
-P = prod_j Pi_j densifies at the first multiply."""
-function mul_coo(v::Vector{MPO})
-    P = v[1]
-    for j in 2:length(v); P = multiply_mpos(P, v[j]; Abackend = :coo, Bbackend = :coo); end
-    return P
-end
-
 """psi = P * psi0 in a sparse format.
 
 `psi0` IS dense, so it is declared `:dense` and the output backend is named
