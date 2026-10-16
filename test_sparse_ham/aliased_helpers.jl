@@ -28,7 +28,7 @@ function run_dmrg_ground(label, H, psi0; nsweeps, maxdim, mindim, cutoff, roofli
     println("[warmup pass: 1 JIT sweep, results discarded]")
     try
         dmrg(H, deepcopy(psi0); nsweeps=1, maxdim=10, mindim=10, cutoff=1e-12,
-             outputlevel=0, use_early_exit=false)
+             outputlevel=0, use_early_exit=false, run_mode=get(kwargs, :run_mode, nothing))
     catch e
         println("  warmup failed: ", sprint(showerror, e))
     end
@@ -64,7 +64,7 @@ function run_dmrg_excited(label, H, Ms::Vector{MPS}, psi0; nsweeps, maxdim, mind
     println("[warmup pass: 1 JIT sweep, results discarded]")
     try
         dmrg(H, Ms, deepcopy(psi0); nsweeps=1, maxdim=10, mindim=10, cutoff=1e-12,
-             weight=weight, outputlevel=0, use_early_exit=false)
+             weight=weight, outputlevel=0, use_early_exit=false, run_mode=get(kwargs, :run_mode, nothing))
     catch e
         println("  warmup failed: ", sprint(showerror, e))
     end

@@ -256,7 +256,7 @@ let
     (energy_a, psi_ali, sweeps_a, t_err_a), aliased_wall =
         run_dmrg_ground("ALIASED H_new_aliased", H_new_aliased, psi2;
                         nsweeps, maxdim, mindim, cutoff, target_energy,
-                        last_sweep_energy, outputlevel=1, run_label="ALIASED")
+                        last_sweep_energy, outputlevel=1, run_label="ALIASED", run_mode=:standard)
     E_1_ali = inner(psi_ali', H, psi_ali)
     println("\n\t Energy at start $E_0 and at end $E_1_ali",
             " in sweeps $sweeps_a and truncation error $t_err_a")

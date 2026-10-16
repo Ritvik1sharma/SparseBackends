@@ -172,7 +172,7 @@ let
 
     println("[ALIASED ground]")
     (E0_a, psi0_a), t_g_ali = run_dmrg_ground("ALIASED_ground",
-        H_aliased, deepcopy(psi_init); nsweeps=_ns, maxdim, mindim, cutoff, outputlevel=1, run_label="ALIASED_G")
+        H_aliased, deepcopy(psi_init); nsweeps=_ns, maxdim, mindim, cutoff, outputlevel=1, run_label="ALIASED_G", run_mode=:standard)
 
     # ── First excited state ───────────────────────────────────────────────────
     Random.seed!(_seed + 1)   # excited init seed = ground seed + 1 (was hardcoded 43)
@@ -189,7 +189,7 @@ let
     println("[ALIASED excited]")
     (E1_a, psi1_a), t_e_ali = run_dmrg_excited("ALIASED_excited",
         H_aliased, [psi0_a], deepcopy(psi_init2);
-        nsweeps=_ns, maxdim, mindim, cutoff, weight=excited_weight, outputlevel=1, run_label="ALIASED_E")
+        nsweeps=_ns, maxdim, mindim, cutoff, weight=excited_weight, outputlevel=1, run_label="ALIASED_E", run_mode=:standard)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     println("\n========== SUMMARY (PXP PHP, N=$N, maxdim=$_md, nsweeps=$_ns) ==========")
