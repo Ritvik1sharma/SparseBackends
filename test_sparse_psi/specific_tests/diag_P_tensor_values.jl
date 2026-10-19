@@ -14,7 +14,7 @@ let
     t += 0.5, "Id", 2*j-1, "Id", 2*j, "Id", 2*j+1, "Id", 2*j+2
     t += cs,  "exp(i*pi*Sy)", 2*j-1, "exp(i*pi*Sx)", 2*j,
                "exp(i*pi*Sx)", 2*j+1, "exp(i*pi*Sy)", 2*j+2
-    P_j = clean!(MPO(t, sites, [2*j-1, 2*j, 2*j+1, 2*j+2]))
+    P_j = MPO(t, sites, [2*j-1, 2*j, 2*j+1, 2*j+2]; clean = true)
 
     println("=== MPO tensor at site 1 (support of P_1 = sites 1-4) ===")
     T1 = P_j[1]

@@ -18,7 +18,7 @@ function build_setup(N, psign, spin, seed)
         t += cs, "exp(i*pi*Sy)", 2j - 1, "exp(i*pi*Sx)", 2j, "exp(i*pi*Sx)", 2j + 1, "exp(i*pi*Sy)", 2j + 2
         push!(os2, t)
     end
-    Cons = [clean!(MPO(os2[j], sites, [2j - 1, 2j, 2j + 1, 2j + 2])) for j in 1:N]
+    Cons = [MPO(os2[j], sites, [2j - 1, 2j, 2j + 1, 2j + 2]; clean = true) for j in 1:N]
     mulMPO(A, B) = replaceprime(contract(A, prime(B, "Site"), :coo, :coo), 2 => 1)
     P = Cons[1]; for j in 2:length(Cons); P = mulMPO(P, Cons[j]); end
     H = MPO(os, sites); psi0 = random_mps(sites)

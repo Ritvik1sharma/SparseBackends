@@ -70,30 +70,6 @@ end
 
 maxabs(H::MPO) = maximum(_maxabs, H)
 
-function clean!(op::MPO; tol=1e-12)
-    for j in 1:length(op)
-        T = op[j]
-        A = array(T)
-        for i in eachindex(A)
-            v = A[i]
-            if     abs(v)       < tol; A[i] =  0.0
-            elseif abs(v - 1.0) < tol; A[i] =  1.0
-            elseif abs(v + 1.0) < tol; A[i] = -1.0
-            elseif abs(v - 0.5) < tol; A[i] =  0.5
-            elseif abs(v + 0.5) < tol; A[i] = -0.5
-            elseif abs(v - 1.0im) < tol; A[i] =  1.0im
-            elseif abs(v + 1.0im) < tol; A[i] = -1.0im
-            elseif abs(v - 0.5im) < tol; A[i] =  0.5im
-            elseif abs(v + 0.5im) < tol; A[i] = -0.5im
-            elseif abs(v + 2.0)   < tol; A[i] = -2.0
-            elseif abs(v - 2.0)   < tol; A[i] =  2.0
-            end
-        end
-        op[j] = ITensor(A, inds(T)...)
-    end
-    return op
-end
-
 function mpo_memory_bytes(H::MPO)
     total_bytes = sum(Base.summarysize(W) for W in H)
     println("Total MPO memory: $(total_bytes/1e6) MB")
@@ -160,8 +136,7 @@ let
     cutoff   = 10.0^(-12)
     ConsOps1 = MPO[]; ConsOps2 = MPO[]
     for j in 1:N
-        operator = MPO(os2[j], sites, [2*j-1, 2*j, 2*j+1, 2*j+2])
-        clean!(operator; tol=1e-12)
+        operator = MPO(os2[j], sites, [2*j-1, 2*j, 2*j+1, 2*j+2]; clean = true)
         push!(ConsOps1, operator)
         push!(ConsOps2, MPO(os2[j], sites))
     end

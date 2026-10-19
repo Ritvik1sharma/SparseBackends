@@ -37,8 +37,7 @@ let
     end
     ConsOps1 = MPO[]
     for j in 1:N
-        operator = MPO(os2[j], sites, [2*j-1, 2*j, 2*j+1, 2*j+2])
-        clean!(operator; tol=1e-12)
+        operator = MPO(os2[j], sites, [2*j-1, 2*j, 2*j+1, 2*j+2]; clean = true)
         push!(ConsOps1, operator)
     end
     ConsOpsCombined = multiplyVecMPOtoMPO(ConsOps1)

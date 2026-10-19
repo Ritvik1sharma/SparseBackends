@@ -29,7 +29,7 @@ function build_setup(N::Int)
                    "exp(i*pi*Sx)", 2*j+1, "exp(i*pi*Sy)", 2*j+2
         push!(os2, t)
     end
-    ConsOps1 = [clean!(MPO(os2[j], sites, [2*j-1, 2*j, 2*j+1, 2*j+2])) for j in 1:N]
+    ConsOps1 = [MPO(os2[j], sites, [2*j-1, 2*j, 2*j+1, 2*j+2]; clean = true) for j in 1:N]
     ConsOps2 = [MPO(os2[j], sites) for j in 1:N]
     function mulMPO(A, B); Bp = prime(B, "Site"); replaceprime(contract(A, Bp, :coo, :coo), 2 => 1); end
     P_sparse = ConsOps1[1]; for j in 2:length(ConsOps1); P_sparse = mulMPO(P_sparse, ConsOps1[j]); end

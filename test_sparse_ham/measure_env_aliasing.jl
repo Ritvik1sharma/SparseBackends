@@ -14,36 +14,6 @@ include(joinpath(@__DIR__, "..", "..", "experiments", "utils", "cotenn_utils.jl"
 
 length(ARGS) < 1 && error("Usage: julia measure_env_aliasing.jl <N_plaq>")
 
-function clean!(op::MPO; tol=1e-12)
-    for j in 1:length(op)
-        T = op[j]
-        A = array(T)
-        for i in eachindex(A)
-            if abs(A[i]) < tol
-                A[i] = 0.0
-            elseif abs(A[i] - 1.0) < tol
-                A[i] = 1.0
-            elseif abs(A[i] + 1.0) < tol
-                A[i] = -1.0
-            elseif abs(A[i] - 0.5) < tol
-                A[i] = 0.5
-            elseif abs(A[i] + 0.5) < tol
-                A[i] = -0.5
-            elseif abs(A[i] - 1.0im) < tol
-                A[i] = 1.0im
-            elseif abs(A[i] + 1.0im) < tol
-                A[i] = -1.0im
-            elseif abs(A[i] - 0.5im) < tol
-                A[i] = 0.5im
-            elseif abs(A[i] + 0.5im) < tol
-                A[i] = -0.5im
-            end
-        end
-        op[j] = ITensor(A, inds(T)...)
-    end
-    return op
-end
-
 function multiplyVec(vec::Vector{MPO})
     result = vec[1]
     for j in 2:length(vec); result = multiply_mpos(result, vec[j]; Abackend = :coo, Bbackend = :coo); end
@@ -132,8 +102,7 @@ let
 
     ConsOps = MPO[]
     for j in 1:N
-        op = MPO(os2[j], sites, [2*j-1, 2*j, 2*j+1, 2*j+2])
-        clean!(op; tol=1e-12)
+        op = MPO(os2[j], sites, [2*j-1, 2*j, 2*j+1, 2*j+2]; clean = true)
         push!(ConsOps, op)
     end
     P = multiplyVec(ConsOps)
