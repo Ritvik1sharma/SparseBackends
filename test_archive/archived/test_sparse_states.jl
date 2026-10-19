@@ -175,40 +175,6 @@ function isometric_check(P::MPO, sites::Vector{Index{Int64}}; trials::Int=2, pow
 end
 
 
-function clean!(op::MPO; tol=1e-12)
-  for j in 1:length(op)
-      T = op[j]
-      A = array(T)  # convert to dense Julia array
-      for i in eachindex(A)
-          if abs(A[i]) < tol
-              A[i] = 0.0
-          elseif abs(A[i] - 1.0) < tol
-              A[i] = 1.0
-          elseif abs(A[i] + 1.0) < tol
-              A[i] = -1.0
-          elseif abs(A[i] - 0.5) < tol
-              A[i] = 0.5
-          elseif abs(A[i] + 0.5) < tol
-              A[i] = -0.5
-          elseif abs(A[i] - 1.0im) < tol
-              A[i] = 1.0im
-          elseif abs(A[i] + 1.0im) < tol
-              A[i] = -1.0im
-          elseif abs(A[i] - 0.5im) < tol
-              A[i] = 0.5im
-          elseif abs(A[i] + 0.5im) < tol
-              A[i] = -0.5im
-          elseif abs(A[i] + 2.0) < tol
-              A[i] = -2.0
-          elseif abs(A[i] - 2.0) < tol
-              A[i] = 2.0
-          end
-      end
-      op[j] = ITensor(A, inds(T)...)  # rebuild tensor with same indices
-  end
-  return op
-end
-
 
 function mpo_memory_bytes(H::MPO)
   total_bytes = 0
@@ -288,8 +254,7 @@ let
     ConsOps2 = MPO[]
     
     for j in 1:N
-        operator = MPO(os2[j], sites, [2*j - 1, 2*j, 2*j + 1, 2*j + 2])
-        clean!(operator; tol=1e-12)
+        operator = MPO(os2[j], sites, [2*j - 1, 2*j, 2*j + 1, 2*j + 2]; clean = true)
         push!(ConsOps1, operator)
         operator = MPO(os2[j], sites)
         push!(ConsOps2, operator)

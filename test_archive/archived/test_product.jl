@@ -71,7 +71,7 @@ let
     push!(os2, t)
   end
 
-  ConsOps1 = [clean!(MPO(os2[j], sites, [2*j-1,2*j,2*j+1,2*j+2])) for j in 1:N]
+  ConsOps1 = [MPO(os2[j], sites, [2*j-1,2*j,2*j+1,2*j+2]; clean = true) for j in 1:N]
   ConsOps2 = [MPO(os2[j], sites) for j in 1:N]
 
   ConsOpsCombined  = multiplyVecMPOtoMPO(ConsOps1)

@@ -35,7 +35,7 @@ function build_setup(N::Int, psign::Int, spin::Int)
         t += cs, "exp(i*pi*Sy)", 2*j-1, "exp(i*pi*Sx)", 2*j, "exp(i*pi*Sx)", 2*j+1, "exp(i*pi*Sy)", 2*j+2
         push!(os2, t)
     end
-    ConsOps1 = [clean!(MPO(os2[j], sites, [2*j-1,2*j,2*j+1,2*j+2])) for j in 1:N]
+    ConsOps1 = [MPO(os2[j], sites, [2*j-1,2*j,2*j+1,2*j+2]; clean = true) for j in 1:N]
     P = ConsOps1[1]; for j in 2:length(ConsOps1); P = multiply_mpos(P, ConsOps1[j]; Abackend = :coo, Bbackend = :coo); end
     H = MPO(os, sites); psi0 = random_mps(sites)
     psi = replaceprime(contract(P, copy(psi0), :coo,:aliased; denseLinksB=0), 1=>0)
