@@ -16,14 +16,12 @@ Compute `C = A ⊗_rlab B` where `A` is a `COOTensor`, `B` is dense, and `C` is
 an `AliasedBlockSparse`.
 
 Exploits the aliasing structure:
-- When a prefix key in A appears exactly **once**, the resulting block is
-  `α * B[:,rv]` — a scalar multiple of a stored template.  No copy of the
-  dense slice is made; only the scalar is recorded.
-- Multiple COO entries with the **same** `rv` (reduction index) share a
-  single stored template, regardless of their prefix keys.
-- When a prefix key accumulates contributions from multiple rv values,
-  the block is accumulated concretely and stored as its own template
-  (scalar = 1) so correctness is always maintained.
+- The entries of one A key (one row, over the reduction index `rv`) give the block
+  `Σ_rv a_rv B[:,rv]`. Rows whose entries are proportional (exactly, after dividing by the
+  largest-magnitude entry) share ONE stored template, `Σ_rv (a_rv/λ) B[:,rv]`; each key keeps the
+  scalar λ of its row. A row with a single entry is `α * B[:,rv]`: the template is the slice
+  itself, shared by every row with that `rv`.
+- No template is stored that no key references.
 
 Preconditions (same as the COO × Dense `contract!`):
   - `rlab` is the unique shared label, reduced (not in labelsC).
@@ -112,113 +110,71 @@ function contract_aliased!(
     @inline _ckey(acoord, m) =
         ntuple(j -> srcA[j] != 0 ? acoord[srcA[j]] : _mdigit(m, srcM[j]), Val(PC))
 
-    # ── Exact template count from A's integer keys alone (no dense data touched).
-    #    Clean P (every A key hit once, e.g. P·core): one template per distinct (rv, m).
-    #    Otherwise mirror the main loop: distinct rv among first contributions to an A
-    #    key, plus one accumulated template per A key hit >= 2 times; each × Mprod (every
-    #    moved value m repeats the A-key pattern). ──
-    rvs   = Set{Int}()
-    akeys = Set{NTuple{NA-1,Int}}()
-    n_nz  = 0
-    @inbounds for acoord in A.keys
-        rv = acoord[axisAr]
-        (1 <= rv <= R) || continue
-        n_nz += 1
-        push!(rvs, rv); push!(akeys, ntuple(j -> acoord[j], Val(NA-1)))
-    end
-    if length(akeys) == n_nz
-        n_tmpl_final = length(rvs) * Mprod
-    else
-        akey_count = Dict{NTuple{NA-1,Int},Int}()
-        first_rvs  = Set{Int}()
-        @inbounds for acoord in A.keys
-            rv = acoord[axisAr]
-            (1 <= rv <= R) || continue
-            akey = ntuple(j -> acoord[j], Val(NA-1))
-            c = get(akey_count, akey, 0) + 1
-            akey_count[akey] = c
-            c == 1 && push!(first_rvs, rv)
-        end
-        n_tmpl_final = (length(first_rvs) + count(>=(2), values(akey_count))) * Mprod
-    end
-
-    # ── Clear output; templates allocated at their exact final size ──
-    C.templates = Vector{TC}(undef, n_tmpl_final * blksize); C.n_templates = 0
-    empty!(C.keys); empty!(C.alias_ids); empty!(C.scalars)
-
-    # Template deduplication: (rv, m) -> template id
-    rv_to_tid = Dict{Tuple{Int,Int},Int}()
-
-    # Two intermediate maps (resolved into C arrays after all COO entries processed):
-    #   key_to_alias[k] = (tid, α)    — block has a single contribution  (aliased)
-    #   key_to_accum[k] = Vector{TC}  — block accumulated from multiple contributions
-    key_to_alias = Dict{NTuple{PC,Int}, Tuple{Int,TC}}()
-    key_to_accum = Dict{NTuple{PC,Int}, Vector{TC}}()
-
+    # ── Rows of A: the entries of one A key (c_l, s', c_r) over the reduction index rv. Rows whose
+    #    entries are proportional, compared exactly after dividing by the largest-magnitude entry
+    #    (first of ties, in rv order), form one class. A class stores ONE template per moved value m,
+    #    Σ_rv (a_rv / λ) B[:, m, rv], and each key of the class carries the scalar λ of its row.
+    #    A row with one nonzero entry (a diagonal-type P) is the class {rv}: its template is
+    #    B[:, m, rv] itself and its scalar the entry. Template ids: (class - 1) * Mprod + m, classes
+    #    numbered by the first row that holds them. ──
+    AK = NTuple{NA-1,Int}
+    row_of = Dict{AK,Int}(); row_first = Int[]; row_entries = Vector{Vector{Int}}()
     @inbounds for idx in eachindex(A.keys)
         acoord = A.keys[idx]
-        α      = convert(TC, A.vals[idx])
-        rv     = acoord[axisAr]
-        (1 <= rv <= R) || continue
-        for m in 1:Mprod
-        ckey    = _ckey(acoord, m)
-        src_off = ((rv - 1) * Mprod + (m - 1)) * blksize
+        (1 <= acoord[axisAr] <= R) || continue
+        ak = ntuple(j -> acoord[j], Val(NA-1))
+        r = get!(row_of, ak, length(row_first) + 1)
+        r > length(row_first) && (push!(row_first, idx); push!(row_entries, Int[]))
+        push!(row_entries[r], idx)
+    end
+    nrow = length(row_first)
+    class_of = Dict{Tuple{Vector{Int},Vector{TC}},Int}()
+    class_rvs = Vector{Vector{Int}}(); class_ratio = Vector{Vector{TC}}()
+    row_class = Vector{Int}(undef, nrow); row_scalar = Vector{TC}(undef, nrow)
+    for r in 1:nrow
+        ents = sort(row_entries[r]; by = i -> A.keys[i][axisAr])
+        nz = [i for i in ents if !iszero(A.vals[i])]
+        isempty(nz) && (nz = ents[1:1])                       # an explicit zero row: scalar 0
+        vals = TC[convert(TC, A.vals[i]) for i in nz]
+        lp = 1
+        for q in 2:length(vals); abs(vals[q]) > abs(vals[lp]) && (lp = q); end
+        λ = vals[lp]
+        ratio = TC[q == lp ? one(TC) : vals[q] / λ + zero(TC) for q in eachindex(vals)]   # + 0: -0.0 -> 0.0
+        rvs = Int[A.keys[i][axisAr] for i in nz]
+        cls = get!(class_of, (rvs, ratio), length(class_rvs) + 1)
+        cls > length(class_rvs) && (push!(class_rvs, rvs); push!(class_ratio, ratio))
+        row_class[r] = cls; row_scalar[r] = λ
+    end
+    ncls = length(class_rvs)
+    n_tmpl_final = ncls * Mprod
 
-        if haskey(key_to_accum, ckey)
-            # ── Key already accumulating: add α * B[:,m,rv] to running block ──
-            acc     = key_to_accum[ckey]
-            @simd for j in 1:blksize
-                acc[j] += α * convert(TC, Bvec[src_off + j])
-            end
-
-        elseif haskey(key_to_alias, ckey)
-            if false  # SB_TRACE — flip to true here for debug output
-              println("[SB_TRACE]   demotion fired @ ckey=", ckey, " (rv=", rv, ")")
-            end
-            # ── Second contribution to this key: demote alias → accumulator ──
-            (tid_prev, α_prev) = key_to_alias[ckey]
-            delete!(key_to_alias, ckey)
-            acc      = Vector{TC}(undef, blksize)
-            tmpl_off = (tid_prev - 1) * blksize
-            @simd for j in 1:blksize
-                acc[j] = α_prev * C.templates[tmpl_off + j] +
-                         α      * convert(TC, Bvec[src_off + j])
-            end
-            key_to_accum[ckey] = acc
-
-        else
-            # ── First contribution: register/reuse a template ──
-            tid = get(rv_to_tid, (rv, m), 0)
-            if tid == 0
-                # New template: copy B[:,m,rv] into C.templates
-                C.n_templates += 1
-                tid = C.n_templates
-                rv_to_tid[(rv, m)] = tid
-                dst_off = (tid - 1) * blksize
-                for j in 1:blksize
-                    C.templates[dst_off + j] = convert(TC, Bvec[src_off + j])
+    # ── Clear output; templates allocated at their exact final size and written once ──
+    C.templates = Vector{TC}(undef, n_tmpl_final * blksize); C.n_templates = n_tmpl_final
+    empty!(C.keys); empty!(C.alias_ids); empty!(C.scalars)
+    @inbounds for cls in 1:ncls, m in 1:Mprod
+        dst = ((cls - 1) * Mprod + (m - 1)) * blksize
+        rvs, rat = class_rvs[cls], class_ratio[cls]
+        for q in eachindex(rvs)
+            src = ((rvs[q] - 1) * Mprod + (m - 1)) * blksize
+            if q == 1
+                if isone(rat[1])
+                    for j in 1:blksize; C.templates[dst + j] = convert(TC, Bvec[src + j]); end
+                else
+                    for j in 1:blksize; C.templates[dst + j] = rat[1] * convert(TC, Bvec[src + j]); end
+                end
+            else
+                @simd for j in 1:blksize
+                    C.templates[dst + j] += rat[q] * convert(TC, Bvec[src + j])
                 end
             end
-            key_to_alias[ckey] = (tid, α)
-        end
         end
     end
 
-    # ── Collect alias blocks ──
     AI = eltype(C.alias_ids)
-    for (k, (tid, α)) in key_to_alias
-        push!(C.keys,      k)
-        push!(C.alias_ids, _alias_id(AI, tid))
-        push!(C.scalars,   α)
-    end
-
-    # ── Collect accumulated blocks: store each as its own template, scalar = 1 ──
-    for (k, acc) in key_to_accum
-        C.n_templates += 1
-        copyto!(C.templates, (C.n_templates - 1) * blksize + 1, acc, 1, blksize)
-        push!(C.keys,      k)
-        push!(C.alias_ids, _alias_id(AI, C.n_templates))
-        push!(C.scalars,   one(TC))
+    for r in 1:nrow, m in 1:Mprod
+        push!(C.keys,      _ckey(A.keys[row_first[r]], m))
+        push!(C.alias_ids, _alias_id(AI, (row_class[r] - 1) * Mprod + m))
+        push!(C.scalars,   row_scalar[r])
     end
 
     # ── Sort keys in column-major order ──
@@ -231,14 +187,13 @@ function contract_aliased!(
     # ── factor-core: persist the PRE-P routing (rv → template id). rv = the reduction
     # index = the core (B) column = pre-P site slice. read_core/write_core! key the core
     # on rv via this map, so they work for OFF-DIAGONAL/flip P (KL), not just diagonal.
-    # (Diagonal P has rv == output site, so this equals the group-by-s' derivation ⇒ PXP
-    # stays bit-identical.) Accumulated (multi-rv) templates are absent from rv_to_tid —
-    # a clean P·core has none. Unset rv slots stay 0 (that pre-P slice absent).
-    # With moved indices one rv has Mprod templates, which this map cannot express: it is
-    # left empty (absent), so the factor-core helpers refuse rather than guess.
-    if Mprod == 1
+    # It exists only when every class is a single rv (one nonzero per row: a clean P·core, whose
+    # template is the core slice itself). A class of several rv (e.g. the parity gauge) is not a
+    # core slice, and one rv with Mprod templates cannot be expressed: the map is left empty
+    # (absent), so the factor-core helpers refuse rather than guess. Unset rv slots stay 0.
+    if Mprod == 1 && all(c -> length(class_rvs[c]) == 1, 1:ncls)
         s2t = zeros(Int, R)
-        for ((rv, _), tid) in rv_to_tid; s2t[rv] = tid; end
+        for c in 1:ncls; s2t[class_rvs[c][1]] = c; end
         C.slice_to_template = s2t
     else
         C.slice_to_template = Int[]

@@ -274,3 +274,111 @@ end
 #     end
 #   end
 # end
+
+using ITensors, Random, LinearAlgebra
+# Regression tests for the t26 block-sparse fixes (complex bs x dense, column-major key order,
+# + / map! index identity, factorize grouping the labels a row key meets).
+@testset "block-sparse fixes (t26)" begin
+
+  SB = SparseBackends
+  rng = MersenneTwister(26)
+  wrapbs(bs, is) = ITensors._itensor_from_external_storage(SB.WrappedBlockSparse(bs, Tuple(is)))
+  todense(T) = SB.to_dense_itensors_unfused(T)
+  keys_colmajor(T) = (bsx = ITensors.get_external_storage(T).blocksparse;
+                      pd = bsx.dims[1:SB._P(bsx)]; lin = [SB._prefix_lin(k, pd) for k in bsx.keys];
+                      all(i -> lin[i] < lin[i+1], 1:length(lin)-1))
+  # block-sparse ITensor over `is` (first P key, rest dense) holding the listed keys (default: all)
+  function bsten(::Type{T}, is, P; keep = k -> true) where {T}
+    N = length(is); dims = Tuple(ITensors.dim.(is)); blk = prod(dims[P+1:N]; init = 1)
+    ks = [Tuple(c) for c in CartesianIndices(dims[1:P]) if keep(Tuple(c))]
+    wrapbs(SB.NewBlockSparseSorted{T,N,N-P,P,Int}(dims, blk, ks, collect(1:length(ks)), randn(rng, T, blk * length(ks))), is)
+  end
+  a, b, c = Index(2, "a"), Index(2, "b"), Index(2, "c")
+  d, e = Index(3, "d"), Index(2, "e")
+
+  @testset "complex bs x dense is not conjugated (contract_dense_bd!)" begin
+    for TB in (ComplexF64, Float64)
+      A = bsten(ComplexF64, [a, d], 1; keep = k -> k[1] == 2)      # key a, dense d (contracted)
+      B = ITensor(randn(rng, TB, 3, 2), d, e)
+      C = ITensors.contract(A, B; preserve_bs_output = true)
+      @test norm(todense(C) - todense(A) * B) < 1e-12
+    end
+  end
+
+  @testset "bs x dense via contract_shared!: keys in column-major order" begin
+    A = bsten(Float64, [a, b, c, d], 3; keep = k -> !(k[1] == 1 && k[2] == 1))
+    for B in (ITensor(randn(rng, 2, 3, 2), c, d, e), ITensor(randn(rng, 2), e))   # 2 shared / outer product
+      C = ITensors.contract(A, B; preserve_bs_output = true)
+      @test keys_colmajor(C)
+      @test norm(todense(C) - todense(A) * B) < 1e-12
+      @test norm(todense(C + C) - 2 * todense(C)) < 1e-12
+    end
+  end
+
+  @testset "fuse_sparse_axes on non-adjacent key axes keeps column-major keys" begin
+    A = bsten(Float64, [a, b, c, d], 3; keep = k -> k != (1, 2, 2))
+    F = SB.fuse_sparse_axes(ITensors.get_external_storage(A).blocksparse, 1, 3)
+    pd = F.dims[1:2]; lin = [SB._prefix_lin(k, pd) for k in F.keys]
+    @test all(diff(lin) .> 0)
+    Fa = reshape(permutedims(Array(todense(A), a, b, c, d), (1, 3, 2, 4)), 4, 2, 3)   # fused (a,c) index: a fastest
+    @test all(F[i, j, k] == Fa[i, j, k] for i in 1:4, j in 1:2, k in 1:3)
+  end
+
+  @testset "+ and map! need the same indices in the same order" begin
+    A  = bsten(Float64, [a, b, d, e], 2)
+    B  = bsten(Float64, [a, b, d, e], 2)
+    Bp = SB.permute(B, b, a, e, d)
+    @test norm(todense(A + B) - (todense(A) + todense(B))) < 1e-12
+    C = copy(A); map!((x, y) -> x + y, C, C, B)
+    @test norm(todense(C) - (todense(A) + todense(B))) < 1e-12
+    # same set in another order, different index sets, or a different key/dense split: errors
+    @test_throws ErrorException A + Bp
+    @test_throws ErrorException (C1 = copy(A); map!((x, y) -> x + y, C1, C1, Bp))
+    @test_throws ErrorException A + bsten(Float64, [a, b, d, Index(2, "z")], 2)
+    Bx = bsten(Float64, [a, d, b, e], 2)
+    @test_throws ErrorException A + Bx
+    @test_throws ErrorException (C2 = copy(A); map!((x, y) -> x + y, C2, C2, Bx))
+  end
+
+  @testset "factorize groups the bond labels a row key meets" begin
+    # keys (site s, label b), dense axis = multiplicity; L: (s, b*, new mult), R: (b*, b, new mult, mult)
+    arr(B) = [B[Tuple(I)...] for I in CartesianIndices(B.dims)]
+    LR(L, R) = (l = arr(L); r = arr(R);
+                [sum(l[s, c, k] * r[c, b, k, m] for c in axes(l, 2), k in axes(l, 3))
+                 for s in axes(l, 1), b in axes(r, 2), m in axes(r, 4)])
+    # (1) every site value meets both labels: one group {1, 2}, b* = 1
+    # (2) s=1 meets b=1,2, s=2 meets b=2, s=3 meets b=3: groups {1, 2} (rows s=1,2) and {3} (row s=3)
+    for (dims, keys, groups) in (((2, 2, 2), [(1, 1), (2, 1), (1, 2), (2, 2)], [([1, 2], [1, 2])]),
+                                 ((3, 3, 2), [(1, 1), (1, 2), (2, 2), (3, 3)], [([1, 2], [1, 2]), ([3], [3])]))
+      A  = SB.NewBlockSparseSorted{Float64,3,1,2,Int}(dims, dims[3], keys, collect(1:length(keys)),
+                                                      randn(rng, dims[3] * length(keys)))
+      Ad = arr(A)
+      # dense SVD per group of the matrix [s, (b, m)]
+      Fs = [svd(reshape(Ad[ss, bs, :], length(ss), :)) for (ss, bs) in groups]
+      for md in (typemax(Int), 1)
+        L, R, spec = SB.blocksparse_factorize(A, [1]; maxdim = md, cutoff = 0.0)
+        @test L.keys == sort([(s, first(bs)) for (ss, bs) in groups for s in ss])     # (s, b*)
+        @test R.keys == [(first(bs), b) for (ss, bs) in groups for b in bs]           # (b*, b)
+        Ld = arr(L)
+        Lm = reshape(Ld, size(Ld, 1), :)                                               # [s, (b, new mult)]
+        kk = [min(md, length(F.S)) for F in Fs]
+        kb = zeros(Int, dims[2]); for ((ss, bs), k) in zip(groups, kk); kb[first(bs)] = k; end
+        @test norm(Lm' * Lm - Diagonal(vec([mu <= kb[b] ? 1.0 : 0.0 for b in 1:dims[2], mu in 1:size(Ld, 3)]))) < 1e-12
+        # L * R against the per-group dense truncated SVD (full rank: A itself)
+        ref = zeros(size(Ad))
+        for ((ss, bs), F, k) in zip(groups, Fs, kk)
+          ref[ss, bs, :] .= reshape(F.U[:, 1:k] * Diagonal(F.S[1:k]) * F.Vt[1:k, :], length(ss), length(bs), :)
+        end
+        @test norm(LR(L, R) - ref) < 1e-12
+        md == typemax(Int) && @test norm(LR(L, R) - Ad) < 1e-12
+        sv = reduce(vcat, (F.S for F in Fs))
+        @test spec.eigs ≈ sort(reduce(vcat, (abs2.(F.S[1:k]) for (F, k) in zip(Fs, kk))); rev = true)
+        terr = sum(sum(abs2, F.S[(k + 1):end]; init = 0.0) for (F, k) in zip(Fs, kk)) / sum(abs2, sv)
+        @test abs(spec.truncerr - terr) < 1e-14
+      end
+    end
+    A2 = SB.NewBlockSparseSorted{Float64,3,1,2,Int}((2, 2, 2), 2, [(1, 1), (2, 2)], collect(1:2), randn(rng, 4))
+    L, R, _ = SB.blocksparse_factorize(A2, [1]; maxdim = 4, cutoff = 0.0)   # label conserved: R diagonal
+    @test L.keys == A2.keys && R.keys == [(1, 1), (2, 2)]
+  end
+end

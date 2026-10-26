@@ -121,7 +121,7 @@ end
 `psi0` IS dense, so it is declared `:dense` and the output backend is named
 explicitly. Do NOT use the legacy `:coo, :aliased; denseLinksB=0` form: it
 declares a dense operand as aliased purely so top_level_contract will INFER
-Cbackend -- see the "old contract_and_fuse_links_aliased semantics" note in
+Cbackend -- see the note on an ALIASED input backend in top_level_contract,
 SparseBackends/src/tensor_contraction.jl."""
 attach_P(P::MPO, psi0::MPS; backend::Symbol = :aliased) =
     replaceprime(contract(P, copy(psi0), :coo, :dense; Cbackend = backend), 1 => 0)
@@ -171,7 +171,7 @@ function mul_aliased(A::ITensor, B::ITensor; in_position::Bool = false)
     (a_ali || b_ali) || return A * B
     Aw = a_ali ? ITensors.get_external_storage(A) : SparseBackends.wrap_itensor(A; backend = :dense)
     Bw = b_ali ? ITensors.get_external_storage(B) : SparseBackends.wrap_itensor(B; backend = :dense)
-    Cw = SparseBackends.wrapped_contract_aliased(Aw, Bw;
+    Cw = SparseBackends.contract(Aw, Bw;
             preserve_bs_output = true, in_position = in_position,
             layout = SparseBackends.dense_from_aliased_operand(Aw, Bw))
     return Cw isa ITensor ? Cw : ITensors._itensor_from_external_storage(Cw)
@@ -200,34 +200,39 @@ Two consequences, both measured on the D4 ring:
     multiplicity [2,4,4,4,2] against an effective [1,1,1,1,1]. It is now a keyword,
     defaulting to 0.0 so nothing else changes; pass `cutoff` here to use it.
 
-`maxdim <= 0` means EXACT: skip orthogonalize! entirely. Bonds then grow by the layer
+`maxdim <= 0` means EXACT: skip the truncation entirely. Bonds then grow by the layer
 bond dimension every layer, so that is for validation and short runs.
 
-`merge` and `ortho_frame` are the two knobs the ordering result above rests on, and both
-are now selectable so an accuracy sweep can measure them rather than assume them:
+The truncation is stock `truncate!` (orthogonalize to site N, then a truncating sweep
+N -> 1; the centre ends at site 1). There is one direction.
+
+`merge` is selectable so an accuracy sweep can measure it rather than assume it:
 
   * `merge` -- `:before` (default, the measured template win), `:after` (the old
     behaviour), `:both`, or `:none`. `true`/`false` still work and map to
     `:before`/`:none`, so existing callers are unchanged.
-  * `ortho_frame` -- `:left` (default, centre at site 1) or `:right` (centre at site N).
 
-Template counts were previously found identical across all four combinations, but their
-FIDELITY was never compared. The direction dependence that motivated `ortho_frame` came
-from truncating in a single sweep on a non-canonical φ; truncation is now two-pass (see
-the body), so the frames are expected to agree closely. The remaining difference is the
-aliased factorize's shared multiplicity projector, whose L is orthonormal only summed
-over channels."""
-function apply_layer_sparse(psi::MPS, M::MPO; maxdim::Int, cutoff::Real = 0.0,
-                            merge::Union{Bool,Symbol} = :before,
-                            ortho_frame::Symbol = :left,
+`merge` defaults to `:before` for an MPO layer and to `:none` for a constrained layer `(gate, gauges)`:
+the gauged kernel returns psi's own keys, template classes and scalars (one template per class, the
+scalars kept), so there is nothing left to merge, and a numeric merge would only divide by computed
+coefficients (`:before`/`:both`/`:after` still run it if asked for).
+
+`M` may also be a constrained layer `(gate, gauges)` of `build_tebd_mpo_layers(...; P,
+datastructure = :aliased)` for an aliased psi = P*core: the same `contract` call then applies
+the gate and the bond gauges in one contraction (see the ITensorMPS fork's
+`contract(A, psi, Abackend, Bbackend)`). Its default layout puts each bond's core link next
+to the gate link it fuses with, (m_l, g_l, m_r, g_r), so the bond fusion after the contraction
+needs no template permute (fused value m + Dm*(g-1), m fastest, as for an MPO layer)."""
+function apply_layer_sparse(psi::MPS, M::Union{MPO,NamedTuple{(:gate, :gauges)}};
+                            maxdim::Int, cutoff::Real = 0.0,
+                            merge::Union{Bool,Symbol} = M isa MPO ? :before : :none,
                             layout = SparseBackends.OutputLayout(
                                 sparse = [(:B,:l,1), (:B,:r,1), (:A,:sp)],
-                                dense  = [(:B,:l,2), (:B,:r,2), (:A,:r), (:A,:l)]))
+                                dense  = M isa MPO ? [(:B,:l,2), (:B,:r,2), (:A,:r), (:A,:l)] :
+                                                     [(:B,:l,2), (:A,:l), (:B,:r,2), (:A,:r)]))
     mode = merge isa Bool ? (merge ? :before : :none) : merge
     mode in (:none, :before, :after, :both) ||
         error("apply_layer_sparse: merge must be :none/:before/:after/:both (or a Bool); got $merge")
-    ortho_frame in (:left, :right) ||
-        error("apply_layer_sparse: ortho_frame must be :left or :right; got $ortho_frame")
 
     bk = storage_kind(psi[1])
     # Output of each site product gate[i] (A) * ψ[i] (B), for an aliased ψ = P·core:
@@ -240,8 +245,7 @@ function apply_layer_sparse(psi::MPS, M::MPO; maxdim::Int, cutoff::Real = 0.0,
     # from the INPUT tensors -- so merging here hands the sweep the small schema, whereas
     # merging afterwards has to find proportionality the refactorization destroyed.
     (mode === :before || mode === :both) && merge_aliased_templates!(phi)
-    maxdim > 0 && truncate_sparse!(phi; maxdim = maxdim, cutoff = cutoff,
-                                   ortho_frame = ortho_frame)
+    maxdim > 0 && truncate!(phi; maxdim = maxdim, cutoff = cutoff)
     (mode === :after || mode === :both) && merge_aliased_templates!(phi)
     return phi
 end
@@ -258,83 +262,16 @@ function merge_aliased_templates!(psi::MPS)
     return psi
 end
 
-"""Truncate `psi` in place to `maxdim` (and `cutoff`, if > 0). The centre ends at site 1
-for `ortho_frame = :left`, at site N for `:right`.
-
-Factored out of `apply_layer_sparse` so the truncation can be tested on a given state.
-
-TWO PASSES, as in ITensorMPS.truncate!. After a layer, ψ is raw contraction output with no
-canonical form, and a single truncating sweep cuts on local singular values while the
-sites ahead are still unnormalized -- those are not Schmidt values, so it keeps redundant
-directions and drops the wrong ones. Pass 1 canonicalizes toward the far end without
-truncating (only exact zeros are dropped, as in ITensors' truncate!); pass 2 sweeps back and truncates, so each bond has an orthonormal side behind it
-and the pass-1 side ahead of it. truncate! itself cannot be used: it calls svd, and
-aliased storage only hooks factorize. The limits are reset because whatever contract left
-is not trusted.
-
-For aliased ψ pass 2 is still not exactly optimal: the single-site factorize applies one
-multiplicity projector shared by all channels, and its L is orthonormal only summed over
-channels, so pass 1 leaves ψ close to canonical but not exactly."""
-function truncate_sparse!(psi::MPS; maxdim::Int, cutoff::Real = 0.0,
-                          ortho_frame::Symbol = :left)
-    ortho_frame in (:left, :right) ||
-        error("truncate_sparse!: ortho_frame must be :left or :right; got $ortho_frame")
-    N = length(psi)
-    j, j0 = ortho_frame === :left ? (1, N) : (N, 1)
-    reset_ortho_lims!(psi)
-    orthogonalize!(psi, j0)
-    # `cutoff` is forwarded ONLY when nonzero. The kwarg is a LOCAL patch to
-    # SparseBackends/ITensorMPS.jl; upstream -- and the copy deployed on Sherlock --
-    # has `orthogonalize!(M, j; maxdim, normalize)` and nothing else, so passing
-    # cutoff unconditionally kills every remote run with an unsupported-keyword
-    # MethodError, after setup and JIT, i.e. minutes in and long past any load
-    # check. cutoff=0.0 is the default here and was measured inert on this model
-    # anyway (relerr 0.000e+00 against 1e-14), so the default path needs no patched
-    # library and the sweep does not have to ship one.
-    if Float64(cutoff) > 0
-        orthogonalize!(psi, j; maxdim = maxdim, cutoff = Float64(cutoff))
-    else
-        orthogonalize!(psi, j; maxdim = maxdim)
-    end
-    return psi
-end
-
-"""All layers of one Trotter cycle onto `psi`.
-
-`ortho_frame` is `:left`, `:right`, or `:alternate`. The first two hand the same fixed
-frame to every layer, so the canonicalization sweep runs in the SAME direction every
-time -- N->1 for `:left`, 1->N for `:right` -- and any directional bias in what
-`itensor_aliased_factorize` discards accumulates over the run.
-
-`:alternate` flips the frame per LAYER, the usual back-and-forth sweeping order. It is
-nearly free here: the frame only sets where the previous layer left the centre, and the
-next layer's contraction is exact and needs no canonical form, so alternating costs no
-extra sweep.
-
-`layer0` is the number of layers already applied before this call, so the parity
-CONTINUES across cycles: with an even number of layers per cycle, restarting at `:left`
-every cycle would reintroduce exactly the bias `:alternate` removes. Callers advancing
-cycle by cycle should pass `layer0 = (cycle - 1) * length(layers)`. Ignored unless
-`ortho_frame === :alternate`."""
-function step_sparse(psi::MPS, layers::Vector{MPO}; maxdim::Int, cutoff::Real = 0.0,
-                     merge::Union{Bool,Symbol} = :before,
-                     ortho_frame::Symbol = :left,
-                     layer0::Int = 0,
-                     layout = SparseBackends.OutputLayout(
-                         sparse = [(:B,:l,1), (:B,:r,1), (:A,:sp)],
-                         dense  = [(:B,:l,2), (:B,:r,2), (:A,:r), (:A,:l)]))
-    ortho_frame in (:left, :right, :alternate) ||
-        error("step_sparse: ortho_frame must be :left, :right or :alternate; got $ortho_frame")
+"""All layers of one Trotter cycle onto `psi`, each through `apply_layer_sparse`.
+`merge = nothing` and `layout = nothing`: each layer gets `apply_layer_sparse`'s default for its type."""
+function step_sparse(psi::MPS, layers::AbstractVector; maxdim::Int, cutoff::Real = 0.0,
+                     merge::Union{Nothing,Bool,Symbol} = nothing,
+                     layout = nothing)
     p = psi
-    for (k, M) in enumerate(layers)
-        # Resolved HERE, not in apply_layer_sparse: that function is stateless per layer
-        # and cannot know the parity, and keeping its contract at :left/:right leaves
-        # every existing caller bit-for-bit unchanged.
-        frame = ortho_frame === :alternate ?
-                (iseven(layer0 + k - 1) ? :left : :right) : ortho_frame
+    for M in layers
         p = apply_layer_sparse(p, M; maxdim = maxdim, cutoff = cutoff,
-                               merge = merge, ortho_frame = frame,
-                               layout = layout)
+                               (merge === nothing ? (;) : (; merge = merge))...,
+                               (layout === nothing ? (;) : (; layout = layout))...)
     end
     return p
 end

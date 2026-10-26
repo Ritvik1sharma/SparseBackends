@@ -177,8 +177,10 @@ function contract_shared!(
     permA = _find_perm_for_A_join_and_dense_order(A, labelsA, mapA, shared_prefix, desired_keepA, red_dense)
     permB = _find_perm_for_B_join_and_dense_redfirst_order(B, labelsB, mapB, shared_prefix, red_dense, desired_keepB)
 
-    A       = permutedims(A, permA)
-    B       = permutedims(B, permB)
+    # A and B are only read below: an identity permutation is skipped, and one that moves only
+    # key axes keeps the operand's templates (_permutedims_sharing) instead of copying them.
+    A       = permA == 1:NA ? A : _permutedims_sharing(A, permA)
+    B       = permB == 1:NB ? B : _permutedims_sharing(B, permB)
     labelsA = labelsA[permA]
     labelsB = labelsB[permB]
     mapA    = Dict(l => i for (i, l) in enumerate(labelsA))
@@ -267,15 +269,15 @@ function contract_shared!(
                     combined_tid_map[ct_key] = combined_tid
 
                     tmpl_B_mat = reshape(_aliased_template_view(B, tidB), K, N)   # (K, N)
-                    new_tmpl   = Vector{TC}(undef, C.blksize)
+                    # the new template is written straight into its slot of `pending`
+                    resize!(pending, n_pending * C.blksize)
+                    new_tmpl = view(pending, ((n_pending - 1) * C.blksize + 1):(n_pending * C.blksize))
 
                     if mode == :AthenB
                         # C (M, N) = Amat (M, K) @ Bmat (K, N)
                         Cmat = reshape(new_tmpl, M, N)
                         if can_blas
-                            mul!(Cmat,
-                                 convert(Matrix{TC}, tmpl_A_mat),
-                                 convert(Matrix{TC}, tmpl_B_mat))
+                            mul!(Cmat, tmpl_A_mat, tmpl_B_mat)
                         else
                             fill!(new_tmpl, zero(TC))
                             for k in 1:K
@@ -287,9 +289,8 @@ function contract_shared!(
                     else  # :BthenA  →  C (N, M) = Bmat^T (N, K) @ Amat^T (K, M)
                         Cmat = reshape(new_tmpl, N, M)
                         if can_blas
-                            mul!(Cmat,
-                                 convert(Matrix{TC}, transpose(tmpl_B_mat)),
-                                 convert(Matrix{TC}, transpose(tmpl_A_mat)))
+                            # lazy transposes: BLAS reads the templates in place (transpose flags)
+                            mul!(Cmat, transpose(tmpl_B_mat), transpose(tmpl_A_mat))
                         else
                             fill!(new_tmpl, zero(TC))
                             for k in 1:K
@@ -299,8 +300,6 @@ function contract_shared!(
                             end
                         end
                     end
-
-                    @timeit TIMER "cas.append_pending" append!(pending, new_tmpl)
                 end   # combined template computed
 
                 ckey = ntuple(j -> (src[j] > 0 ? akey[src[j]] : bkey[-src[j]]), Val(PC))

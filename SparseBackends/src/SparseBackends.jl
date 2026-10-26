@@ -139,7 +139,9 @@ export WrappedAliasedBlockSparse, contract_aliased_itensor,
 # The public contract API still accepts Symbols for ergonomics; `to_backend`
 # converts at the boundary and ERRORS on any non-canonical name. Internal
 # dispatch compares the enum.
-@enum Backend DENSE COO BLOCKSPARSE ALIASED
+# ALIASED_SECTOR_SPLIT is an OUTPUT backend only (Cbackend = :aliased_sector_split): the aliased
+# product with SectorSplitAliasedBlockSparse storage (one multiplicity basis per channel value).
+@enum Backend DENSE COO BLOCKSPARSE ALIASED ALIASED_SECTOR_SPLIT
 export Backend, DENSE, COO, BLOCKSPARSE, ALIASED, to_backend
 export footprint
 export OutputLayout, OutputLayoutError, as_dense, validate_layout,
@@ -151,11 +153,14 @@ export OutputLayout, OutputLayoutError, as_dense, validate_layout,
     s === :coo         ? COO :
     s === :blocksparse ? BLOCKSPARSE :
     s === :aliased     ? ALIASED :
-    throw(ArgumentError("Unknown backend $(repr(s)); valid: :dense, :coo, :blocksparse, :aliased"))
+    s === :aliased_sector_split ? ALIASED_SECTOR_SPLIT :
+    throw(ArgumentError("Unknown backend $(repr(s)); valid: :dense, :coo, :blocksparse, :aliased, " *
+                        ":aliased_sector_split (output only)"))
 end
 # Reverse map for the few internal helpers still keyed on a Symbol.
 @inline Base.Symbol(b::Backend) =
-    b === DENSE ? :dense : b === COO ? :coo : b === BLOCKSPARSE ? :blocksparse : :aliased
+    b === DENSE ? :dense : b === COO ? :coo : b === BLOCKSPARSE ? :blocksparse :
+    b === ALIASED ? :aliased : :aliased_sector_split
 
 include("base.jl")
 include("output_layout.jl")      # OutputLayout + OutputLayoutError (kernels throw it)
@@ -196,12 +201,18 @@ include("ops_factorize_qr.jl")
 # tensor_wrappers.jl (owned-SVD variant never exercised by any script). Uncomment
 # this include + that wrapper + the mps.jl/verify_iso.jl dispatch branches to re-enable.
 # include("ops_factorize_svd_owned.jl")
-include("tensor_wrappers.jl")
+include("tensor_wrappers.jl")          # contract(A, B; ...) entry + wrapped_contract for non-aliased operands
 include("tensor_index.jl")
-include("tensor_contraction.jl")
-include("tensor_wrappers_aliased.jl")   # WrappedAliasedBlockSparse + top-level aliased contract functions
-include("output_layout_builders.jl")  # OutputLayout builders for the known callers
-include("aliased/factorize.jl")         # Aliased-aware factorize (Tier 1: dense SVD + re-aliasify)
-include("core_helpers/factor_core.jl")  # factor-core read_core/write_core_window!/slice_to_template (ψ=P·core)
+include("tensor_contraction.jl")       # top_level_contract (MPO × MPS / MPO site products + bond-link fusion)
+include("tensor_wrappers_aliased.jl")   # WrappedAliasedBlockSparse + wrapped_contract with aliased operands / output
+include("tensoralgebra/contract_aliased_gauged.jl")  # aliased ψ × constrained TEBD layer site (gate + bond gauges)
+include("output_layout_builders.jl")  # OutputLayout builders for the known callers (incl. _absorb_layout)
+# Per-storage hooks: factorize (ITensors._external_factorize_storage) and _absorb_bond (ITensorMPS).
+include("blocksparse/factorize.jl")            # block-sparse: per-group SVD; its _absorb_bond
+include("aliased/shared/factorize.jl")         # Shared: shared-basis SVD; two-site direct split
+include("aliased/shared/factor_core.jl")       # Shared: factor-core read_core/write_core_window!/slice_to_template (ψ=P·core)
+include("aliased/shared/absorb.jl")            # Shared: _absorb_bond
+include("aliased/sector_split/factorize.jl")   # SectorSplit: one SVD per channel value
+include("aliased/sector_split/absorb.jl")      # SectorSplit: _absorb_bond (c' -> c relabel)
 
 end

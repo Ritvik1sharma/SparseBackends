@@ -288,7 +288,16 @@ function fuse_sparse_axes(
     # println(" new key is ", newkeys[i])
   end
   # Reuse ids/data; blksize unchanged; prefix length P -> P-1
-  return NewBlockSparseSorted{T,N-1,N2,P-1,K}(newdims, A.blksize, newkeys, A.ids, A.data)
+  newids = A.ids
+  if a2 != a1 + 1
+    # Non-adjacent axes: the fused keys are no longer in column-major order (the storage
+    # invariant _find_key and the merge joins rely on), so reorder keys and ids together.
+    pdims = ntuple(i -> newdims[i], Val(P - 1))
+    p = sortperm(newkeys; by = k -> _prefix_lin(k, pdims))
+    newkeys = newkeys[p]
+    newids  = A.ids[p]
+  end
+  return NewBlockSparseSorted{T,N-1,N2,P-1,K}(newdims, A.blksize, newkeys, newids, A.data)
 end
 
 function fuse_dense_axes!(

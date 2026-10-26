@@ -444,12 +444,6 @@ function infer_denseLinksC(Aw::WrappedTensorTypes,
     return length(dC)
 end
 
-@inline infer_C_backend(::WrappedCOOTensor, ::WrappedCOOTensor) = :coo
-@inline infer_C_backend(::WrappedBlockSparse, ::WrappedBlockSparse) = :blocksparse
-@inline infer_C_backend(::WrappedCOOTensor, ::WrappedTensor) = :blocksparse
-@inline infer_C_backend(::WrappedCOOTensor, ::WrappedBlockSparse) = :blocksparse
-@inline infer_C_backend(::WrappedBlockSparse, ::WrappedTensor) = :blocksparse
-
 function _dense_last_order(indsC_vec::Vector{ITensors.Index},
                            dense_set::Set{ITensors.Index})
     sparse = ITensors.Index[I for I in indsC_vec if !(I in dense_set)]
@@ -497,6 +491,9 @@ function contract(A::ITensors.ITensor, B::ITensors.ITensor,
                                     emit_window_map=emit_window_map,
                                     layout=layout)
   end
+  Cb === ALIASED_SECTOR_SPLIT && throw(ArgumentError(
+      "contract(A, B, Abackend, Bbackend, Cbackend): Cbackend = :aliased_sector_split is " *
+      "supported by contract(::MPO, ::MPS / ::MPO, Abackend, Bbackend; Cbackend), not here"))
   layout === nothing || throw(OutputLayoutError(
       "contract(…, Cbackend=$Cbackend): a layout is only supported for aliased output"))
   return contract(A, B, Abackend, Bbackend;
@@ -1050,19 +1047,6 @@ end
   return ntuple(i -> inds[perm[i]], Val(N))
 end
 
-function contract(A::WrappedTensorTypes{TA,NA}, B::WrappedTensorTypes{TB,NB}; kwargs...) where {TA,TB,NA,NB}
-  if A isa WrappedTensor && B isa WrappedCOOTensor
-    return wrapped_contract(B, A; kwargs...)
-  elseif A isa WrappedTensor && B isa WrappedBlockSparse
-    result = wrapped_contract(B, A; kwargs...)
-    return result
-  elseif A isa WrappedBlockSparse && B isa WrappedCOOTensor
-    return wrapped_contract(B, A; kwargs...)
-  else
-    result = wrapped_contract(A, B; kwargs...)
-    return result
-  end
-end
 
 
 # --- fast rep dispatch ---
@@ -1140,197 +1124,207 @@ end
 
 
 
-function wrapped_contract(A::WrappedTensorTypes{TA,NA},
-                          B::WrappedTensorTypes{TB,NB};
-                          output_backend::Symbol=:blocksparse,
-                          preserve_bs_output::Bool=false,
-                          in_position::Bool=false) where {TA,TB,NA,NB}
-  # `preserve_bs_output=true` is an opt-in pathway that forces the result of
-  # a BlockSparse-involving contraction to remain WrappedBlockSparse, even
-  # when the natural output has no sparse axes (P_C = 0) or shares only
-  # dense indices. The default (false) preserves the existing behavior of
-  # returning a plain dense ITensor in those cases. Used by Path-B sparse
-  # DMRG where the Krylov subspace requires storage-type stability across
-  # operator applications.
-  @timeit TIMER "wrapped_contract" begin
-    @timeit TIMER "wc.setup" begin
-      Arep = rep(A)
-      Brep = rep(B)
-      indsA = A.inds
-      indsB = B.inds
-      denseA = dense_inds(A)
-      denseB = dense_inds(B)
-    end
-    if false  # SB_TRACE — flip to true here for debug output
-      println("[SB_TRACE] wrapped_contract  A=", _backend(A), "{T=", TA, ",N=", NA, "}",
-              "  B=", _backend(B), "{T=", TB, ",N=", NB, "}",
-              "  → C=", infer_C_backend(A, B))
-    end
-    @timeit TIMER "wc.output_inds" begin
-      indsC, denseC = output_inds(indsA, indsB, denseA, denseB)
-    end
-    @timeit TIMER "wc.labels" begin
-      dimsC = ntuple(i -> ITensors.dim(indsC[i]), length(indsC))
-      TC = promote_type(eltype(Arep), eltype(Brep))
-      Cbackend = infer_C_backend(A, B)
-      sc = scratch()
-      labelsA_vec = fill_labels!(sc.labelsA, indsA)
-      labelsB_vec = fill_labels!(sc.labelsB, indsB)
-      labelsC_vec = fill_labels!(sc.labelsC, indsC)
-    end
-    if Cbackend === :blocksparse
-        denseLinksC = length(denseC)
-        if denseLinksC == length(indsC) && !preserve_bs_output
-            # P_C = 0: all output indices are dense → return plain ITensor
-            @timeit TIMER "wc.alloc_dense" begin
-              C_data = zeros(TC, dimsC...)
-            end
-            if Arep isa NewBlockSparseSorted && Brep isa NewBlockSparseSorted
-              @timeit TIMER "kern.bs_bs_to_dense" begin
-                SparseBackends.contract_bs_bs_to_dense!(
-                    C_data, labelsC_vec, Arep, labelsA_vec, Brep, labelsB_vec)
-              end
-            elseif Arep isa NewBlockSparseSorted && Brep isa AbstractArray
-              @timeit TIMER "kern.bs_dense_to_dense" begin
-                SparseBackends.contract_bs_dense_to_dense!(
-                    C_data, labelsC_vec, Arep, labelsA_vec, Brep, labelsB_vec; in_position=in_position)
-              end
-            elseif Arep isa AbstractArray && Brep isa NewBlockSparseSorted
-              @timeit TIMER "kern.bs_dense_to_dense" begin
-                SparseBackends.contract_bs_dense_to_dense!(
-                    C_data, labelsC_vec, Brep, labelsB_vec, Arep, labelsA_vec; in_position=in_position)
-              end
-            else
-              @timeit TIMER "kern.dense_dense_einsum" begin
-                C_bs = NewBlockSparseSorted{TC, length(dimsC), length(dimsC)}(dimsC)
-                contract!(C_bs, labelsC_vec, NewBlockSparseSorted(Arep), labelsA_vec, Brep, labelsB_vec)
-              end
-            end
-            @timeit TIMER "wc.wrap_output" begin
-              if get(ENV, "SB_NO_ALIAS_OUTPUT", "0") == "1"
-                out = length(indsC) == 0 ? ITensors.ITensor(C_data[]) : ITensors.ITensor(C_data, indsC...)
-              else
-                out = length(indsC) == 0 ? ITensors.ITensor(C_data[]) :
-                      ITensors.ITensor(ITensors.AllowAlias(), C_data, indsC...)
-              end
-            end
-            return out
-        end
+# ─────────────────────────────────────────────────────────────────────────────
+# Contraction of two wrapped tensors
+#
+# contract(A, B; preserve_bs_output, in_position, layout) is the entry for every product of two
+# wrapped tensors (ITensors.contract reaches it through _contract_external_storage; an ITensor
+# operand is wrapped dense first). It picks the output storage class C, the target backend
+# (_output_storage), and calls wrapped_contract(A, B, C), whose methods pick the kernel by the
+# operands' storage and C:
+#   C = COOTensor / NewBlockSparseSorted / Array (dense), operands without aliasing   this file
+#   C = Array with an aliased operand; C = SharedAliasedBlockSparse or
+#       SectorSplitAliasedBlockSparse (any operands)                tensor_wrappers_aliased.jl
+#   A = a constrained TEBD gate site (gate, gauges), B aliased ψ     contract_aliased_gauged.jl
+# top_level_contract (tensor_contraction.jl) picks C from its Cbackend instead.
+# `layout` (an OutputLayout) sets the output's index order and key/dense split; nothing = the
+# stock order of output_inds. A layout a kernel cannot honour throws OutputLayoutError.
+# `in_position` only feeds the FLOP counter of the dense-output kernels.
+# ─────────────────────────────────────────────────────────────────────────────
 
-        # if output_backend === :dense
-        shared = indsA ∩ indsB
-        # println("Shared indices: ", shared, " with dense ", denseA, " and ", denseB)
-        if (A isa WrappedTensor && B isa WrappedBlockSparse) ||
-          (A isa WrappedBlockSparse && B isa WrappedTensor)
-          if preserve_bs_output
-            output_backend = :blocksparse
-          else
-            output_backend = :dense
-            for I in shared
-              if !(I in denseA) && !(I in denseB)
-                output_backend = :blocksparse
-                break
-              end
-            end
-          end
-          # if output_backend === :dense
-          #   println("Output will be dense because shared index ", shared, " is dense")
-          # else
-          #   println("Output will be block-sparse because shared index ", shared, " is sparse")
-          # end
-        end
+const _BSFamily = Union{WrappedTensor,WrappedCOOTensor,WrappedBlockSparse}
 
-        # SB_TRACE_ONE removed 2026-06 — was a fire-once debug trace; hardcoded off.
-        _trace = false
-        if output_backend === :dense
-          if _trace
-            println("\n[TRACE] wrapped_contract bs×dense path")
-            println("  indsA (BS):   ", [(ITensors.dim(i), ITensors.tags(i), ITensors.plev(i)) for i in indsA])
-            println("  indsB (dense):", [(ITensors.dim(i), ITensors.tags(i), ITensors.plev(i)) for i in indsB])
-            println("  indsC (pre-canonical):", [(ITensors.dim(i), ITensors.tags(i), ITensors.plev(i)) for i in indsC])
-            println("  denseA (BS dense axes):", [(ITensors.dim(i), ITensors.tags(i), ITensors.plev(i)) for i in denseA])
-          end
-          # Reorder indsC to canonical [keepA, keepB, c_prefix] for the bd
-          # kernel so it skips its trailing permute_back copy. Only applies
-          # to BS×Dense (and Dense×BS); BS×BS keeps the original output_inds
-          # order. ITensor identifies by Index identity, so the reorder is
-          # invisible to callers.
-          if Arep isa NewBlockSparseSorted && !(Brep isa NewBlockSparseSorted)
-              @timeit TIMER "wc.canonicalize" begin
-                indsC = canonical_indsC_for_bd(indsA, denseA, indsB, indsC)
-                dimsC = ntuple(i -> ITensors.dim(indsC[i]), length(indsC))
-                labelsC_vec = fill_labels!(sc.labelsC, indsC)
-              end
-              if _trace
-                println("  indsC (post-canonical [keepA,keepB,c_prefix]):",
-                        [(ITensors.dim(i), ITensors.tags(i), ITensors.plev(i)) for i in indsC])
-              end
-          end
-          @timeit TIMER "wc.alloc_dense" begin
-            C_data = zeros(TC, dimsC...)
-          end
-          if Arep isa NewBlockSparseSorted
-            if Brep isa NewBlockSparseSorted
-              @timeit TIMER "kern.bs_bs_to_dense" begin
-                SparseBackends.contract_bs_bs_to_dense!(
-                    C_data, labelsC_vec, Arep, labelsA_vec, Brep, labelsB_vec)
-              end
-            else Brep isa AbstractArray
-              @timeit TIMER "kern.bs_dense_to_dense" begin
-                SparseBackends.contract_bs_dense_to_dense!(
-                    C_data, labelsC_vec, Arep, labelsA_vec, Brep, labelsB_vec; in_position=in_position)
-              end
-            end
-          end
-          @timeit TIMER "wc.wrap_output" begin
-            # C_data is freshly allocated in wc.alloc_dense and not referenced
-            # elsewhere — safe to alias into the returned ITensor instead of
-            # copying. Saved ~3.8 s + 4.4 GiB at md=80 single-core.
-            # Gate-able via SB_NO_ALIAS_OUTPUT=1 to compare against the
-            # copying path for regression checks.
-            if get(ENV, "SB_NO_ALIAS_OUTPUT", "0") == "1"
-              out = length(indsC) == 0 ? ITensors.ITensor(C_data[]) : ITensors.ITensor(C_data, indsC...)
-            else
-              out = length(indsC) == 0 ? ITensors.ITensor(C_data[]) :
-                    ITensors.ITensor(ITensors.AllowAlias(), C_data, indsC...)
-              if _trace
-                println("  inds(out) wrapped: ", [(ITensors.dim(i), ITensors.tags(i), ITensors.plev(i)) for i in inds(out)])
-                println("  size(C_data): ", size(C_data))
-                println("  dimsC: ", dimsC)
-                ENV["SB_TRACE_ONE"] = "0"  # only trace once
-              end
-            end
-          end
-          return out
-        else
-          @timeit TIMER "wc.alloc_bs" begin
-            C = WrappedBlockSparse(TC, dimsC, denseLinksC, indsC)
-          end
-          @timeit TIMER "kern.contract!_bs_out" begin
-            C.blocksparse = SparseBackends.contract!(
-                C.blocksparse, labelsC_vec,
-                Arep, labelsA_vec,
-                Brep, labelsB_vec,
-            )
-          end
-        end
-        return C
-    elseif Cbackend === :coo
-        @timeit TIMER "wc.alloc_coo" begin
-          C = WrappedCOOTensor(TC, dimsC, indsC)
-        end
-        @timeit TIMER "kern.contract!_coo_out" begin
-          C.coo = SparseBackends.contract!(
-              C.coo, labelsC_vec,
-              Arep, labelsA_vec,
-              Brep, labelsB_vec
-          )
-        end
-        return C
+# Output storage class of contract(A, B; preserve_bs_output, layout).
+#   an aliased operand      the aliased product (its class: _product_kind), or dense without
+#                           preserve_bs_output
+#   COO x COO               COO
+#   otherwise               block-sparse; without preserve_bs_output dense when one operand is
+#                           dense and the other block-sparse (each index they share is in the
+#                           dense operand's dense set), or when no output index is in a key
+function _output_storage(A::WrappedTensorTypes, B::WrappedTensorTypes, preserve_bs_output::Bool,
+                         layout::Union{Nothing,OutputLayout})
+    if A isa WrappedAliasedBlockSparse || B isa WrappedAliasedBlockSparse
+        return preserve_bs_output ? _product_kind(rep(A), rep(B)) : Array
+    end
+    A isa WrappedCOOTensor && B isa WrappedCOOTensor && return COOTensor
+    A isa WrappedTensor && B isa WrappedTensor &&
+        throw(ArgumentError("contract: both operands are dense wrapped tensors; use ITensors.contract"))
+    preserve_bs_output && return NewBlockSparseSorted
+    ((A isa WrappedTensor && B isa WrappedBlockSparse) ||
+     (A isa WrappedBlockSparse && B isa WrappedTensor)) && return Array
+    nokey = if layout === nothing
+        dA, dB = dense_inds(A), dense_inds(B)
+        all(I -> I in B.inds || I in dA || I in dB, A.inds) &&
+            all(I -> I in A.inds || I in dA || I in dB, B.inds)
     else
-        error("Unsupported backend: $Cbackend")
+        isempty(resolve_layout(layout, A, B).sparse)
     end
-  end  # @timeit "wrapped_contract"
+    return nokey ? Array : NewBlockSparseSorted
+end
+
+function contract(A::WrappedTensorTypes, B::WrappedTensorTypes;
+                  preserve_bs_output::Bool=false, in_position::Bool=false,
+                  layout::Union{Nothing,OutputLayout}=nothing)
+    return wrapped_contract(A, B, _output_storage(A, B, preserve_bs_output, layout);
+                            in_position, layout)
+end
+
+# Output indices of A * B, its dense indices and the three label vectors: the (resolved)
+# layout's order and split if given, else output_inds' stock order with each index's kind
+# inherited from its operand.
+function _contract_setup(A::WrappedTensorTypes, B::WrappedTensorTypes,
+                         layout::Union{Nothing,OutputLayout})
+    indsA, indsB = A.inds, B.inds
+    @timeit TIMER "output_inds" begin
+        if layout === nothing
+            indsC, denseC = output_inds(indsA, indsB, dense_inds(A), dense_inds(B))
+        else
+            validate_layout(layout, indsA, indsB)
+            indsC  = Tuple(ITensors.Index[I for I in layout_inds(layout)])
+            denseC = collect(ITensors.Index, layout.dense)
+        end
+    end
+    sc = scratch()
+    return indsC, denseC, fill_labels!(sc.labelsA, indsA), fill_labels!(sc.labelsB, indsB),
+           fill_labels!(sc.labelsC, indsC)
+end
+
+# Operands without aliasing go to the kernels in the order they take: COO before
+# block-sparse before dense.
+for C in (:Array, :NewBlockSparseSorted, :COOTensor)
+    @eval begin
+        wrapped_contract(A::WrappedTensor, B::Union{WrappedCOOTensor,WrappedBlockSparse},
+                         ::Type{$C}; kwargs...) = wrapped_contract(B, A, $C; kwargs...)
+        wrapped_contract(A::WrappedBlockSparse, B::WrappedCOOTensor, ::Type{$C}; kwargs...) =
+            wrapped_contract(B, A, $C; kwargs...)
+    end
+end
+
+# COO x COO -> COO
+function wrapped_contract(A::_BSFamily, B::_BSFamily, ::Type{COOTensor};
+                          in_position::Bool=false, layout::Union{Nothing,OutputLayout}=nothing)
+  @timeit TIMER "wrapped_contract" begin
+    layout === nothing || throw(OutputLayoutError("wrapped_contract: a COO result " *
+        "cannot honour a layout"))
+    indsC, _, labelsA_vec, labelsB_vec, labelsC_vec = _contract_setup(A, B, nothing)
+    dimsC = ntuple(i -> ITensors.dim(indsC[i]), length(indsC))
+    TC = promote_type(eltype(rep(A)), eltype(rep(B)))
+    @timeit TIMER "wc.alloc_coo" begin
+      C = WrappedCOOTensor(TC, dimsC, indsC)
+    end
+    @timeit TIMER "kern.contract!_coo_out" begin
+      C.coo = SparseBackends.contract!(C.coo, labelsC_vec, rep(A), labelsA_vec, rep(B), labelsB_vec)
+    end
+    return C
+  end
+end
+
+# block-sparse output (COO / block-sparse / dense operands, at least one sparse)
+function wrapped_contract(A::_BSFamily, B::_BSFamily, ::Type{NewBlockSparseSorted};
+                          in_position::Bool=false, layout::Union{Nothing,OutputLayout}=nothing)
+  @timeit TIMER "wrapped_contract" begin
+    layout === nothing || (layout = resolve_layout(layout, A, B))
+    indsC, denseC, labelsA_vec, labelsB_vec, labelsC_vec = _contract_setup(A, B, layout)
+    dimsC = ntuple(i -> ITensors.dim(indsC[i]), length(indsC))
+    TC = promote_type(eltype(rep(A)), eltype(rep(B)))
+    @timeit TIMER "wc.alloc_bs" begin
+      C = WrappedBlockSparse(TC, dimsC, length(denseC), indsC)
+    end
+    @timeit TIMER "kern.contract!_bs_out" begin
+      C.blocksparse = SparseBackends.contract!(C.blocksparse, labelsC_vec,
+                                               rep(A), labelsA_vec, rep(B), labelsB_vec)
+    end
+    return C
+  end
+end
+
+# Dense output from operands without aliasing. When no output index is in a key: the stock
+# order (output_inds). Otherwise (block-sparse x dense): the order contract_bs_dense_to_dense!
+# writes, [keepA, keepB, c_prefix] (canonical_indsC_for_bd), so the kernel skips its permute
+# back. A pair with no dense-output kernel is an error.
+function wrapped_contract(A::_BSFamily, B::_BSFamily, ::Type{Array};
+                          in_position::Bool=false, layout::Union{Nothing,OutputLayout}=nothing)
+  @timeit TIMER "wrapped_contract" begin
+    layout === nothing || throw(OutputLayoutError("wrapped_contract: this contraction " *
+        "returns a dense tensor, which has no key; pass preserve_bs_output = true to " *
+        "keep a block-sparse result"))
+    Arep, Brep = rep(A), rep(B)
+    indsC, denseC, labelsA_vec, labelsB_vec, labelsC_vec = _contract_setup(A, B, nothing)
+    dimsC = ntuple(i -> ITensors.dim(indsC[i]), length(indsC))
+    TC = promote_type(eltype(Arep), eltype(Brep))
+    if length(denseC) == length(indsC)
+        # P_C = 0: every output index is dense
+        @timeit TIMER "wc.alloc_dense" begin
+          C_data = zeros(TC, dimsC...)
+        end
+        if Arep isa NewBlockSparseSorted && Brep isa NewBlockSparseSorted
+          @timeit TIMER "kern.bs_bs_to_dense" begin
+            SparseBackends.contract_bs_bs_to_dense!(
+                C_data, labelsC_vec, Arep, labelsA_vec, Brep, labelsB_vec)
+          end
+        elseif Arep isa NewBlockSparseSorted && Brep isa AbstractArray
+          @timeit TIMER "kern.bs_dense_to_dense" begin
+            SparseBackends.contract_bs_dense_to_dense!(
+                C_data, labelsC_vec, Arep, labelsA_vec, Brep, labelsB_vec; in_position=in_position)
+          end
+        elseif Arep isa AbstractArray && Brep isa NewBlockSparseSorted
+          @timeit TIMER "kern.bs_dense_to_dense" begin
+            SparseBackends.contract_bs_dense_to_dense!(
+                C_data, labelsC_vec, Brep, labelsB_vec, Arep, labelsA_vec; in_position=in_position)
+          end
+        else
+          error("wrapped_contract: no dense-output kernel for $(typeof(Arep).name.name) × " *
+                "$(typeof(Brep).name.name)")
+        end
+    else
+        # block-sparse x dense: [keepA, keepB, c_prefix] order (see above)
+        if Arep isa NewBlockSparseSorted && !(Brep isa NewBlockSparseSorted)
+            @timeit TIMER "wc.canonicalize" begin
+              indsC = canonical_indsC_for_bd(A.inds, dense_inds(A), B.inds, indsC)
+              dimsC = ntuple(i -> ITensors.dim(indsC[i]), length(indsC))
+              labelsC_vec = fill_labels!(scratch().labelsC, indsC)
+            end
+        end
+        @timeit TIMER "wc.alloc_dense" begin
+          C_data = zeros(TC, dimsC...)
+        end
+        if Arep isa NewBlockSparseSorted && Brep isa NewBlockSparseSorted
+          @timeit TIMER "kern.bs_bs_to_dense" begin
+            SparseBackends.contract_bs_bs_to_dense!(
+                C_data, labelsC_vec, Arep, labelsA_vec, Brep, labelsB_vec)
+          end
+        elseif Arep isa NewBlockSparseSorted && Brep isa AbstractArray
+          @timeit TIMER "kern.bs_dense_to_dense" begin
+            SparseBackends.contract_bs_dense_to_dense!(
+                C_data, labelsC_vec, Arep, labelsA_vec, Brep, labelsB_vec; in_position=in_position)
+          end
+        else
+          error("wrapped_contract: no dense-output kernel for $(typeof(Arep).name.name) × " *
+                "$(typeof(Brep).name.name) with a key")
+        end
+    end
+    @timeit TIMER "wc.wrap_output" begin
+      # C_data is freshly allocated above and not referenced elsewhere: aliased into the
+      # returned ITensor instead of copied (SB_NO_ALIAS_OUTPUT=1 copies, for regression checks).
+      if get(ENV, "SB_NO_ALIAS_OUTPUT", "0") == "1"
+        out = length(indsC) == 0 ? ITensors.ITensor(C_data[]) : ITensors.ITensor(C_data, indsC...)
+      else
+        out = length(indsC) == 0 ? ITensors.ITensor(C_data[]) :
+              ITensors.ITensor(ITensors.AllowAlias(), C_data, indsC...)
+      end
+    end
+    return out
+  end
 end
 
 
@@ -1503,7 +1497,11 @@ function Base.copy(wbs::WrappedBlockSparse{T,N,N2,P}) where {T,N,N2,P}
 end
 
 # ── Block-wise addition (union of block keys) ─────────────────────────────────
+# Blocks are paired by key position, so both tensors must store the same indices in the same
+# order; the caller aligns them (no permute here).
 function Base.:+(wA::WrappedBlockSparse{T,N,N2,P}, wB::WrappedBlockSparse{T,N,N2,P}) where {T,N,N2,P}
+    wA.inds == wB.inds ||
+        error("WrappedBlockSparse +: both tensors must store the same indices in the same order: $(wA.inds) vs $(wB.inds)")
     C = copy(wA)
     bs_C = C.blocksparse
     bs_B = wB.blocksparse
@@ -1534,8 +1532,13 @@ end
 
 # Element-wise map! for ExternalStorage ITensors (used by scale!, axpy!, normalize!)
 function _apply_elementwise!(f, R::WrappedBlockSparse, A::WrappedBlockSparse)
+    R.inds == A.inds ||
+        error("_external_map! (WrappedBlockSparse): both tensors must store the same indices in the same order: $(R.inds) vs $(A.inds)")
     length(R.blocksparse.data) == length(A.blocksparse.data) ||
         error("Mismatched sparsity patterns in _external_map! (WrappedBlockSparse)")
+    # the loop below pairs data entries by position, so the block keys and their data ids must agree
+    (R.blocksparse.keys == A.blocksparse.keys && R.blocksparse.ids == A.blocksparse.ids) ||
+        error("Mismatched sparsity patterns in _external_map! (WrappedBlockSparse): block keys or ids differ")
     @inbounds @simd for i in eachindex(R.blocksparse.data)
         R.blocksparse.data[i] = f(R.blocksparse.data[i], A.blocksparse.data[i])
     end

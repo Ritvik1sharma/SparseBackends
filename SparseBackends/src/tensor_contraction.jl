@@ -349,8 +349,31 @@ end
 
 
 
+@inline _bs_head_len(::WrappedBlockSparse{T,N,N2,P}) where {T,N,N2,P} = P
+
+"""
+    top_level_contract(A, B, Abackend, Bbackend, Cbackend, bondmap; denseLinksA, denseLinksB,
+                       aLeft, aRight, bLeft, bRight, layout) -> (C, bondmap)
+
+One site product A[i] * B[i] of an MPO × MPS / MPO × MPO contraction (the ITensorMPS fork's
+`contract(A, B, Abackend, Bbackend; Cbackend)`), then the fusion of its bond links. The
+operands are wrapped as their backends say, the output storage class (the target backend)
+comes from `Cbackend`, and the product is the one wrapped entry `wrapped_contract`:
+  :aliased               the aliased product (SectorSplit when an operand is SectorSplit,
+                         else Shared); also inferred when Abackend or Bbackend is :aliased
+  :aliased_sector_split  SectorSplitAliasedBlockSparse
+  :dense                 dense, with an aliased operand
+  otherwise              the stock storage of the operands (contract(A, B) without
+                         preserve_bs_output); not allowed with an aliased operand
+`layout` (an OutputLayout, Index objects or roles naming A as :A and B as :B) sets the
+product's key/dense split and order before fusion; nothing = stock layout. It needs an
+aliased operand or output. `A` may be one site of a constrained TEBD layer,
+`(gate = ITensor, gauges = (X_left, X_right^-1))` (see contract(::NamedTuple, ::MPS, ...) in
+the ITensorMPS fork): the gate is wrapped dense and the pair goes to the gauged kernel
+(contract_aliased_gauged.jl).
+"""
 function top_level_contract(
-  A::ITensors.ITensor, B::ITensors.ITensor,
+  A::Union{ITensors.ITensor,NamedTuple{(:gate,:gauges)}}, B::ITensors.ITensor,
   Abackend::Symbol, Bbackend::Symbol,
   Cbackend::Union{Nothing,Symbol},
   bondmap::BondMap;
@@ -367,12 +390,10 @@ function top_level_contract(
   Ab = to_backend(Abackend)
   Bb = to_backend(Bbackend)
   Cb = Cbackend === nothing ? nothing : to_backend(Cbackend)
-  # An ALIASED input backend signals "produce an aliased output" (the old
-  # contract_and_fuse_links_aliased semantics): a dense input with ALIASED
-  # backend is wrapped DENSE below, and the COO/Dense→Aliased kernel makes the
-  # output aliased — but only if Cb===ALIASED reaches contract_and_fuse_links.
-  # Infer it here when the caller left Cbackend unset (e.g. build_setup's
-  # contract(...,:coo,:aliased; denseLinksB=0)).
+  # An ALIASED input backend signals "produce an aliased output": a dense input
+  # with ALIASED backend is wrapped DENSE below, and the COO/Dense→Aliased kernel
+  # makes the output aliased. Infer it here when the caller left Cbackend unset
+  # (e.g. build_setup's contract(...,:coo,:aliased; denseLinksB=0)).
   if Cb === nothing && (Ab === ALIASED || Bb === ALIASED)
     Cb = ALIASED
   end
@@ -385,7 +406,10 @@ function top_level_contract(
     error("Not optimal backend combination: both inputs are dense but Cbackend is not :dense.")
   end
   # Wrap inputs if needed
-  Aw = if Ab === ALIASED
+  Aw = if A isa NamedTuple
+      Ab === DENSE || error("top_level_contract: a gauged gate must be passed as :dense, got $Abackend")
+      (gate = wrap_itensor(A.gate; backend=DENSE, denseLinks=denseLinksA), gauges = A.gauges)
+    elseif Ab === ALIASED
       if ITensors.has_external_storage(A)
           wrap_itensor_aliased(A; denseLinks=denseLinksA)
       else
@@ -403,54 +427,28 @@ function top_level_contract(
     else
       wrap_itensor(B; backend=Bb, denseLinks=denseLinksB)
   end
-  return contract_and_fuse_links(Aw, Bw, Cb, bondmap;
-                                 aLeft=aLeft, aRight=aRight, bLeft=bLeft, bRight=bRight,
-                                 layout=layout)
-end
 
-@inline _bs_head_len(::WrappedBlockSparse{T,N,N2,P}) where {T,N,N2,P} = P
-
-"""
-    contract_and_fuse_links(Aw, Bw, Cbackend, bondmap; aLeft, aRight, bLeft, bRight, layout)
-
-Contract two wrapped site tensors and fuse their bond links. `layout` (an
-OutputLayout, Index objects or roles naming Aw as :A and Bw as :B) sets the product's
-key/dense split and order before fusion; nothing = stock layout.
-"""
-function contract_and_fuse_links(
-  Aw::WrappedTensorTypes, Bw::WrappedTensorTypes, Cbackend::Union{Nothing,Symbol,Backend},
-  bondmap::BondMap;
-  aLeft::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing,
-  aRight::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing,
-  bLeft::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing,
-  bRight::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing,
-  layout::Union{Nothing,OutputLayout}=nothing
-)
-  Cb = Cbackend === nothing ? nothing : to_backend(Cbackend)
-  if layout !== nothing
-    # Roles (op, kind, k) name the operands as passed here: :A = Aw (the MPO site).
-    (Aw isa WrappedAliasedBlockSparse || Bw isa WrappedAliasedBlockSparse || Cb === ALIASED) ||
-      throw(OutputLayoutError("contract_and_fuse_links: a layout needs an aliased operand " *
-          "or aliased output; got $(typeof(Aw).name.name) × $(typeof(Bw).name.name) -> $Cb"))
-    if Cb === ALIASED
-      Cw = wrapped_contract_aliased(Aw, Bw; preserve_bs_output=true, layout=layout)
-    elseif Cb === DENSE
-      Cw = wrapped_contract_aliased(Aw, Bw; layout=as_dense(layout))
-    else
-      throw(OutputLayoutError("contract_and_fuse_links: a layout needs Cbackend " *
-                              ":aliased or :dense, got $Cb"))
-    end
-  elseif Aw isa WrappedAliasedBlockSparse || Bw isa WrappedAliasedBlockSparse || Cb === ALIASED
-    if Cb === ALIASED
-      Cw = wrapped_contract_aliased(Aw, Bw; preserve_bs_output=true)   # <-- aliased output
-    elseif Cb === DENSE
-      Cw = wrapped_contract_aliased(Aw, Bw)                            # <-- dense output
-    else
-      error("Unsupported Cbackend=$Cb for contract_and_fuse_links with aliased inputs.")
-    end
+  # ── the output storage class from Cbackend, then the product ───────────────
+  aliased_operand = Aw isa WrappedAliasedBlockSparse || Bw isa WrappedAliasedBlockSparse
+  if Cb === ALIASED || Cb === ALIASED_SECTOR_SPLIT
+    C = Cb === ALIASED_SECTOR_SPLIT ? SectorSplitAliasedBlockSparse :
+        _product_kind(Aw isa NamedTuple ? nothing : rep(Aw), rep(Bw))
+  elseif aliased_operand
+    Cb === DENSE || (layout === nothing ?
+        error("top_level_contract: unsupported Cbackend=$Cb with an aliased operand") :
+        throw(OutputLayoutError("top_level_contract: a layout needs Cbackend :aliased or " *
+                                ":dense, got $Cb")))
+    C = Array
+    layout === nothing || (layout = as_dense(layout))
   else
-    Cw = contract(Aw, Bw)
+    layout === nothing || throw(OutputLayoutError("top_level_contract: a layout needs an " *
+        "aliased operand or aliased output; got $(typeof(Aw).name.name) × " *
+        "$(typeof(Bw).name.name) -> $Cb"))
+    C = _output_storage(Aw, Bw, false, nothing)
   end
+  Cw = wrapped_contract(Aw, Bw, C; layout)
+
+  # ── bond-link fusion ────────────────────────────────────────────────────────
   _nz(v) = (v !== nothing && !isempty(v))
   if _nz(aLeft) && _nz(bLeft)
     aBondLogical = first(aLeft)  # stable logical id for bondmap key
@@ -473,7 +471,7 @@ function contract_and_fuse_links(
     bBondLogical = first(bRight)
     if Cw isa WrappedAliasedBlockSparse
             Cw, bondmap = _canonicalize_bond_aliased!(
-                Cw, bondmap, aBondLogical, bBondLogical, aRight, bRight)  
+                Cw, bondmap, aBondLogical, bBondLogical, aRight, bRight)
     elseif Cw isa WrappedBlockSparse
       Cw, bondmap = _canonicalize_bond_blocksparse!(Cw, bondmap, aBondLogical, bBondLogical, aRight, bRight)
     else

@@ -2,7 +2,7 @@
 # AliasedBS×AliasedBS contraction. Produces `AliasedBlockSparse.window_slice_map`, the
 # (rv_b, rv_{b+1}) → template-id routing that CANNOT be recovered post-hoc for a flip P
 # (φ sums over the internal FSM bond). The consumer side (window_write_map /
-# write_core_window!) lives in core_helpers/factor_core.jl; the storage field is on the
+# write_core_window!) lives in aliased/shared/factor_core.jl; the storage field is on the
 # AliasedBlockSparse struct in aliased/storage.jl.
 #
 # Two entry points, both used ONLY on the factor-core path (emit_window_map=true):
@@ -10,7 +10,7 @@
 #     the AliasedBS×AliasedBS `contract_shared!` calls (gated by its emit_window_map kwarg).
 #   • contract_shared_emit_window! — a front-end that builds the label→axis maps + the
 #     reduced-shared set and runs `contract_shared!` with emission on, so the general
-#     `wrapped_contract_aliased` need not re-derive that dispatch state itself.
+#     aliased-output `wrapped_contract` need not re-derive that dispatch state itself.
 
 # Emission state: per-input inverse rv maps (template-id → pre-P slice) + the per-output-
 # key source-pair accumulator. PC = C's sparse-prefix rank.
@@ -68,7 +68,7 @@ function window_emit_finalize!(C::AliasedBlockSparse, st::WindowEmit{PC}, key_to
     return C
 end
 
-# Front-end for wrapped_contract_aliased: build the label→axis maps + reduced-shared set
+# Front-end for the aliased-output wrapped_contract: build the label→axis maps + reduced-shared set
 # (the dispatch state contract! would otherwise compute) and run the AliasedBS×AliasedBS
 # contract_shared! with emission ON. Keeps that map-building out of the general wrapper.
 function contract_shared_emit_window!(C::AliasedBlockSparse, labelsC,

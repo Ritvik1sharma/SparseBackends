@@ -399,8 +399,8 @@ function contract_aliased_dense_to_dense!(
 
         if perm_C == collect(1:NC) || direct_rows != :none
             # Identity layout OR strided-writable layout → write straight into
-            # the caller's C (already zeroed by wrapped_contract_aliased's
-            # `zeros(TC, dimsC...)`); no scratch, no permute_back.
+            # the caller's C (already zeroed by the dense-output wrapped_contract's
+            # `_ali_dense_ctgt`); no scratch, no permute_back.
             Ctgt = C
             canon_owns_buffer = false
         else

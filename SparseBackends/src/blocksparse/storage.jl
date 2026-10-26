@@ -410,16 +410,6 @@ end
 import Base: sort!
 
 
-function sort!(C::NewBlockSparseSorted)
-  # If you guarantee unique keys via _ensure_block!, you only need sorting:
-  perm = sortperm(C.keys)  # relies on lexicographic ordering of NTuples
-  C.keys = C.keys[perm]
-  C.ids  = C.ids[perm]
-  # C.data stays as-is because ids refer into C.data
-  return C
-end
-
-
 function is_dense(A::NewBlockSparseSorted{T,N,N2,P,K}) where {T,N,N2,P,K}
   if P === 0
     @assert length(A.keys) <= 1 "P=0 means no prefix, so at most one block (the whole tensor) is allowed"

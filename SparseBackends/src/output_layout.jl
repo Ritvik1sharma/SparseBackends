@@ -11,7 +11,7 @@
 # `layout = nothing` (the default everywhere) means the result's stock layout: the
 # key/dense split is inherited from the operands and the order is output_inds'
 # fixed grouping (one documented exception: aliased × dense with a dense output uses
-# its own stock order, see wrapped_contract_aliased).
+# its own stock order, see the dense-output wrapped_contract in tensor_wrappers_aliased.jl).
 #
 # A layout that cannot be honoured is an error (OutputLayoutError), never a silent
 # fallback.
