@@ -708,7 +708,7 @@ function contract_shared!(
         end
         # Build sorted (ckey, cid) pairs for C.keys / C.ids.
         sorted_pairs = collect(ck_to_cid)
-        sort!(sorted_pairs; by = first)
+        sort!(sorted_pairs; by = p -> _prefix_lin(p.first, ntuple(i -> C.dims[i], Val(PC))))
         resize!(C.keys, n_unique)
         resize!(C.ids,  n_unique)
         @inbounds for k in 1:n_unique
@@ -933,7 +933,7 @@ function contract_shared!(
           cid_for[ii] = cid
         end
         sorted_pairs = collect(ck_to_cid)
-        sort!(sorted_pairs; by = first)
+        sort!(sorted_pairs; by = p -> _prefix_lin(p.first, ntuple(i -> C.dims[i], Val(PC))))
         resize!(C.keys, n_unique)
         resize!(C.ids,  n_unique)
         @inbounds for k in 1:n_unique

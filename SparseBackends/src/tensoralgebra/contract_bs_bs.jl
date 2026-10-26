@@ -119,7 +119,8 @@ end
     Cmat::StridedMatrix{T}, α::T,
     x::StridedVector{T}, y::StridedVector{T}
 ) where {T<:BlasFloat}
-  BLAS.ger!(α, x, y, Cmat)
+  # x*transpose(y) for every T (ger! is the conjugating x*y' update for complex T, so use geru!)
+  T <: Complex ? BLAS.geru!(α, x, y, Cmat) : BLAS.ger!(α, x, y, Cmat)
   return nothing
 end
 
@@ -585,14 +586,14 @@ end
 function contract_shared!(
     C::NewBlockSparseSorted{TC,NC,N2C,PC},
     labelsC::AbstractVector,
-    A::NewBlockSparseSorted{TA,NA,N2A,PA},
+    A::NewBlockSparseSorted{TA,NA,N2A,PA,KA},
     labelsA::AbstractVector,
-    B::NewBlockSparseSorted{TB,NB,N2B,PB},
+    B::NewBlockSparseSorted{TB,NB,N2B,PB,KB},
     labelsB::AbstractVector,
     mapA::Dict,
     mapB::Dict,
     shared_labels::Vector,
-) where {TC,NC,N2C,PC,TA,NA,N2A,PA,TB,NB,N2B,PB}
+) where {TC,NC,N2C,PC,TA,NA,N2A,PA,KA<:Integer,TB,NB,N2B,PB,KB<:Integer}
 
   @timeit TIMER "kbb.contract_shared.label!" begin
   
@@ -658,10 +659,46 @@ function contract_shared!(
     # -----------------------------
     permA = _find_perm_for_A_join_and_dense_order(A, labelsA, mapA, shared_prefix, desired_keepA, red_dense)
     permB = _find_perm_for_B_join_and_dense_redfirst_order(B, labelsB, mapB, shared_prefix, red_dense, desired_keepB)
-    A = permutedims(A, permA)
-    B = permutedims(B, permB)
-    # permutedims!(A, permA)
-    # permutedims!(B, permB)
+
+    # A's dense tail is read as (red, keepA) and multiplied one slice at a time, with no dense
+    # permute, when its one reduced axis comes first and C's dense block is [B's, A's] with A's
+    # kept axes in A's order. B is read as stored, (red, keepB) or (keepB, red).
+    n_red = length(red_dense)
+    slice = n_red == 1 && mode == :BthenA && Adense0[1] == red_dense[1] && desired_keepA == keepA0 &&
+            (Bdense0 == vcat(red_dense, desired_keepB) || Bdense0 == vcat(desired_keepB, red_dense))
+    B_red_first = slice && Bdense0[1] == red_dense[1]
+    if slice
+      permA[(PA + 1):NA] .= (PA + 1):NA
+      permB[(PB + 1):NB] .= (PB + 1):NB
+    end
+
+    # `permutedims` copies every block, even for the identity: skip it then. A permutation of
+    # the key axes only (the join label moved last) re-keys the blocks and reads the same
+    # data through `ids`, so no data moves. The operands are only read.
+    if permA != 1:NA
+      if all(i -> permA[PA + i] == PA + i, 1:N2A)
+        perm_prefix = permA[1:PA]
+        keysA  = [_map_prefix_key(k, perm_prefix) for k in A.keys]
+        dimsAp = ntuple(j -> A.dims[permA[j]], Val(NA))
+        pdimsA = ntuple(i -> dimsAp[i], Val(PA))
+        pA     = sortperm(keysA; by = k -> _prefix_lin(k, pdimsA))
+        A = NewBlockSparseSorted{TA,NA,N2A,PA,KA}(dimsAp, A.blksize, keysA[pA], A.ids[pA], A.data)
+      else
+        A = permutedims(A, permA)
+      end
+    end
+    if permB != 1:NB
+      if all(i -> permB[PB + i] == PB + i, 1:N2B)
+        perm_prefix = permB[1:PB]
+        keysB  = [_map_prefix_key(k, perm_prefix) for k in B.keys]
+        dimsBp = ntuple(j -> B.dims[permB[j]], Val(NB))
+        pdimsB = ntuple(i -> dimsBp[i], Val(PB))
+        pB     = sortperm(keysB; by = k -> _prefix_lin(k, pdimsB))
+        B = NewBlockSparseSorted{TB,NB,N2B,PB,KB}(dimsBp, B.blksize, keysB[pB], B.ids[pB], B.data)
+      else
+        B = permutedims(B, permB)
+      end
+    end
 
     labelsA = labelsA[permA]
     labelsB = labelsB[permB]
@@ -698,15 +735,23 @@ function contract_shared!(
     # -----------------------------
     # 4) Dense contraction shapes
     # -----------------------------
-    dimsA_dense = A.dims[PA+1:NA]  # [keepA..., red...]
-    dimsB_dense = B.dims[PB+1:NB]  # [red..., keepB...]
+    dimsA_dense = A.dims[PA+1:NA]  # [keepA..., red...]; slice: [red, keepA...]
+    dimsB_dense = B.dims[PB+1:NB]  # [red..., keepB...]; slice: as stored
 
-    M = (n_keepA == 0) ? 1 : prod(dimsA_dense[1:n_keepA])
-    K = (n_red   == 0) ? 1 : prod(dimsA_dense[n_keepA+1:end])
-    N = (n_keepB == 0) ? 1 : prod(dimsB_dense[n_red+1:end])
+    if slice
+      # A is (pre = 1, K, M) and C is (1, N, M): C[:, :, q] += A[:, :, q] * B, one q at a time
+      K = dimsA_dense[1]
+      M = prod(dimsA_dense[2:end])
+      N = B_red_first ? prod(dimsB_dense[2:end]) : prod(dimsB_dense[1:(end - 1)])
+      @assert K == (B_red_first ? dimsB_dense[1] : dimsB_dense[end]) "Reduced dense extents mismatch between A and B"
+    else
+      M = (n_keepA == 0) ? 1 : prod(dimsA_dense[1:n_keepA])
+      K = (n_red   == 0) ? 1 : prod(dimsA_dense[n_keepA+1:end])
+      N = (n_keepB == 0) ? 1 : prod(dimsB_dense[n_red+1:end])
 
-    if n_red > 0
-      @assert K == prod(dimsB_dense[1:n_red]) "Reduced dense extents mismatch between A and B"
+      if n_red > 0
+        @assert K == prod(dimsB_dense[1:n_red]) "Reduced dense extents mismatch between A and B"
+      end
     end
     @assert C.blksize == M * N "C.blksize must equal M*N (got $(C.blksize), expected $(M*N))"
 
@@ -714,6 +759,8 @@ function contract_shared!(
     iA = firstindex(A.keys); nA = lastindex(A.keys)
     iB = firstindex(B.keys); nB = lastindex(B.keys)
 
+    # Pass 1: the (A block, B block) pairs of the merge join, in join order.
+    pairA = Int[]; pairB = Int[]
     @inbounds while iA <= nA && iB <= nB
       cmp = _cmp_join_tuple(A.keys[iA], B.keys[iB], join_posA, join_posB)
       if cmp < 0
@@ -727,36 +774,60 @@ function contract_shared!(
       iA2 = _advance_run(A.keys, iA, nA, join_posA)
       iB2 = _advance_run(B.keys, iB, nB, join_posB)
 
-      for ii in iA:(iA2-1)
-        akey = A.keys[ii]
-        Avec = _block_view(A, A.ids[ii])
-        Amat = reshape(Avec, M, K)
-
-        for jj in iB:(iB2-1)
-          bkey = B.keys[jj]
-          Bvec = _block_view(B, B.ids[jj])
-          Bmat = reshape(Bvec, K, N)
-          ckey = ntuple(Val(PC)) do j
-            s = src[j]
-            s > 0 ? akey[s] : bkey[-s]
-          end
-          cid  = _ensure_block!(C, ckey)
-          Cvec = _block_view(C, cid)
-          @timeit TIMER "kbb.contract_shared.gemm" begin
-            if mode == :AthenB
-              # Cdense == [keepA..., keepB...] with your desired within-group orders
-              Cmat = reshape(Cvec, M, N)
-              mul!(Cmat, Amat, Bmat, one(TC), one(TC))
-            else
-              # Cdense == [keepB..., keepA...]
-              Cmat = reshape(Cvec, N, M)
-              mul!(Cmat, transpose(Bmat), transpose(Amat), one(TC), one(TC))
-            end
-          end
-        end
+      for ii in iA:(iA2-1), jj in iB:(iB2-1)
+        push!(pairA, ii); push!(pairB, jj)
       end
       iA = iA2
       iB = iB2
+    end
+
+    # Pass 2: C's blocks are created in key order (so C.ids is 1:n in key order, whatever
+    # the join order); pairs with the same C key keep their join order, so the sums are
+    # accumulated in the same order.
+    np = length(pairA)
+    pdimsC = ntuple(i -> C.dims[i], Val(PC))
+    clin = Vector{Int}(undef, np)
+    @inbounds for t in 1:np
+      akey = A.keys[pairA[t]]; bkey = B.keys[pairB[t]]
+      ckey = ntuple(Val(PC)) do j
+        s = src[j]
+        s > 0 ? akey[s] : bkey[-s]
+      end
+      clin[t] = _prefix_lin(ckey, pdimsC)
+    end
+    @inbounds for t in sortperm(clin; alg = Base.Sort.MergeSort)
+      ii = pairA[t]; jj = pairB[t]
+      akey = A.keys[ii]; bkey = B.keys[jj]
+      Avec = _block_view(A, A.ids[ii])
+      Bvec = _block_view(B, B.ids[jj])
+      ckey = ntuple(Val(PC)) do j
+        s = src[j]
+        s > 0 ? akey[s] : bkey[-s]
+      end
+      cid  = _ensure_block!(C, ckey)
+      Cvec = _block_view(C, cid)
+      @timeit TIMER "kbb.contract_shared.gemm" begin
+        if slice
+          X  = reshape(Avec, 1, K, M)
+          Y  = reshape(Cvec, 1, N, M)
+          Bt = B_red_first ? reshape(Bvec, K, N) : transpose(reshape(Bvec, N, K))
+          for q in 1:M
+            mul!(view(Y, :, :, q), view(X, :, :, q), Bt, one(TC), one(TC))
+          end
+        else
+          Amat = reshape(Avec, M, K)
+          Bmat = reshape(Bvec, K, N)
+          if mode == :AthenB
+            # Cdense == [keepA..., keepB...] with your desired within-group orders
+            Cmat = reshape(Cvec, M, N)
+            mul!(Cmat, Amat, Bmat, one(TC), one(TC))
+          else
+            # Cdense == [keepB..., keepA...]
+            Cmat = reshape(Cvec, N, M)
+            mul!(Cmat, transpose(Bmat), transpose(Amat), one(TC), one(TC))
+          end
+        end
+      end
     end
   end
   return C

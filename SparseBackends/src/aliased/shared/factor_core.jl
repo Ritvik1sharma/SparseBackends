@@ -1,4 +1,4 @@
-# core_helpers/factor_core.jl — factor-core primitives for ψ = P·core (diagonal AND flip P).
+# aliased/shared/factor_core.jl — factor-core primitives for ψ = P·core (diagonal AND flip P).
 #
 # The aliased ψ stores each template as one pre-P core physical-slice `core[:, rv, :]`
 # (verified: contract_aliased_coo_dense makes template = α·B[:,rv]). These let a
@@ -24,8 +24,14 @@ _n2(w::WrappedAliasedBlockSparse{T,N,N2,P}) where {T,N,N2,P} = N2
 
 # core-slice → template id. Uses the cached hint if present, else derives it by
 # grouping keys on the physical axis (and asserts no scramble).
-function slice_to_template(w::WrappedAliasedBlockSparse; assume_diagonal_P::Bool = false)
-    a = w.aliased
+# The single-core features (slice_to_template, read_core, window_pairs / window_write_map,
+# write_core_window!, core_rebuild, core_split) are defined for SharedAliasedBlockSparse only:
+# each wrapper-level entry forwards to a method on the storage, which exists only for Shared,
+# so a SectorSplit site is a MethodError.
+slice_to_template(w::WrappedAliasedBlockSparse; assume_diagonal_P::Bool = false) =
+    slice_to_template(w.aliased, w; assume_diagonal_P)
+function slice_to_template(a::SharedAliasedBlockSparse, w::WrappedAliasedBlockSparse;
+                           assume_diagonal_P::Bool = false)
     isempty(a.keys) && return Int[]
     !isempty(a.slice_to_template) && return a.slice_to_template
     # NO SILENT FALLBACK. The derivation below reads the Site coordinate out of each
@@ -56,8 +62,8 @@ end
 
 # Recover the dense core tensor at this site: core[:, s, :] = template[s2t[s]].
 # Returned on (physical index, dense/core-link indices) — the aliased tensor's own.
-function read_core(w::WrappedAliasedBlockSparse)
-    a = w.aliased
+read_core(w::WrappedAliasedBlockSparse) = read_core(w.aliased, w)
+function read_core(a::SharedAliasedBlockSparse, w::WrappedAliasedBlockSparse)
     phys = _phys_prefix_pos(w)
     phys == 0 && error("factor-core: no Site axis")
     Pn = length(a.dims) - _n2(w)
@@ -85,9 +91,12 @@ end
 # from exactly these M_b, M_b1, including a copy. Errors if a φ key was built from two
 # different template pairs (a demoted accumulator: φ is not a clean window) or if one
 # template holds two pairs.
-function window_pairs(wphi::WrappedAliasedBlockSparse,
+window_pairs(wphi::WrappedAliasedBlockSparse, wb::WrappedAliasedBlockSparse,
+             wb1::WrappedAliasedBlockSparse) = window_pairs(wb.aliased, wb1.aliased, wphi, wb, wb1)
+function window_pairs(ab::SharedAliasedBlockSparse, ab1::SharedAliasedBlockSparse,
+                      wphi::WrappedAliasedBlockSparse,
                       wb::WrappedAliasedBlockSparse, wb1::WrappedAliasedBlockSparse)
-    aphi, ab, ab1 = wphi.aliased, wb.aliased, wb1.aliased
+    aphi = wphi.aliased
     Pphi, Pb, Pb1 = _abs_head_len(wphi), _abs_head_len(wb), _abs_head_len(wb1)
     pre_b, pre_b1, pre_phi = wb.inds[1:Pb], wb1.inds[1:Pb1], wphi.inds[1:Pphi]
     ch = [I for I in pre_b if I in pre_b1]
@@ -172,10 +181,11 @@ end
 # Used by the factor-core matvec to re-attach the ket-P to the evolving Krylov core each
 # step: `write_core_window!(φ, core, wmap); product(...)`. `core` lives on φ's Site +
 # dense (core-link) indices.
-function write_core_window!(w::WrappedAliasedBlockSparse, core::ITensors.ITensor,
-                            wmap::Tuple{<:AbstractDict,<:AbstractVector})
+write_core_window!(w::WrappedAliasedBlockSparse, core::ITensors.ITensor,
+                   wmap::Tuple{<:AbstractDict,<:AbstractVector}) = write_core_window!(w.aliased, w, core, wmap)
+function write_core_window!(a::SharedAliasedBlockSparse, w::WrappedAliasedBlockSparse,
+                            core::ITensors.ITensor, wmap::Tuple{<:AbstractDict,<:AbstractVector})
     tup2tid, sp = wmap
-    a = w.aliased
     Pn = length(a.dims) - _n2(w)
     dense_inds = w.inds[Pn+1:end]
     dense_dims = a.dims[Pn+1:end]
@@ -230,7 +240,7 @@ end
 # Split a dense 2-site core `cg` and write the factors into the structure of M_b, M_b1
 # with P fixed. ortho="left": L = U, R = S V (left-iso at b); "right": L = U S, R = V.
 # Truncates on the core bond. The factor-core two-site write-back (dense core in); the
-# direct aliased φ split is the separate itensor_aliased_factorize (aliased/factorize.jl).
+# direct aliased φ split is the separate itensor_aliased_factorize (aliased/shared/factorize.jl).
 function core_split(M_b::ITensors.ITensor, M_b1::ITensors.ITensor, cg::ITensors.ITensor;
                     ortho::String = "left", maxdim::Int = typemax(Int), mindim::Int = 1,
                     cutoff::Real = 0.0, tags = nothing)

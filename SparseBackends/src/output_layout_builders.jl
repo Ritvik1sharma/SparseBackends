@@ -26,6 +26,29 @@ function dense_from_aliased_operand(Aw::WrappedTensorTypes, Bw::WrappedTensorTyp
     return _layout_from_output_inds(indsC, denseC)
 end
 
+"""
+    _absorb_layout(inds, P, old, new) -> OutputLayout
+
+Layout of M * R for the per-storage `_absorb_bond` methods: M's own index order and
+key/dense split (`inds` = M's stored order, the first `P` in the key, the rest dense), with
+R's new bond index `new[i]` in the slot of `old[i]` (both in R's stored order).
+"""
+function _absorb_layout(inds::NTuple{N,ITensors.Index}, P::Int, old, new) where {N}
+    sparse = Vector{LayoutEntry}(undef, P)
+    dense  = Vector{LayoutEntry}(undef, N - P)
+    for j in 1:N
+        I = inds[j]
+        for i in eachindex(old)
+            if old[i] == I
+                I = new[i]
+                break
+            end
+        end
+        j <= P ? (sparse[j] = I) : (dense[j - P] = I)
+    end
+    return OutputLayout(sparse, dense)
+end
+
 # ── roles (see the vocabulary in output_layout.jl) ───────────────────────────
 
 function _role_num(I, key::String)

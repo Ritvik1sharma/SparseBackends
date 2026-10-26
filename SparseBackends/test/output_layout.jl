@@ -3,7 +3,7 @@
 # or unsupported layouts are rejected with OutputLayoutError. Aliased operands are produced by a (:coo, :dense) -> :aliased
 # multiplication, as in the real code.
 using Test, Random, ITensors, SparseBackends
-import SparseBackends: wrapped_contract_aliased, wrap_itensor, dense_inds, layout_inds
+import SparseBackends: wrap_itensor, dense_inds, layout_inds
 
 # dense ITensor of a wrapped result (aliased or already dense), in its own index order
 _as_dense(C::ITensor) = C
@@ -34,7 +34,7 @@ _same(X::ITensor, Y::ITensor; atol=1e-12) =
     ref = Adense * B
 
     @testset "default layout matches the reference" begin
-        C0 = wrapped_contract_aliased(Aw, Bw; preserve_bs_output=true)
+        C0 = SparseBackends.contract(Aw, Bw; preserve_bs_output=true)
         @test _same(_as_dense(C0), ref)
     end
 
@@ -42,7 +42,7 @@ _same(X::ITensor, Y::ITensor; atol=1e-12) =
         L    = dense_from_aliased_operand(Aw, Bw)
         # dense block = A's dense indices; the dense operand's free index x moves to the key
         @test L.sparse == [s, x] && L.dense == [t, h]
-        Cnew = wrapped_contract_aliased(Aw, Bw; preserve_bs_output=true, layout=L)
+        Cnew = SparseBackends.contract(Aw, Bw; preserve_bs_output=true, layout=L)
         @test collect(Cnew.inds) == layout_inds(L)
         @test _same(_as_dense(Cnew), ref)
     end
@@ -55,29 +55,29 @@ _same(X::ITensor, Y::ITensor; atol=1e-12) =
         b_part = [I for I in L0.dense if !(I in Set(Aw.inds))]
         L = OutputLayout(sparse=L0.sparse, dense=vcat(b_part, a_part))
         @test L.dense != L0.dense
-        C = wrapped_contract_aliased(Aw, Bw; preserve_bs_output=true, layout=L)
+        C = SparseBackends.contract(Aw, Bw; preserve_bs_output=true, layout=L)
         @test collect(C.inds) == layout_inds(L)
         @test _same(_as_dense(C), ref)
     end
 
     @testset "dense output in a requested order" begin
-        D0 = wrapped_contract_aliased(Aw, Bw)                 # stock dense order
+        D0 = SparseBackends.contract(Aw, Bw)                 # stock dense order
         order = reverse(collect(inds(D0)))
-        D = wrapped_contract_aliased(Aw, Bw; layout=OutputLayout(sparse=Index[], dense=order))
+        D = SparseBackends.contract(Aw, Bw; layout=OutputLayout(sparse=Index[], dense=order))
         @test collect(inds(D)) == order
         @test _same(D, ref)
     end
 
     @testset "invalid layouts are rejected" begin
         L = dense_from_aliased_operand(Aw, Bw)
-        @test_throws OutputLayoutError wrapped_contract_aliased(Aw, Bw; preserve_bs_output=true,
+        @test_throws OutputLayoutError SparseBackends.contract(Aw, Bw; preserve_bs_output=true,
             layout=OutputLayout(sparse=L.sparse[2:end], dense=L.dense))                 # missing index
-        @test_throws OutputLayoutError wrapped_contract_aliased(Aw, Bw; preserve_bs_output=true,
+        @test_throws OutputLayoutError SparseBackends.contract(Aw, Bw; preserve_bs_output=true,
             layout=OutputLayout(sparse=vcat(L.sparse, L.sparse[1:1]), dense=L.dense))   # duplicate
-        @test_throws OutputLayoutError wrapped_contract_aliased(Aw, Bw; preserve_bs_output=true,
+        @test_throws OutputLayoutError SparseBackends.contract(Aw, Bw; preserve_bs_output=true,
             layout=OutputLayout(sparse=vcat(L.sparse, [Index(2, "stray")]), dense=L.dense)) # extra
-        @test_throws OutputLayoutError wrapped_contract_aliased(Aw, Bw; layout=L)       # dense output with a key
-        @test_throws MethodError wrapped_contract_aliased(Aw, Bw; preserve_bs_output=true,
+        @test_throws OutputLayoutError SparseBackends.contract(Aw, Bw; layout=L)       # dense output with a key
+        @test_throws MethodError SparseBackends.contract(Aw, Bw; preserve_bs_output=true,
             output_inds_hint=Set{Index}(dense_inds(Aw)))                                   # removed keyword
         @test_throws OutputLayoutError dense_from_aliased_operand(wrap_itensor(Adense; backend=:dense), Bw)
     end
@@ -106,7 +106,7 @@ _same(X::ITensor, Y::ITensor; atol=1e-12) =
         @test L.sparse == [pl, pr, z'] && L.dense == [cl, cr, gr, gl]
         # roles name the operands as passed (gate first, as in contract(MPO, MPS)); the
         # aliased operand is put first internally, which needs no change to the layout
-        C = wrapped_contract_aliased(Gw, Psw; preserve_bs_output=true, layout=Lr)
+        C = SparseBackends.contract(Gw, Psw; preserve_bs_output=true, layout=Lr)
         @test collect(C.inds) == [pl, pr, z', cl, cr, gr, gl]
         @test _same(_as_dense(C), refT)
         # (op, kind) is (op, kind, 1); Index entries pass through
@@ -123,12 +123,12 @@ _same(X::ITensor, Y::ITensor; atol=1e-12) =
         rm = SparseBackends._role_map([y, y1])
         @test rm[(:r, 1)] == y1 && !haskey(rm, (:l, 1))
         # the same roles with ψ passed first: now ψ is :A
-        C2 = wrapped_contract_aliased(Psw, Gw; preserve_bs_output=true,
+        C2 = SparseBackends.contract(Psw, Gw; preserve_bs_output=true,
                  layout=OutputLayout(sparse=[(:A,:l,1), (:A,:r,1), (:B,:sp)],
                                      dense =[(:A,:l,2), (:A,:r,2), (:B,:r), (:B,:l)]))
         @test C2.inds == C.inds && SparseBackends.to_dense(C2.aliased) == SparseBackends.to_dense(C.aliased)
         # dense output in a role order
-        D = wrapped_contract_aliased(Gw, Psw; layout=OutputLayout(sparse=ITensors.Index[],
+        D = SparseBackends.contract(Gw, Psw; layout=OutputLayout(sparse=ITensors.Index[],
                 dense=[(:A,:sp), (:A,:l), (:A,:r), (:B,:l,1), (:B,:l,2), (:B,:r,1), (:B,:r,2)]))
         @test collect(inds(D)) == [z', gl, gr, pl, cl, pr, cr]
         @test _same(D, refT)
@@ -136,7 +136,7 @@ _same(X::ITensor, Y::ITensor; atol=1e-12) =
         @test_throws OutputLayoutError R(OutputLayout(sparse=[(:C,:s)], dense=ITensors.Index[]))
         @test_throws OutputLayoutError R(OutputLayout(sparse=[(:A,:x)], dense=ITensors.Index[]))
         @test_throws OutputLayoutError R(OutputLayout(sparse=[(:A,:s,0)], dense=ITensors.Index[]))
-        @test_throws OutputLayoutError wrapped_contract_aliased(Gw, Psw; preserve_bs_output=true,
+        @test_throws OutputLayoutError SparseBackends.contract(Gw, Psw; preserve_bs_output=true,
             layout=OutputLayout(sparse=[(:B,:l,1), (:B,:r,1)], dense=[(:B,:l,2), (:B,:r,2)]))
         # show_roles lists every index with its role and key/dense
         io = IOBuffer(); show_roles(io, Ps; as=:B); out = String(take!(io))
@@ -144,7 +144,7 @@ _same(X::ITensor, Y::ITensor; atol=1e-12) =
 
         # requests a kernel cannot honour are OutputLayoutErrors, never a silent mislabel
         # aliased × dense: reordering inside the gate's dense group (gate stored r, l)
-        @test_throws OutputLayoutError wrapped_contract_aliased(Gw, Psw; preserve_bs_output=true,
+        @test_throws OutputLayoutError SparseBackends.contract(Gw, Psw; preserve_bs_output=true,
             layout=OutputLayout(sparse=[(:B,:l,1), (:B,:r,1), (:A,:sp)],
                                 dense =[(:B,:l,2), (:B,:r,2), (:A,:l), (:A,:r)]))
         # COO × aliased, contracted index in B's key: any dense order, dense indices of B

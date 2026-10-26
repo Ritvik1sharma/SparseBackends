@@ -1,11 +1,13 @@
-# aliased/factorize.jl
+# aliased/shared/factorize.jl
 #
-# Aliased factorizations. P (keys, alias_ids, scalars, channel axes) stays fixed;
-# only templates and the multiplicity (core-link) axis change.
+# Factorizations of SharedAliasedBlockSparse sites. P (keys, alias_ids, scalars, channel axes)
+# stays fixed; only templates and the multiplicity (core-link) axis change.
 #   itensor_aliased_factorize        two-site, direct: split an aliased φ in template space
-#   _external_factorize_storage      single-site: the `factorize` hook (orthogonalize!, TEBD)
+#   _aliased_factorize (Shared)      single-site: this storage's method of the `factorize` hook
+#                                    (ITensors._external_factorize_storage, tensor_wrappers_aliased.jl;
+#                                    orthogonalize!, truncate!, TEBD)
 # The factor-core two-site split (dense core in, core_split) is a separate method in
-# core_helpers/factor_core.jl; replacebond! picks between the two by the input's type.
+# aliased/shared/factor_core.jl; replacebond! picks between the two by the input's type.
 
 import ITensors
 using LinearAlgebra: svd, Diagonal, norm
@@ -153,11 +155,11 @@ function _build_aliased_frozen_schema(
     @assert length(templates_new) == am.n_templates * new_blksize "templates length mismatch ($(length(templates_new)) vs $(am.n_templates) * $(new_blksize))"
 
     Kt = eltype(eltype(am.keys))
-    ali_new = AliasedBlockSparse{T, N, N2, P, Kt}(
+    ali_new = _same_kind(am, AliasedBlockSparse{T, N, N2, P, Kt}(
         new_dims, new_blksize,
         templates_new, am.n_templates,
         copy(am.keys), copy(am.alias_ids), T.(am.scalars),
-    )
+    ))
     # FROZEN schema, as the name says: keys, alias_ids and n_templates all come
     # across verbatim and only the dense tail (the multiplicity bond) is rebuilt.
     # Template ids therefore still denote the same slots, so the rv -> tid routing
@@ -180,8 +182,9 @@ function _build_aliased_frozen_schema(
     return ITensors._itensor_from_external_storage(w)
 end
 
-# Single-site factorize of an aliased tensor (the `factorize` hook, used by
-# orthogonalize! and so by TEBD). Only the multiplicity axis is refactorized.
+# Single-site factorize of a SharedAliasedBlockSparse site (this storage's method of the
+# `factorize` hook, used by orthogonalize!, truncate! and so by TEBD). Only the multiplicity
+# axis is refactorized.
 #
 # Every block is scalars[i] * templates[alias_ids[i]], so one matrix acting on the
 # multiplicity axis the same way for every channel is the only change the frozen
@@ -194,17 +197,8 @@ end
 # k ≥ rank(W): a direction with W v = 0 has T_a v = 0 for every referenced template.
 # L keeps A's keys, alias_ids, scalars, n_templates, slice_to_template and the
 # bond's channel index; only the multiplicity index is replaced.
-function ITensors._external_factorize_storage(
-    Aw :: WrappedAliasedBlockSparse,
-    A  :: ITensors.ITensor,
-    Linds...;
-    mindim = nothing, maxdim = nothing, cutoff = nothing, ortho = nothing,
-    eigen_perturbation = nothing, kwargs...,
-)
-    something(ortho, "left") == "left" ||
-        error("aliased factorize: only ortho=\"left\" is supported (got $ortho)")
-    eigen_perturbation === nothing ||
-        error("aliased factorize: eigen_perturbation is not supported")
+function _aliased_factorize(::SharedAliasedBlockSparse, Aw::WrappedAliasedBlockSparse,
+                            A::ITensors.ITensor, Linds...; mindim, maxdim, cutoff)
     maxdim = something(maxdim, typemax(Int))
     mindim = something(mindim, 1)
     cutoff = Float64(something(cutoff, 0.0))
@@ -278,10 +272,4 @@ function ITensors._external_factorize_storage(
                    sum(s -> s * s, sv[k_new + 1:end]) / _sv_tot
     spec = ITensors.Spectrum(abs2.(sv[1:k_new]), truncerr_val)
     return L, R, spec, new_mult
-end
-
-# TODO: add a single-site block-sparse factorize once the aliased one is validated.
-function ITensors._external_factorize_storage(Aw::WrappedBlockSparse, A::ITensors.ITensor,
-                                              Linds...; kwargs...)
-    error("factorize: block-sparse (non-aliased) storage is not supported yet")
 end

@@ -81,12 +81,12 @@ end
 println("\n--- Step 2: H * psi at bond b=1 (eigenvector test vector) ---")
 b = 1
 phi_d   = psi_d[b]   * psi_d[b+1]
-# Aliased phi: route through wrapped_contract_aliased with preserve_bs_output=true
+# Aliased phi: route through SparseBackends.contract with preserve_bs_output=true
 # (same as dmrg.jl does for the eigsolve test vector).
 let
     Aw = ITensors.get_external_storage(psi_ali[b])
     Bw = ITensors.get_external_storage(psi_ali[b+1])
-    Cw = SparseBackends.wrapped_contract_aliased(Aw, Bw; preserve_bs_output=true)
+    Cw = SparseBackends.contract(Aw, Bw; preserve_bs_output=true)
     global phi_ali = Cw isa ITensor ? Cw : ITensors._itensor_from_external_storage(Cw)
 end
 @printf("phi_ali storage = %s\n", ITensors.has_external_storage(phi_ali) ? typeof(phi_ali.tensor.data) : "dense")

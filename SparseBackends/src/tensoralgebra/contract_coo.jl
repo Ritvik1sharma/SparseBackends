@@ -81,11 +81,19 @@ function ensure_rlab_last_and_sorted(
   return A2, labels2, map2
 end
 
-@inline function _push_term!(C::COOTensor{T,N}, c::NTuple{N,Int}, v) where {T,N}
+# `slot` maps an output coordinate to its position in C.keys/C.vals: a repeated coordinate
+# adds into the first entry (COO `to_dense` overwrites duplicate keys instead of summing).
+@inline function _push_term!(C::COOTensor{T,N}, slot::Dict{NTuple{N,Int},Int}, c::NTuple{N,Int}, v) where {T,N}
   vv = convert(T, v)
   vv == zero(T) && return nothing
-  push!(C.keys, c)
-  push!(C.vals, vv)
+  s = get(slot, c, 0)
+  if s == 0
+    push!(C.keys, c)
+    push!(C.vals, vv)
+    slot[c] = length(C.keys)
+  else
+    C.vals[s] += vv
+  end
   C.dirty = true
   return nothing
 end
@@ -134,6 +142,7 @@ function contract!(
   # Heuristic reserve (tune if needed)
   sizehint!(C.keys, length(A.keys))
   sizehint!(C.vals, length(A.keys))
+  slot = Dict{NTuple{NC,Int},Int}()
   i, j = 1, 1
   nA, nB = length(A.keys), length(B.keys)
   @inbounds while i <= nA && j <= nB
@@ -159,11 +168,17 @@ function contract!(
           bcoord = B.keys[jj]
           bval   = B.vals[jj]
           ccoord = ntuple(t -> (src[t] == 0x01 ? acoord[pos[t]] : bcoord[pos[t]]), Val(NC))
-          _push_term!(C, ccoord, aval * bval)
+          _push_term!(C, slot, ccoord, aval * bval)
         end
         i += 1
       end
     end
+  end
+  # summed duplicates can cancel to exactly zero: drop those entries, order kept
+  if any(v -> v == zero(TC), C.vals)
+    keep = findall(v -> v != zero(TC), C.vals)
+    C.keys = C.keys[keep]
+    C.vals = C.vals[keep]
   end
   # println("Contracted COO: ", C.keys, " and inputs ", A.keys, " and ", B.keys, "  ", C.dirty)
   return C

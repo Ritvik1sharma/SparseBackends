@@ -47,7 +47,19 @@ end
 # ─────────────────────────────────────────────────────────────────────────────
 
 """
-    AliasedBlockSparse{T,N,N2,P}
+    AliasedBlockSparse{T,N,N2,P,K,AI}
+
+Abstract parent of the two aliased storage types. Both hold the same fields and differ
+only in how a bond is factorized:
+- `SharedAliasedBlockSparse`: ψ = P·core, one multiplicity basis shared by all of a
+  bond's channels (aliased/shared/: factorize, _absorb_bond). The single-core features
+  (read_core, slice_to_template, window map, core_split; aliased/shared/factor_core.jl) are
+  defined for it only.
+- `SectorSplitAliasedBlockSparse`: the same fields; one multiplicity basis per channel value
+  of the bond (one SVD per channel value; aliased/sector_split/: factorize, _absorb_bond).
+  Meant for a P with orthogonal channels; nothing
+  checks that, the type is the user's choice (`Cbackend = :aliased_sector_split`).
+`AliasedBlockSparse{...}(...)` constructs a `SharedAliasedBlockSparse`.
 
 A block-sparse tensor where each logical block is a scalar multiple of a stored
 template block, eliminating redundancy when many blocks share the same
@@ -80,7 +92,9 @@ Storage layout
 const _EMPTY_SLICE_MAP = Int[]
 const _EMPTY_WINDOW_MAP = Dict{NTuple{2,Int},Int}()
 
-mutable struct AliasedBlockSparse{T,N,N2,P,K<:Integer,AI<:Integer} <: SparseTensor{T,N}
+abstract type AliasedBlockSparse{T,N,N2,P,K<:Integer,AI<:Integer} <: SparseTensor{T,N} end
+
+mutable struct SharedAliasedBlockSparse{T,N,N2,P,K<:Integer,AI<:Integer} <: AliasedBlockSparse{T,N,N2,P,K,AI}
     dims        :: NTuple{N,Int}
     blksize     :: Int                       # prod(dims[P+1 : N])
     templates   :: Vector{T}                 # length = n_templates * blksize
@@ -105,12 +119,67 @@ mutable struct AliasedBlockSparse{T,N,N2,P,K<:Integer,AI<:Integer} <: SparseTens
     window_slice_map :: Dict{NTuple{2,Int},Int}
     # 7-arg inner constructor keeps every existing call site working (defaults both hints
     # empty); struct is mutable so the COO×dense / window kernels set them after construction.
-    function AliasedBlockSparse{T,N,N2,P,K,AI}(dims, blksize, templates, n_templates,
-                                               keys, alias_ids, scalars) where {T,N,N2,P,K,AI}
+    function SharedAliasedBlockSparse{T,N,N2,P,K,AI}(dims, blksize, templates, n_templates,
+                                                     keys, alias_ids, scalars) where {T,N,N2,P,K,AI}
         return new{T,N,N2,P,K,AI}(dims, blksize, templates, n_templates,
                                   keys, alias_ids, scalars, _EMPTY_SLICE_MAP, _EMPTY_WINDOW_MAP)
     end
 end
+
+"""
+    SectorSplitAliasedBlockSparse{T,N,N2,P,K,AI}
+
+The same fields as `SharedAliasedBlockSparse` (no extra field); a distinct type because a bond
+is factorized differently: one SVD per channel value of the bond's key index, so each channel
+keeps its own multiplicity basis (aliased/sector_split/factorize.jl). The hint fields are carried like any
+field but no single-core feature reads them for this type.
+"""
+mutable struct SectorSplitAliasedBlockSparse{T,N,N2,P,K<:Integer,AI<:Integer} <: AliasedBlockSparse{T,N,N2,P,K,AI}
+    dims        :: NTuple{N,Int}
+    blksize     :: Int
+    templates   :: Vector{T}
+    n_templates :: Int
+    keys        :: Vector{NTuple{P,K}}
+    alias_ids   :: Vector{AI}
+    scalars     :: Vector{T}
+    slice_to_template :: Vector{Int}
+    window_slice_map  :: Dict{NTuple{2,Int},Int}
+    function SectorSplitAliasedBlockSparse{T,N,N2,P,K,AI}(dims, blksize, templates, n_templates,
+                                                          keys, alias_ids, scalars) where {T,N,N2,P,K,AI}
+        return new{T,N,N2,P,K,AI}(dims, blksize, templates, n_templates, keys, alias_ids, scalars,
+                                  _EMPTY_SLICE_MAP, _EMPTY_WINDOW_MAP)
+    end
+end
+
+# The parent's constructors build a SharedAliasedBlockSparse, so every existing
+# `AliasedBlockSparse{...}(...)` call site behaves as before.
+AliasedBlockSparse{T,N,N2,P,K,AI}(dims, blksize, templates, n_templates,
+                                  keys, alias_ids, scalars) where {T,N,N2,P,K,AI} =
+    SharedAliasedBlockSparse{T,N,N2,P,K,AI}(dims, blksize, templates, n_templates,
+                                            keys, alias_ids, scalars)
+
+# A SectorSplit tensor with `a`'s fields (the same vectors, not copies; the hints too).
+function _as_sector_split(a::SharedAliasedBlockSparse{T,N,N2,P,K,AI}) where {T,N,N2,P,K,AI}
+    s = SectorSplitAliasedBlockSparse{T,N,N2,P,K,AI}(a.dims, a.blksize, a.templates, a.n_templates,
+                                                     a.keys, a.alias_ids, a.scalars)
+    s.slice_to_template = a.slice_to_template
+    s.window_slice_map  = a.window_slice_map
+    return s
+end
+_as_sector_split(a::SectorSplitAliasedBlockSparse) = a
+
+# `ali` (freshly built from `src`) as the child type of `src`: unchanged for Shared. Every
+# helper that rebuilds a tensor from another (copy, permute, rekey, fuse, frozen-schema factor,
+# the gate kernel) goes through this.
+@inline _same_kind(::SharedAliasedBlockSparse, ali::SharedAliasedBlockSparse) = ali
+_same_kind(::SectorSplitAliasedBlockSparse, ali::SharedAliasedBlockSparse) = _as_sector_split(ali)
+
+# Storage class of the aliased product of operands A and B (storages): SectorSplit when an
+# operand is SectorSplit (e.g. a SectorSplit site times its neighbour's R), else Shared. The
+# contraction entry allocates the output as this class and the kernels fill it.
+@inline _product_kind(A, B) =
+    (A isa SectorSplitAliasedBlockSparse || B isa SectorSplitAliasedBlockSparse) ?
+        SectorSplitAliasedBlockSparse : SharedAliasedBlockSparse
 
 # Outer constructor inferring the alias-id type AI from the passed vector. Keeps
 # every existing `AliasedBlockSparse{T,N,N2,P,K}(...)` call site working and
@@ -132,7 +201,7 @@ AliasedBlockSparse{T,N,N2,P}(dims, blksize, templates, n_templates,
 
 _dims(x::AliasedBlockSparse) = x.dims
 
-Base.eltype(::Type{AliasedBlockSparse{T,N,N2,P,K,AI}}) where {T,N,N2,P,K,AI} = T
+Base.eltype(::Type{<:AliasedBlockSparse{T}}) where {T} = T
 Base.eltype(A::AliasedBlockSparse) = eltype(typeof(A))
 Base.size(A::AliasedBlockSparse{T,N,N2,P,K}) where {T,N,N2,P,K} = A.dims
 Base.axes(A::AliasedBlockSparse{T,N,N2,P,K}) where {T,N,N2,P,K} =
@@ -182,25 +251,32 @@ end
 # Constructor
 # ─────────────────────────────────────────────────────────────────────────────
 
+# SharedAliasedBlockSparse{T,N,N2}(dims), SectorSplitAliasedBlockSparse{T,N,N2}(dims): an empty
+# tensor of that class with the given shape and no blocks. The contraction entry allocates its
+# aliased output this way (the requested class) and the kernels fill it in place.
+for K in (:SharedAliasedBlockSparse, :SectorSplitAliasedBlockSparse)
+    @eval function $K{T,N,N2}(dims::NTuple{N,Int}) where {T,N,N2}
+        P = N - N2
+        # N2=0 is allowed: every axis lives in the sparse prefix and each block
+        # is a single scalar (blksize=1). Needed for aliased outputs where the
+        # contraction reduces away every dense-tail axis.
+        @assert 0 <= N2 <= N
+        @assert all(dims .>= 1)
+        blksize = N2 == 0 ? 1 : prod(ntuple(i -> dims[P+i], Val(N2)))
+        return $K{T,N,N2,P,Int,DEFAULT_ALIAS_ID_TYPE}(
+            dims, blksize,
+            Vector{T}(), 0,
+            Vector{NTuple{P,Int}}(), DEFAULT_ALIAS_ID_TYPE[], Vector{T}(),
+        )
+    end
+end
 """
     AliasedBlockSparse{T,N,N2}(dims)
 
-Allocate an empty AliasedBlockSparse tensor with the given shape and no blocks.
+Allocate an empty AliasedBlockSparse tensor (a SharedAliasedBlockSparse) with the given
+shape and no blocks.
 """
-function AliasedBlockSparse{T,N,N2}(dims::NTuple{N,Int}) where {T,N,N2}
-    P = N - N2
-    # N2=0 is allowed: every axis lives in the sparse prefix and each block
-    # is a single scalar (blksize=1). Needed for aliased outputs where the
-    # contraction reduces away every dense-tail axis.
-    @assert 0 <= N2 <= N
-    @assert all(dims .>= 1)
-    blksize = N2 == 0 ? 1 : prod(ntuple(i -> dims[P+i], Val(N2)))
-    return AliasedBlockSparse{T,N,N2,P,Int,DEFAULT_ALIAS_ID_TYPE}(
-        dims, blksize,
-        Vector{T}(), 0,
-        Vector{NTuple{P,Int}}(), DEFAULT_ALIAS_ID_TYPE[], Vector{T}(),
-    )
-end
+AliasedBlockSparse{T,N,N2}(dims::NTuple{N,Int}) where {T,N,N2} = SharedAliasedBlockSparse{T,N,N2}(dims)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Element access
@@ -240,8 +316,20 @@ compression_ratio(A::AliasedBlockSparse) =
 # Key efficiency advantage: permuting the dense tail only touches n_templates
 # blocks (not n_blocks), which is much cheaper when templates are shared.
 
+# permutedims(A, perm) returns a tensor with its own vectors (templates copied even when only
+# key axes move).
 function Base.permutedims(A::AliasedBlockSparse{T,N,N2,P,K},
                           perm::AbstractVector{Int}) where {T,N,N2,P,K}
+    B = _permutedims_sharing(A, perm)
+    B.templates === A.templates && (B.templates = copy(A.templates))
+    return B
+end
+
+# The same permutation, but when the dense block is not permuted the result's `templates` IS
+# A's vector (keys, alias_ids and scalars are always new). For a read-only temporary (a kernel's
+# permuted operand): the result must not be mutated in place.
+function _permutedims_sharing(A::AliasedBlockSparse{T,N,N2,P,K},
+                              perm::AbstractVector{Int}) where {T,N,N2,P,K}
     _check_no_cross_perm(perm, N, P, N2)
     dimsB = ntuple(j -> A.dims[perm[j]], Val(N))
 
@@ -256,7 +344,7 @@ function Base.permutedims(A::AliasedBlockSparse{T,N,N2,P,K},
     # ── Step 1: permute the dense tail of each TEMPLATE (only n_templates ops) ──
     is_identity_block = all(perm_block[i] == i for i in 1:N2)
     new_templates = if is_identity_block
-        copy(A.templates)
+        A.templates
     else
         # Build mapping  new_lin -> old_lin  for the dense tail (computed once)
         invp = invperm(collect(perm_block))
@@ -300,10 +388,10 @@ function Base.permutedims(A::AliasedBlockSparse{T,N,N2,P,K},
     prefix_dimsB = ntuple(i -> dimsB[i], Val(P))
     p = sortperm(newkeys; by = k -> _prefix_lin(k, prefix_dimsB))
 
-    return AliasedBlockSparse{T,N,N2,P,K}(
+    return _same_kind(A, AliasedBlockSparse{T,N,N2,P,K}(
         dimsB, blksizeB, new_templates, A.n_templates,
         newkeys[p], A.alias_ids[p], A.scalars[p],
-    )
+    ))
 end
 
 Base.permutedims(A::AliasedBlockSparse{T,N,N2,P,K}, perm::NTuple{N,Int}) where {T,N,N2,P,K} =

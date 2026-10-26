@@ -87,10 +87,10 @@ function rekey(A::AliasedBlockSparse{T,N,N2,P,K}, ::Type{K2}; check::Bool=true) 
         end
     end
     new_keys = [ntuple(j -> K2(key[j]), Val(P)) for key in A.keys]
-    return AliasedBlockSparse{T,N,N2,P,K2}(
+    return _same_kind(A, AliasedBlockSparse{T,N,N2,P,K2}(
         A.dims, A.blksize, copy(A.templates), A.n_templates,
         new_keys, copy(A.alias_ids), copy(A.scalars),
-    )
+    ))
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -132,10 +132,10 @@ function fuse_sparse_axes(
         end, Val(P - 1))
     end
     # Templates, alias_ids, scalars, blksize all untouched.
-    return AliasedBlockSparse{T,N-1,N2,P-1,K}(
+    return _same_kind(A, AliasedBlockSparse{T,N-1,N2,P-1,K}(
         newdims, A.blksize, copy(A.templates), A.n_templates,
         newkeys, copy(A.alias_ids), copy(A.scalars),
-    )
+    ))
 end
 
 function fuse_dense_axes!(
@@ -171,10 +171,10 @@ function fuse_dense_axes!(
     # blksize and templates layout collapse: the two adjacent tail dims merge,
     # so the flat template buffer is unchanged in memory (column-major), only
     # the logical shape changes.
-    return AliasedBlockSparse{T,N-1,N2-1,P,K}(
+    return _same_kind(A, AliasedBlockSparse{T,N-1,N2-1,P,K}(
         newdims, A.blksize, copy(A.templates), A.n_templates,
         copy(A.keys), copy(A.alias_ids), copy(A.scalars),
-    )
+    ))
 end
 
 function fuse_two_axes!(
