@@ -17,7 +17,8 @@ isdefined(@__MODULE__, :multiply_mpos) ||
 storage_kind(T::ITensor) =
     !ITensors.has_external_storage(T) ? :dense :
     ITensors.get_external_storage(T) isa SparseBackends.WrappedAliasedBlockSparse ? :aliased :
-    ITensors.get_external_storage(T) isa SparseBackends.WrappedBlockSparse ? :blocksparse : :other
+    ITensors.get_external_storage(T) isa SparseBackends.WrappedBlockSparse ? :blocksparse :
+    ITensors.get_external_storage(T) isa SparseBackends.WrappedCOOTensor ? :coo : :other
 
 storage_kinds(psi) = [storage_kind(psi[i]) for i in 1:length(psi)]
 
@@ -238,8 +239,9 @@ function apply_layer_sparse(psi::MPS, M::Union{MPO,NamedTuple{(:gate, :gauges)}}
     # Output of each site product gate[i] (A) * ψ[i] (B), for an aliased ψ = P·core:
     # key = P's links + the gate's output site s' (moved into the key); dense = core's
     # links + the gate links. Other storage kinds use the stock layout.
-    phi = replaceprime(contract(M, psi, :dense, bk; Cbackend = bk,
-                                layout = bk === :aliased ? layout : nothing), 1 => 0)
+    # the gate's backend is its own storage: an MPO's sites, or a constrained layer's COO gate
+    phi = replaceprime(contract(M, psi, storage_kind((M isa MPO ? M : M.gate)[1]), bk; Cbackend = bk,
+                                layout = (bk === :aliased || !(M isa MPO)) ? layout : nothing), 1 => 0)
     # MERGE FIRST. The output-stationary kernel emits one template per output block
     # (dedup 1.00x by construction), and the single-site aliased factorize inherits its schema
     # from the INPUT tensors -- so merging here hands the sweep the small schema, whereas

@@ -254,8 +254,10 @@ end
 # SharedAliasedBlockSparse{T,N,N2}(dims), SectorSplitAliasedBlockSparse{T,N,N2}(dims): an empty
 # tensor of that class with the given shape and no blocks. The contraction entry allocates its
 # aliased output this way (the requested class) and the kernels fill it in place.
+# `alias_id_type` is the element type of its alias-id vector (template indices).
 for K in (:SharedAliasedBlockSparse, :SectorSplitAliasedBlockSparse)
-    @eval function $K{T,N,N2}(dims::NTuple{N,Int}) where {T,N,N2}
+    @eval function $K{T,N,N2}(dims::NTuple{N,Int};
+                              alias_id_type::Type{<:Integer} = DEFAULT_ALIAS_ID_TYPE) where {T,N,N2}
         P = N - N2
         # N2=0 is allowed: every axis lives in the sparse prefix and each block
         # is a single scalar (blksize=1). Needed for aliased outputs where the
@@ -263,10 +265,10 @@ for K in (:SharedAliasedBlockSparse, :SectorSplitAliasedBlockSparse)
         @assert 0 <= N2 <= N
         @assert all(dims .>= 1)
         blksize = N2 == 0 ? 1 : prod(ntuple(i -> dims[P+i], Val(N2)))
-        return $K{T,N,N2,P,Int,DEFAULT_ALIAS_ID_TYPE}(
+        return $K{T,N,N2,P,Int,alias_id_type}(
             dims, blksize,
             Vector{T}(), 0,
-            Vector{NTuple{P,Int}}(), DEFAULT_ALIAS_ID_TYPE[], Vector{T}(),
+            Vector{NTuple{P,Int}}(), alias_id_type[], Vector{T}(),
         )
     end
 end
@@ -277,6 +279,40 @@ Allocate an empty AliasedBlockSparse tensor (a SharedAliasedBlockSparse) with th
 shape and no blocks.
 """
 AliasedBlockSparse{T,N,N2}(dims::NTuple{N,Int}) where {T,N,N2} = SharedAliasedBlockSparse{T,N,N2}(dims)
+
+"""
+    drop_zero_blocks(a::AliasedBlockSparse) -> AliasedBlockSparse
+
+`a` without its exactly-zero blocks (scalar == 0, or a template whose entries are all == 0) and
+without the templates no remaining block references (alias ids renumbered; keys stay sorted).
+Exact: the tensor is unchanged. Opt-in: no product, factorize or truncate! calls it. Products leave
+such blocks where contributions to one output key cancel exactly (_commit_aliased_dicts_lazy!),
+and channel fusion (merge.jl) counts them.
+"""
+function drop_zero_blocks(a::AliasedBlockSparse{T,N,N2,P,K,AI}) where {T,N,N2,P,K,AI}
+    (isempty(a.slice_to_template) && isempty(a.window_slice_map)) || error(
+        "drop_zero_blocks: the tensor carries factor-core hints (slice_to_template / " *
+        "window_slice_map), which refer to template ids; renumbering them is not supported")
+    bs = a.blksize
+    zt = [all(iszero, @view a.templates[(t - 1) * bs + 1 : t * bs]) for t in 1:a.n_templates]
+    keep = [!iszero(a.scalars[i]) && !zt[Int(a.alias_ids[i])] for i in eachindex(a.scalars)]
+    used = falses(a.n_templates)
+    for i in eachindex(keep)
+        keep[i] && (used[Int(a.alias_ids[i])] = true)
+    end
+    remap = zeros(Int, a.n_templates)
+    nt = 0
+    for t in 1:a.n_templates
+        used[t] && (nt += 1; remap[t] = nt)
+    end
+    templates = Vector{T}(undef, nt * bs)
+    for t in 1:a.n_templates
+        used[t] && copyto!(templates, (remap[t] - 1) * bs + 1, a.templates, (t - 1) * bs + 1, bs)
+    end
+    ids = AI[_alias_id(AI, remap[Int(a.alias_ids[i])]) for i in eachindex(keep) if keep[i]]
+    return _same_kind(a, AliasedBlockSparse{T,N,N2,P,K}(
+        a.dims, bs, templates, nt, a.keys[keep], ids, a.scalars[keep]))
+end
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Element access

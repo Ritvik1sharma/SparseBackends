@@ -5,27 +5,33 @@
 # tensor_wrappers_aliased.jl and dispatches on the storage's child type).
 
 import ITensors
-using LinearAlgebra: svd
+using LinearAlgebra: svd, qr
 
 # Per-channel single-site factorize (the `factorize` hook for SectorSplitAliasedBlockSparse).
 # The bond is the channel (key) index c and the multiplicity (dense) index m outside Linds.
 # Per channel value c:
 #     W_c = vcat_{a : w_{a,c} > 0} sqrt(w_{a,c}) T_a,   w_{a,c} = Σ_{keys: alias a, channel c} |scalar|²
-# one SVD each; the kept counts k_c follow `kept_counts` (maxdim per channel, cutoff pooled).
+# one decomposition each, W_c = U_c B_c:
+#   with maxdim or cutoff (truncate!): SVD, U_c = U, B_c = S V†; the kept counts k_c follow
+#     `kept_counts` (maxdim per channel, cutoff pooled).
+#   with neither (orthogonalize!, nothing can be truncated): QR, U_c = Q, B_c = R, every column
+#     kept (k_c = min(rows, m_old)), as ITensors' factorize picks qr when nothing is truncated.
 #   L  every key of A kept (keys and scalars unchanged); one template per (template a, channel c)
 #      pair present in the keys (a-major), U_{a,c} / sqrt(w_{a,c}) on the k_c kept columns and zero
 #      after (all zero when w_{a,c} = 0 or k_c = 0); m -> K = max_c k_c. The channel index is kept
 #      (it is P's link: the gauges of the next gate step refer to it). No numeric merge;
 #      allocation exact.
 #   R  aliased (Shared) on (c', c, m_new, m_old), c' = prime(c): diagonal keys (c, c) only, one
-#      template per channel value, S_c V_c† (K x m_old, rows > k_c zero; zero for a channel with
+#      template per channel value, B_c (K x m_old, rows > k_c zero; zero for a channel with
 #      no weight), scalars 1. contract(neighbour, R) sums c against the neighbour's channel and
 #      leaves c', which this storage's `_absorb_bond` (sector_split/absorb.jl) renames back to c.
-#   spec  Spectrum(kept s² over every channel, discarded / total weight).
+#   spec  SVD: Spectrum(kept s² over every channel, discarded / total weight); QR: Spectrum(nothing, 0)
+#         (ITensors' qr factorize).
 function _aliased_factorize(X::SectorSplitAliasedBlockSparse{Tel,N,N2,Px,K,AI},
                             Aw::WrappedAliasedBlockSparse, A::ITensors.ITensor, Linds...;
                             mindim, maxdim, cutoff) where {Tel,N,N2,Px,K,AI}
     mindim === nothing || error("per-channel aliased factorize: mindim is not supported")
+    truncating = maxdim !== nothing || cutoff !== nothing
     maxdim = something(maxdim, typemax(Int))
     cutoff = Float64(something(cutoff, 0.0))
 
@@ -55,22 +61,32 @@ function _aliased_factorize(X::SectorSplitAliasedBlockSparse{Tel,N,N2,Px,K,AI},
         wac[t, c] += abs2(X.scalars[i]); present[t, c] = true
     end
 
-    # ---- one weighted SVD per channel value with weight -----------------------------------
+    # ---- one weighted decomposition per channel value with weight -------------------------
     tpl(t) = reshape(permutedims(reshape(@view(X.templates[((t - 1) * bs + 1):(t * bs)]), tail...),
                                  perm), nrest, m_old)
     live = [c for c in 1:Dc if any(>(0), @view wac[:, c])]
     rows = [findall(>(0), @view wac[:, c]) for c in live]
     rowof = zeros(Int, nt, Dc)                           # (template, channel) -> its row block in W_c
     for (q, c) in enumerate(live), (r, t) in enumerate(rows[q]); rowof[t, c] = r; end
-    Fs = map(eachindex(live)) do q
+    function stacked(q)                                  # W_c of channel live[q]
         c = live[q]
         W = Matrix{Tel}(undef, length(rows[q]) * nrest, m_old)
         for (r, t) in enumerate(rows[q])
             W[((r - 1) * nrest + 1):(r * nrest), :] .= sqrt(wac[t, c]) .* tpl(t)
         end
-        svd(W)
+        return W
     end
-    ks, truncerr = kept_counts([F.S for F in Fs]; maxdim, cutoff)
+    if truncating
+        Fs = [svd(stacked(q)) for q in eachindex(live)]
+        ks, truncerr = kept_counts([F.S for F in Fs]; maxdim, cutoff)
+        Us = [F.U for F in Fs]
+        Bs = [F.S[1:ks[q]] .* @view(F.Vt[1:ks[q], :]) for (q, F) in enumerate(Fs)]
+    else
+        Qs = [qr(stacked(q)) for q in eachindex(live)]
+        ks = [minimum(size(F.factors)) for F in Qs]; truncerr = 0.0
+        Us = [Matrix(F.Q) for F in Qs]
+        Bs = [Matrix(F.R) for F in Qs]
+    end
     kc = zeros(Int, Dc); fq = zeros(Int, Dc)
     for (q, c) in enumerate(live); kc[c] = ks[q]; fq[c] = q; end
     Kn = maximum(ks)
@@ -91,7 +107,7 @@ function _aliased_factorize(X::SectorSplitAliasedBlockSparse{Tel,N,N2,Px,K,AI},
         fill!(U, zero(Tel))
         if wac[t, c] > 0 && kc[c] > 0
             q = fq[c]; r = rowof[t, c]
-            U[:, 1:kc[c]] .= @view(Fs[q].U[((r - 1) * nrest + 1):(r * nrest), 1:kc[c]]) ./ sqrt(wac[t, c])
+            U[:, 1:kc[c]] .= @view(Us[q][((r - 1) * nrest + 1):(r * nrest), 1:kc[c]]) ./ sqrt(wac[t, c])
         end
         Base.permutedims!(reshape(view(tm,((id - 1) * nbs + 1):(id * nbs)), tdims), reshape(U, udims), iperm)
     end
@@ -110,9 +126,8 @@ function _aliased_factorize(X::SectorSplitAliasedBlockSparse{Tel,N,N2,Px,K,AI},
     tR  = zeros(Tel, Dc * bsR)
     for c in 1:Dc
         k = kc[c]; k == 0 && continue
-        F = Fs[fq[c]]
         BR = reshape(view(tR, ((c - 1) * bsR + 1):(c * bsR)), Kn, m_old)
-        BR[1:k, :] .= F.S[1:k] .* @view(F.Vt[1:k, :])
+        BR[1:k, :] .= @view(Bs[fq[c]][1:k, :])
     end
     AIR = Dc <= typemax(UInt8) ? UInt8 : Dc <= typemax(UInt16) ? UInt16 : UInt32
     keysR, idsR = _diag_schema(Dc, AIR)
@@ -121,6 +136,7 @@ function _aliased_factorize(X::SectorSplitAliasedBlockSparse{Tel,N,N2,Px,K,AI},
     R = ITensors._itensor_from_external_storage(
         WrappedAliasedBlockSparse(aR, (ITensors.prime(chan), chan, new_mult, old_mult)))
 
+    truncating || return L, R, ITensors.Spectrum(nothing, 0.0)
     eigs = Vector{real(Tel)}(undef, sum(ks))
     o = 0
     for q in eachindex(live), j in 1:ks[q]; o += 1; eigs[o] = abs2(Fs[q].S[j]); end

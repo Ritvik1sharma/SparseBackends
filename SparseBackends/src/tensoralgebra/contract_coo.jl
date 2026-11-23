@@ -50,11 +50,11 @@ function ensure_rlab_last_and_sorted(
     labels::AbstractVector,
     rlab::Label
 ) where {T,N}
-  # fast exit
+  # fast exit: rlab already last; a dirty (unsorted) A is sorted on a copy, the merge-join needs it
   if labels[end] == rlab
     labels2 = collect(labels)
     map2 = Dict(labels2[i] => i for i in 1:N)
-    return A, labels2, map2
+    return (A.dirty ? sort_coo!(deepcopy(A)) : A), labels2, map2
   end
 
   # build new label order: keep relative order, move rlab to end

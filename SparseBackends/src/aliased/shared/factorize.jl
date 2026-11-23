@@ -262,10 +262,23 @@ function _aliased_factorize(::SharedAliasedBlockSparse, Aw::WrappedAliasedBlockS
     end
     new_mult = ITensors.Index(k_new; tags = ITensors.tags(old_mult))
     L = _build_aliased_frozen_schema(Aw, tmpl_x, new_tail_x, mx, k_new, true, Tel, new_mult)
+    # channel fusion on L, after the m SVD (the truncation above is unchanged; aliased/merge.jl)
+    Lw = ITensors.get_external_storage(L)
+    L, _, fusion = _fuse_channels(Lw.aliased, Lw, L, Lis)
 
     # ---- R = S V' over (new m, old m) ----------------------------------------
     SVt = Matrix{Tel}(Diagonal(sv[1:k_new]) * F.V[:, 1:k_new]')
-    R = ITensors.ITensor(SVt, new_mult, old_mult)
+    if fusion === nothing
+        R = ITensors.ITensor(SVt, new_mult, old_mult)
+    else
+        # one R for the channel fusion and the multiplicity: keys (rep[c], c), template S V', scalars λ[c]
+        cs = [c for c in eachindex(fusion.rep) if fusion.rep[c] > 0]
+        aR = SharedAliasedBlockSparse{Tel,4,2,2,Int,UInt8}(
+            (ITensors.dim(fusion.nb), ITensors.dim(fusion.b), k_new, m_old), k_new * m_old, vec(SVt), 1,
+            [(fusion.rep[c], c) for c in cs], ones(UInt8, length(cs)), Tel[fusion.λ[c] for c in cs])
+        R = ITensors._itensor_from_external_storage(
+            WrappedAliasedBlockSparse(aR, (fusion.nb, fusion.b, new_mult, old_mult)))
+    end
 
     _sv_tot = sum(s -> s * s, sv)
     truncerr_val = (k_new >= length(sv) || _sv_tot <= 0) ? 0.0 :

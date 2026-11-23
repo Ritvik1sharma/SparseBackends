@@ -277,3 +277,146 @@ function _contract_coo_aliased_dense!(
     _commit_aliased_dicts_lazy!(C, key_to_alias, key_to_accum, pending, n_pending)
     return C
 end
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Several contracted labels, all in B's key (e.g. a one-site operator that contracts a state's
+# site index and a second key index of the same site). Output-stationary:
+#   A (COO) is permuted to [shared..., kept...] and sorted (column-major: the last axes are the
+#   most significant), so each A group (one value of A's kept indices, i.e. a fixed part of C's
+#   key) is one run whose members are ordered by their shared values;
+#   B's key is permuted to [kept..., shared...] (its blocks come back sorted), so each shared
+#   tuple is one run of B blocks, in the same order as A's members.
+# Per A group, every member is merge-joined with the B run of its shared tuple and the
+# contributions accumulate into the group's own output blocks; distinct groups give distinct C
+# keys, so a group's blocks are complete when it ends and are committed then. B's dense block is
+# laid out as in the single-label prefix kernel ([C dense..., moved...]); template tidB's chunk
+# for moved value m is combined template (tidB - 1) * Mprod + m. A contracted label in B's dense
+# block, or a label of both operands that is not contracted, is an error.
+# ─────────────────────────────────────────────────────────────────────────────
+@inline function _shared_lin(k::NTuple, offset::Int, sdims::NTuple{S,Int}) where {S}
+    l = 1; st = 1
+    @inbounds for t in 1:S
+        l += (Int(k[offset + t]) - 1) * st
+        st *= sdims[t]
+    end
+    return l
+end
+@inline function _same_from(a::NTuple{N}, b::NTuple{N}, from::Int) where {N}
+    @inbounds for d in from:N
+        a[d] == b[d] || return false
+    end
+    return true
+end
+
+function contract_shared!(
+    C             :: AliasedBlockSparse{TC,NC,N2C,PC},
+    labelsC       :: AbstractVector,
+    A             :: COOTensor{TA,NA},
+    labelsA       :: AbstractVector,
+    B             :: AliasedBlockSparse{TB,NB,N2B,PB},
+    labelsB       :: AbstractVector,
+    mapA          :: Dict,
+    mapB          :: Dict,
+    shared_labels :: Vector,
+) where {TC,NC,N2C,PC,TA,NA,TB,NB,N2B,PB}
+    K = "COO × aliased (several contracted indices)"
+    ns = length(shared_labels); sset = Set(shared_labels)
+    for lab in shared_labels
+        lab in labelsC && _layout_error(K, "an index of both operands that is not contracted is not supported")
+        mapB[lab] <= PB || _layout_error(K, "a contracted index in B's dense block is not supported")
+    end
+
+    # B's dense block as [C dense..., moved...]
+    B, labelsB, mapB, keyM, mdims = _coo_aliased_layout_B(B, labelsB, labelsC, PC, Any[], K)
+    Mprod = prod(mdims; init=1)
+    @assert C.blksize * Mprod == B.blksize "C block size × moved dims must equal B's block size"
+    # B's key as [kept..., shared...] (permutedims sorts the keys: blocks then run by shared tuple)
+    keptB = [labelsB[a] for a in 1:PB if !(labelsB[a] in sset)]
+    permB = vcat(Int[mapB[l] for l in keptB], Int[mapB[l] for l in shared_labels], collect(PB+1:NB))
+    if permB != collect(1:NB)
+        B       = _permutedims_sharing(B, permB)
+        labelsB = labelsB[permB]
+        mapB    = Dict(lab => i for (i, lab) in enumerate(labelsB))
+    end
+    # A as [shared..., kept...], sorted (permutedims copies the keys; sort! replaces the vectors)
+    labelsA2 = vcat(collect(shared_labels), [lab for lab in labelsA if !(lab in sset)])
+    A2 = permutedims(A, ntuple(j -> mapA[labelsA2[j]], Val(NA)))
+    A2.dirty = true
+    sort!(A2)
+    mapA2 = Dict(lab => i for (i, lab) in enumerate(labelsA2))
+
+    sdims = ntuple(t -> A2.dims[t], ns)
+    sdims == ntuple(t -> B.dims[PB - ns + t], ns) || _layout_error(K, "the contracted indices have different dims in A and B")
+
+    # C key slot j comes from A's axis srcA[j], B's key axis srcB[j], or moved index srcM[j]
+    srcA = zeros(Int, PC); srcB = zeros(Int, PC); srcM = zeros(Int, PC)
+    @inbounds for j in 1:PC
+        lab = labelsC[j]
+        if haskey(mapA2, lab)
+            srcA[j] = mapA2[lab]
+        elseif (im = findfirst(==(lab), keyM)) !== nothing
+            srcM[j] = im
+        else
+            ax = get(mapB, lab, 0)
+            1 <= ax <= PB - ns || _layout_error(K, "C's key may only list indices of A, B's key indices and B's dense indices")
+            srcB[j] = ax
+        end
+    end
+    mstrides = _mstrides(mdims)
+
+    # B's runs: shared tuple (linear, ascending) -> blocks runLo[r]:runHi[r]
+    runS = Int[]; runLo = Int[]; runHi = Int[]
+    @inbounds for bi in eachindex(B.keys)
+        sl = _shared_lin(B.keys[bi], PB - ns, sdims)
+        if isempty(runS) || runS[end] != sl
+            isempty(runS) || runS[end] < sl || error("$K: B's keys are not sorted (prefix column-major)")
+            push!(runS, sl); push!(runLo, bi); push!(runHi, bi)
+        else
+            runHi[end] = bi
+        end
+    end
+    nruns = length(runS)
+
+    empty!(C.templates); C.n_templates = 0
+    empty!(C.keys); empty!(C.alias_ids); empty!(C.scalars)
+    pending   = TB === TC ? B.templates : convert(Vector{TC}, B.templates)   # read only
+    n_pending = B.n_templates * Mprod
+    key_to_alias = Dict{NTuple{PC,Int}, Tuple{Int,TC}}()
+    key_to_accum = Dict{NTuple{PC,Int}, Vector{TC}}()
+    g_alias = Dict{NTuple{PC,Int}, Tuple{Int,TC}}()
+    g_accum = Dict{NTuple{PC,Int}, Vector{TC}}()
+
+    nA = length(A2.keys); i = 1
+    @inbounds while i <= nA
+        # A group: the entries whose kept part (axes ns+1:NA) equals entry i's
+        i2 = i + 1
+        while i2 <= nA && _same_from(A2.keys[i2], A2.keys[i], ns + 1); i2 += 1; end
+        empty!(g_alias); empty!(g_accum)
+        r = 1
+        for ii in i:(i2 - 1)
+            acoord = A2.keys[ii]
+            sl = _shared_lin(acoord, 0, sdims)
+            while r <= nruns && runS[r] < sl; r += 1; end
+            (r <= nruns && runS[r] == sl) || continue
+            α = convert(TC, A2.vals[ii])
+            for bi in runLo[r]:runHi[r]
+                bkey   = B.keys[bi]
+                tidB   = Int(B.alias_ids[bi])
+                scalar = α * convert(TC, B.scalars[bi])
+                for m in 1:Mprod
+                    ckey = ntuple(j -> srcA[j] != 0 ? Int(acoord[srcA[j]]) :
+                                       srcB[j] != 0 ? Int(bkey[srcB[j]]) :
+                                       _mdigit(m, srcM[j], mstrides, mdims), Val(PC))
+                    _aliased_contribute!(g_alias, g_accum, pending, ckey, (tidB - 1) * Mprod + m, scalar, C.blksize)
+                end
+            end
+        end
+        # the group's output blocks are complete
+        merge!(key_to_alias, g_alias); merge!(key_to_accum, g_accum)
+        i = i2
+    end
+
+    _commit_aliased_dicts_lazy!(C, key_to_alias, key_to_accum, pending, n_pending)
+    return C
+end

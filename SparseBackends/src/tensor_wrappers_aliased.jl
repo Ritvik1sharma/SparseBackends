@@ -363,11 +363,12 @@ function replaceinds(w::WrappedAliasedBlockSparse{T,N,N2,P}, inds1, inds2) where
     return WrappedAliasedBlockSparse{T,N,N2,P}(w.aliased, new_inds)
 end
 
+# block = scalar * template, so both are conjugated
 function ITensors.dag(A::AliasedBlockSparse{T,N,N2,P}) where {T,N,N2,P}
     new_templates = conj.(A.templates)
     return _same_kind(A, AliasedBlockSparse{T,N,N2,P}(
         A.dims, A.blksize, new_templates, A.n_templates,
-        copy(A.keys), copy(A.alias_ids), copy(A.scalars),
+        copy(A.keys), copy(A.alias_ids), conj.(A.scalars),
     ))
 end
 
@@ -844,7 +845,8 @@ _static_output_perm_dense(bondtype::Symbol, step::Int)::Union{Nothing,Vector{Int
 # kernels) fill it in place, so the product has the requested class directly.
 function wrapped_contract(A::WrappedTensorTypes, B::WrappedTensorTypes, ::Type{C};
                           in_position::Bool=false, emit_window_map::Bool=false,
-                          layout::Union{Nothing,OutputLayout}=nothing) where {C<:AliasedBlockSparse}
+                          layout::Union{Nothing,OutputLayout}=nothing,
+                          alias_id_type::Type{<:Integer}=DEFAULT_ALIAS_ID_TYPE) where {C<:AliasedBlockSparse}
     if layout !== nothing
         # Roles name the operands as passed (:A = first). Resolve them now; then, for
         # dense × aliased, put the aliased operand first: the aliased × dense kernel
@@ -852,8 +854,13 @@ function wrapped_contract(A::WrappedTensorTypes, B::WrappedTensorTypes, ::Type{C
         # lists Index objects, so the swap does not change what it means.
         layout = resolve_layout(layout, A, B)
         if B isa WrappedAliasedBlockSparse && A isa WrappedTensor
-            return wrapped_contract(B, A, C; in_position, emit_window_map, layout)
+            return wrapped_contract(B, A, C; in_position, emit_window_map, layout, alias_id_type)
         end
+    end
+    # aliased × COO: the kernel is COO × aliased (contract_coo_aliased.jl), the same product
+    # with the operands swapped (e.g. an aliased site times the COO map of a channel merge)
+    if A isa WrappedAliasedBlockSparse && B isa WrappedCOOTensor
+        return wrapped_contract(B, A, C; in_position, emit_window_map, layout, alias_id_type)
     end
     Arep, Brep = rep(A), rep(B)
     # Requested layout: it IS the output's index order and key/dense split. Stock: the split
@@ -861,7 +868,7 @@ function wrapped_contract(A::WrappedTensorTypes, B::WrappedTensorTypes, ::Type{C
     indsC, denseC, labelsA_vec, labelsB_vec, labelsC_vec = _contract_setup(A, B, layout)
     dimsC = ntuple(i -> ITensors.dim(indsC[i]), length(indsC))
     TC    = promote_type(eltype(Arep), eltype(Brep))
-    Cw    = WrappedAliasedBlockSparse(C{TC,length(indsC),length(denseC)}(dimsC), indsC)
+    Cw    = WrappedAliasedBlockSparse(C{TC,length(indsC),length(denseC)}(dimsC; alias_id_type), indsC)
 
     # ── factor-core window-map path (off by default) ──────────────────────────
     # ψ[b]·ψ[b+1] with BOTH inputs aliased P·core (slice_to_template populated). Route
@@ -1891,3 +1898,8 @@ function is_blocksparse_mps(psi)::Bool
     ITensors.has_external_storage(T) || return false
     return ITensors.get_external_storage(T) isa WrappedBlockSparse
 end
+
+# ITensors.drop_zero_blocks(T) hook (ITensors external_storage.jl): the aliased payload without its
+# exactly-zero blocks (drop_zero_blocks in aliased/storage.jl), same inds.
+ITensors._drop_zero_blocks_external_storage(w::WrappedAliasedBlockSparse) =
+    WrappedAliasedBlockSparse(drop_zero_blocks(w.aliased), w.inds)

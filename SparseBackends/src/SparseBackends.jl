@@ -128,7 +128,7 @@ export FLOP_COUNTER, reset_flops!, report_flops, add_dense_macs!, add_aliased_ma
 # export whatever should be public:
 export NewBlockSparseSorted, blocksparse_from_dense, to_dense
 export COOTensor, coo_from_dense, to_dense
-export AliasedBlockSparse, to_blocksparse, to_dense, contract_aliased!, compression_ratio, compress_aliased_templates!
+export AliasedBlockSparse, to_blocksparse, to_dense, contract_aliased!, compression_ratio, compress_aliased_templates!, drop_zero_blocks
 export WrappedAliasedBlockSparse, contract_aliased_itensor,
        contract_coo_dense_aliased
 
@@ -205,7 +205,9 @@ include("tensor_wrappers.jl")          # contract(A, B; ...) entry + wrapped_con
 include("tensor_index.jl")
 include("tensor_contraction.jl")       # top_level_contract (MPO × MPS / MPO site products + bond-link fusion)
 include("tensor_wrappers_aliased.jl")   # WrappedAliasedBlockSparse + wrapped_contract with aliased operands / output
-include("tensoralgebra/contract_aliased_gauged.jl")  # aliased ψ × constrained TEBD layer site (gate + bond gauges)
+include("tensoralgebra/contract_gauged.jl")  # ψ × constrained TEBD layer site (COO gate + bond gauges): setup
+include("aliased/gauged_kernel.jl")           # its kernel for an aliased ψ
+include("blocksparse/gauged_kernel.jl")       # its kernel for a block-sparse ψ
 include("output_layout_builders.jl")  # OutputLayout builders for the known callers (incl. _absorb_layout)
 # Per-storage hooks: factorize (ITensors._external_factorize_storage) and _absorb_bond (ITensorMPS).
 include("blocksparse/factorize.jl")            # block-sparse: per-group SVD; its _absorb_bond
@@ -214,5 +216,5 @@ include("aliased/shared/factor_core.jl")       # Shared: factor-core read_core/w
 include("aliased/shared/absorb.jl")            # Shared: _absorb_bond
 include("aliased/sector_split/factorize.jl")   # SectorSplit: one SVD per channel value
 include("aliased/sector_split/absorb.jl")      # SectorSplit: _absorb_bond (c' -> c relabel)
-
+include("aliased/merge.jl")                    # channel fusion inside factorize (aliased; COO in tensor_wrappers.jl)
 end

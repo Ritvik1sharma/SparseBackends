@@ -367,10 +367,10 @@ comes from `Cbackend`, and the product is the one wrapped entry `wrapped_contrac
                          preserve_bs_output); not allowed with an aliased operand
 `layout` (an OutputLayout, Index objects or roles naming A as :A and B as :B) sets the
 product's key/dense split and order before fusion; nothing = stock layout. It needs an
-aliased operand or output. `A` may be one site of a constrained TEBD layer,
+aliased operand or output, or a block-sparse output (e.g. COO × dense). `A` may be one site of a constrained TEBD layer,
 `(gate = ITensor, gauges = (X_left, X_right^-1))` (see contract(::NamedTuple, ::MPS, ...) in
-the ITensorMPS fork): the gate is wrapped dense and the pair goes to the gauged kernel
-(contract_aliased_gauged.jl).
+the ITensorMPS fork): the gate is wrapped by its own storage (COO) and the pair goes to the gauged
+contract (contract_gauged.jl), whose kernel follows ψ's storage.
 """
 function top_level_contract(
   A::Union{ITensors.ITensor,NamedTuple{(:gate,:gauges)}}, B::ITensors.ITensor,
@@ -383,7 +383,8 @@ function top_level_contract(
   aRight::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing,
   bLeft::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing,
   bRight::Union{Nothing,AbstractVector{<:ITensors.Index}}=nothing,
-  layout::Union{Nothing,OutputLayout}=nothing
+  layout::Union{Nothing,OutputLayout}=nothing,
+  alias_id_type::Type{<:Integer}=DEFAULT_ALIAS_ID_TYPE
 )
   # Parse the public Symbol API to the canonical Backend enum (strict: a
   # non-canonical name like the old :aliasedblocksparse throws here).
@@ -407,8 +408,7 @@ function top_level_contract(
   end
   # Wrap inputs if needed
   Aw = if A isa NamedTuple
-      Ab === DENSE || error("top_level_contract: a gauged gate must be passed as :dense, got $Abackend")
-      (gate = wrap_itensor(A.gate; backend=DENSE, denseLinks=denseLinksA), gauges = A.gauges)
+      (gate = wrap_itensor(A.gate; backend=Ab, denseLinks=denseLinksA), gauges = A.gauges)
     elseif Ab === ALIASED
       if ITensors.has_external_storage(A)
           wrap_itensor_aliased(A; denseLinks=denseLinksA)
@@ -441,12 +441,24 @@ function top_level_contract(
     C = Array
     layout === nothing || (layout = as_dense(layout))
   else
-    layout === nothing || throw(OutputLayoutError("top_level_contract: a layout needs an " *
-        "aliased operand or aliased output; got $(typeof(Aw).name.name) × " *
-        "$(typeof(Bw).name.name) -> $Cb"))
-    C = _output_storage(Aw, Bw, false, nothing)
+    if Aw isa NamedTuple
+      C = _output_storage(Aw.gate, Bw, false, nothing)
+    else
+      # roles name A and B as passed; resolve them before wrapped_contract may swap the operands
+      layout === nothing || (layout = resolve_layout(layout, Aw, Bw))
+      C = _output_storage(Aw, Bw, false, layout)
+      (layout === nothing || C === NewBlockSparseSorted) || throw(OutputLayoutError(
+          "top_level_contract: a layout needs an aliased operand, an aliased output or a " *
+          "block-sparse output; got $(typeof(Aw).name.name) × $(typeof(Bw).name.name) -> $C"))
+    end
   end
-  Cw = wrapped_contract(Aw, Bw, C; layout)
+  if C <: AliasedBlockSparse && !(Aw isa NamedTuple)
+    Cw = wrapped_contract(Aw, Bw, C; layout, alias_id_type)
+  else
+    alias_id_type === DEFAULT_ALIAS_ID_TYPE || throw(ArgumentError(
+        "top_level_contract: alias_id_type needs an aliased output and no gauged gate"))
+    Cw = wrapped_contract(Aw, Bw, C; layout)
+  end
 
   # ── bond-link fusion ────────────────────────────────────────────────────────
   _nz(v) = (v !== nothing && !isempty(v))

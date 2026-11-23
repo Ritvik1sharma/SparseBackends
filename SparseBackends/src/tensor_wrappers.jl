@@ -312,10 +312,22 @@ end
 # end
 
 
+# `order`: the stored index order (a permutation of inds(T)); the keys are then sorted
+# column-major in that order. nothing = (bra, ket, links sorted).
 function WrappedCOOTensor(T::ITensors.ITensor;
                           bra_plev::Union{Nothing,Int}=nothing,
-                          ket_plev::Union{Nothing,Int}=nothing)
+                          ket_plev::Union{Nothing,Int}=nothing,
+                          order::Union{Nothing,Tuple,AbstractVector}=nothing)
 
+  if order !== nothing
+    (bra_plev === nothing && ket_plev === nothing) || throw(ArgumentError(
+        "WrappedCOOTensor: give either order or bra_plev/ket_plev, not both"))
+    inds_full = Tuple(order)
+    (length(inds_full) == length(ITensors.inds(T)) && Set(inds_full) == Set(ITensors.inds(T))) ||
+        throw(ArgumentError("WrappedCOOTensor: order must be a permutation of the tensor's indices"))
+    coo = SparseBackends.coo_from_dense(Array(T, inds_full...); atol=1e-12, rtol=0.0)
+    return WrappedCOOTensor(coo, inds_full)
+  end
   bra, ket, links = mpo_axes_itensor(T; bra_plev=bra_plev, ket_plev=ket_plev)
   links = sort_links(links)
   if bra !== nothing && ket !== nothing
@@ -1174,9 +1186,13 @@ end
 
 function contract(A::WrappedTensorTypes, B::WrappedTensorTypes;
                   preserve_bs_output::Bool=false, in_position::Bool=false,
-                  layout::Union{Nothing,OutputLayout}=nothing)
-    return wrapped_contract(A, B, _output_storage(A, B, preserve_bs_output, layout);
-                            in_position, layout)
+                  layout::Union{Nothing,OutputLayout}=nothing,
+                  alias_id_type::Type{<:Integer}=DEFAULT_ALIAS_ID_TYPE)
+    C = _output_storage(A, B, preserve_bs_output, layout)
+    C <: AliasedBlockSparse && return wrapped_contract(A, B, C; in_position, layout, alias_id_type)
+    alias_id_type === DEFAULT_ALIAS_ID_TYPE || throw(ArgumentError(
+        "contract: alias_id_type is set but the output ($C) is not aliased"))
+    return wrapped_contract(A, B, C; in_position, layout)
 end
 
 # Output indices of A * B, its dense indices and the three label vectors: the (resolved)
@@ -2289,3 +2305,53 @@ end
 
 #     return L_it, R_it, spec
 # end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COO site hooks for ITensorMPS truncate!/orthogonalize!: channel fusion, factorize, _absorb_bond
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Channel fusion for a COO site (aliased/merge.jl rule, every entry its own block: template id 1,
+# scalar = the entry's value) on the bond index `ax`: (A', Aw', chan), chan = (rep, λ, nb, b) or nothing.
+function _fuse_coo_axis(X::COOTensor{T,N,K}, Mw::WrappedCOOTensor, M::ITensors.ITensor,
+                        ax::Int) where {T,N,K}
+    b = Mw.inds[ax]
+    rep, λ, isrep, n = _merge_classes(X.keys, fill(1, length(X.keys)), X.vals, ax, X.dims[ax])
+    _nothing_merged(rep, n) && return M, Mw, nothing
+    n > 0 || error("channel fusion: site has no entries on bond $b")
+    keep = [isrep[Int(k[ax])] for k in X.keys]
+    keys = [Base.setindex(k, K(rep[Int(k[ax])]), ax) for k in X.keys[keep]]
+    coo  = COOTensor{T,N,K}(Base.setindex(X.dims, n, ax), keys, X.vals[keep], true)
+    sort!(coo)
+    nb = ITensors.Index(n; tags = ITensors.tags(b))
+    Lw = WrappedCOOTensor{T,N}(coo, Base.setindex(Mw.inds, nb, ax))
+    return ITensors._itensor_from_external_storage(Lw), Lw, (; rep, λ, nb, b)
+end
+
+# `factorize` hook for a COO site. COO holds no weights to truncate, so the split is the channel fusion
+# alone: L is the fused site and R the channel map (the identity when nothing fuses). The bond is the
+# one index outside Linds; a truncation that would drop part of it errors.
+function ITensors._external_factorize_storage(Aw::WrappedCOOTensor{T,N}, A::ITensors.ITensor,
+                                              Linds...; mindim = nothing, maxdim = nothing,
+                                              cutoff = nothing, ortho = nothing,
+                                              kwargs...) where {T,N}
+    something(ortho, "left") == "left" ||
+        error("COO factorize: only ortho=\"left\" is supported (got $ortho)")
+    Lis = ITensors.commoninds(A, ITensors.indices(Linds...))
+    out = [p for p in 1:N if !(Aw.inds[p] in Lis)]
+    length(out) == 1 || error("COO factorize: expected one bond index outside Linds, found $(length(out))")
+    iszero(something(cutoff, 0.0)) || error("COO factorize: cutoff = $cutoff is not supported")
+    L, Lw, chan = _fuse_coo_axis(Aw.coo, Aw, A, out[1])
+    b = Aw.inds[out[1]]
+    D = ITensors.dim(b)
+    if chan === nothing                       # nothing fused: rename the bond, R the identity
+        chan = (; rep = collect(1:D), λ = ones(T, D), nb = ITensors.Index(D; tags = ITensors.tags(b)), b)
+        L = ITensors._itensor_from_external_storage(WrappedCOOTensor{T,N}(Aw.coo, Base.setindex(Aw.inds, chan.nb, out[1])))
+    end
+    n = ITensors.dim(chan.nb)
+    something(maxdim, n) >= n || error("COO factorize: maxdim = $maxdim would cut the bond (dim $n)")
+    return L, _merge_map(chan.rep, chan.λ, n, chan.nb, b), ITensors.Spectrum(nothing, 0.0)
+end
+
+# `_absorb_bond` for a COO site: the product M * R (COO x COO).
+_absorb_bond(::COOTensor, Mw::WrappedCOOTensor, M::ITensors.ITensor, R::ITensors.ITensor) =
+    ITensors.contract(M, R)

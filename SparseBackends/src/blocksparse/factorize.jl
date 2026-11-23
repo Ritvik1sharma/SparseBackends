@@ -192,9 +192,12 @@ function ITensors._external_factorize_storage(
                                            cutoff = Float64(something(cutoff, 0.0)))
     jl, jm = sort!(setdiff(1:length(Aw.inds), lpos))
     old_lab, old_mul = Aw.inds[jl], Aw.inds[jm]
-    new_lab = ITensors.Index(ITensors.dim(old_lab); tags = ITensors.tags(old_lab))
+    # every kept label its own group (R keys (b, b)): L keeps the label index; R's new label is it primed,
+    # and `_absorb_bond` puts it back
+    conserving = all(k -> k[1] == k[2], Rbs.keys)
+    new_lab = conserving ? ITensors.prime(old_lab) : ITensors.Index(ITensors.dim(old_lab); tags = ITensors.tags(old_lab))
     new_mul = ITensors.Index(Lbs.dims[jm]; tags = ITensors.tags(old_mul))
-    swap(I) = I == old_lab ? new_lab : I == old_mul ? new_mul : I
+    swap(I) = I == old_lab ? (conserving ? old_lab : new_lab) : I == old_mul ? new_mul : I
     L = ITensors._itensor_from_external_storage(WrappedBlockSparse(Lbs, map(swap, Aw.inds)))
     R = ITensors._itensor_from_external_storage(
         WrappedBlockSparse(Rbs, (new_lab, old_lab, new_mul, old_mul)))
@@ -209,6 +212,12 @@ end
 function _absorb_bond(::NewBlockSparseSorted, Mw::WrappedBlockSparse,
                       M::ITensors.ITensor, R::ITensors.ITensor)
     old, new = ITensors.commoninds(R, M), ITensors.uniqueinds(R, M)
-    return ITensors.contract(M, R; preserve_bs_output = true,
-                             layout = _absorb_layout(Mw.inds, _bs_head_len(Mw), old, new))
+    C = ITensors.contract(M, R; preserve_bs_output = true,
+                          layout = _absorb_layout(Mw.inds, _bs_head_len(Mw), old, new))
+    # a conserving bond (factorize above): R's new label is the old one primed, renamed back
+    for o in old
+        ITensors.prime(o) in new || continue
+        C = ITensors._itensor_from_external_storage(relabel_ind!(ITensors.get_external_storage(C), ITensors.prime(o), o))
+    end
+    return C
 end
